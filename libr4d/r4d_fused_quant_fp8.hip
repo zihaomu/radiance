@@ -1284,6 +1284,10 @@ extern "C" int r4d_rad_gated_quant_fp8(const RadArgs* a, RadStream stream) {
     return rad_gated_quant_fp8(a, stream, false);
 }
 
+extern "C" int r4d_rad_gated_had_quant_fp8(const RadArgs* a, RadStream stream) {
+    return rad_gated_quant_fp8(a, stream, true);
+}
+
 /* Its int8 twin, had_quant_act_i8g's codes: pairs only with a weight stored at dtype i8a8h. */
 extern "C" int r4d_rad_gated_had_quant_i8g(const RadArgs* a, RadStream stream) {
     return rad_gated_quant_fp8(a, stream, true, true);

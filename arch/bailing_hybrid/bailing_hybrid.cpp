@@ -420,9 +420,9 @@ struct Model {
     Names nm{};
     Geom g{};
     Shape s{};
-    /* The trunk is rotated int8 (rad_fp8.h's linear_is_w8h or linear_is_wnh), its activation codes
-     * one scale a `trunk_g8` columns: 256 for IQ8R, 128 for the other rotated forms. `norm_fed`:
-     * the block norms write those codes themselves (rmsnorm_had_quant_i8g is served). */
+    /* Whether layer 0's probe found a rotated-int8 trunk, and its activation scale group: see
+     * rad_fp8.h's trunk_rotation. `norm_fed`: the block norms write those codes themselves
+     * (rmsnorm_had_quant_i8g is served). */
     bool trunk_rot = false, norm_fed = false;
     int64_t trunk_g8 = RAD_FP8_BLOCK;
     std::vector<Layer> layers;
@@ -849,8 +849,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     {
         RadEncoding enc{};
         m.trunk_rot = weight_enc(b, nm.f("blk.0.attn_qkv.weight"), &enc) &&
-                      (linear_is_w8h(enc) || linear_is_wnh(enc));
-        if (m.trunk_rot) m.trunk_g8 = linear_w8h_group(enc);
+                      trunk_rotation(enc, &m.trunk_g8);
     }
     int64_t shared_g8 = m.trunk_g8;
     if (m.trunk_rot) {

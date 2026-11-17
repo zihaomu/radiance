@@ -419,6 +419,15 @@ private:
     /* The text frontend, loaded from the container. The sampler's grammars walk `vocab_view_`,
      * which references `vocab_` and must not outlive it. */
     std::shared_ptr<const Vocab> vocab_;
+    /* End-of-generation ids the chat format also writes as a call delimiter: a call boundary is
+     * not a turn's, so the decoder does not stop on them (run_server demotes them). */
+    std::vector<int32_t> eog_demoted_;
+    /* End-of-generation as the decoder sees it: the vocabulary's set, minus the demoted ids. */
+    bool is_eog(int32_t id) const {
+        if (!vocab_ || !vocab_->is_eog(id)) return false;
+        for (int32_t d : eog_demoted_) if (d == id) return false;
+        return true;
+    }
     std::unique_ptr<VocabView>   vocab_view_;
     /* The container's second vocabulary (rad-convert --tokenizer2), which an image generator that
      * declares `aux_tokens` reads its prompt through; null without one. */

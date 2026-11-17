@@ -10,6 +10,11 @@ committed as core/server/dashboard_page.h and this keeps the two together:
           dashboard/THIRD-PARTY-LICENSES.txt (`npm run embed` in dashboard/ builds and writes)
   check   exits 1 if dashboard/'s sources no longer have the recorded digest: someone changed the
           page's source and did not rebuild the header (the ctest `dashboard_page`)
+
+The digest lives inside the header and only proves sources and claim agree; the served bytes are
+hashed from outside by tests/ARTIFACTS (the ctest `artifact_sums`), so tampering with the header
+alone fails. After a real rebuild, re-record both in the same commit:
+  sha256sum $(awk '{print $2}' tests/ARTIFACTS) > tests/ARTIFACTS
 """
 import hashlib, os, sys
 

@@ -1411,7 +1411,7 @@ commit, the split and the reason for every row:
 | reply parsing | `chat-peg-parser.cpp`, `peg-parser.cpp` | rewritten → `core/text/chatparse.{h,cpp}`, one streaming pass |
 | JSON-schema → grammar | `json-schema-to-grammar.cpp` | lifted, 1.2k |
 | unicode and regex splitting | `common/unicode.cpp`, `src/unicode*` | lifted |
-| HTTP and JSON | `vendor/cpp-httplib`, `vendor/nlohmann` | lifted, unmodified |
+| HTTP and JSON | `vendor/cpp-httplib`; `vendor/nlohmann` (retired) | httplib lifted, one patch (0022); DOM rewritten → `core/util/json.{h,cpp}` on yyjson |
 | GBNF grammar state machine | `src/llama-grammar.cpp` | rewritten → `core/sample/gbnf.{h,cpp}`, token masks in `gbnf_mask.cpp` |
 | tokenizer merge machinery | `src/llama-vocab.cpp` | rewritten → `core/text/tokenizer.{h,cpp}` |
 | GGUF reading | `ggml/src/gguf.cpp` | rewritten → `core/text/gguf.{h,cpp}` |

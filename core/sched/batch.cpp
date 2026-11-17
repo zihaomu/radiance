@@ -8,6 +8,7 @@
 #include "util/simd.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstring>
 #include <cstdlib>
@@ -1068,10 +1069,35 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         if (bidi_on_ && plan.draft_pass == 0 && shift == 0 && e.req && e.req->media) {
             const mm::PromptMedia& pm = *e.req->media;
             const int64_t c0 = e.ctx_len, c1 = c0 + e.n_tokens, T = max_tok_;
+            /* RopeLayout::runs is documented ascending and pairwise disjoint, and the slice
+             * bound (h_bidi is 4*max_tok_ wide, one slot per token this step can carry) leans
+             * on exactly that: overlapping runs would count one token twice. The layout is now
+             * fed from request-side placement, so the promise is checked here rather than
+             * trusted -- an overlapping run drops its media rows' bidirectionality, which the
+             * acceptance path treats as an ordinary miss, where a slot overrun is a fault. */
+            int64_t prev_b = c0;
             for (const mm::RopeLayout::Run& run : pm.rope.runs) {
                 const int64_t a = std::max<int64_t>(run.tok, c0);
                 const int64_t b = std::min<int64_t>((int64_t)run.tok + run.n, c1);
                 if (a >= b || pm.items[(size_t)run.item].item->kind == mm::Kind::Audio) continue;
+                if (a < prev_b) {
+                    static std::atomic<bool> said{false};
+                    if (log_once(said))
+                        RAD_WARN("step batch: a rope layout overlaps at token %lld; that run is "
+                                 "not staged bidirectionally (first of possibly many)",
+                                 (long long)a);
+                    continue;
+                }
+                prev_b = b;
+                if (n_bidi >= T) {
+                    /* Belt: the disjoint check makes this unreachable; the slice says so
+                     * rather than letting an overrun reach the card. */
+                    static std::atomic<bool> said2{false};
+                    if (log_once(said2))
+                        RAD_WARN("step batch: bidi runs overflowed the %lld-token plane "
+                                 "(first of possibly many)", (long long)T);
+                    break;
+                }
                 s.h_bidi[n_bidi]         = (int32_t)b;
                 s.h_bidi[T + n_bidi]     = (int32_t)(k + a - c0);
                 s.h_bidi[2 * T + n_bidi] = (int32_t)(b - a);
@@ -1132,7 +1158,12 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         s.h_q[i]   = e.n_tokens;
         s.h_ctx[i] = e.ctx_len;
         s.h_acc[i] = e.n_accepted;
-        s.h_arow[i] = -1;
+        /* Row 0, not -1: the query pass gathers the context state by these values, and the
+         * gather's index plane is validated in shape only -- a row that reaches the correlator
+         * without having advanced would gather one row BEFORE the context buffer (device OOB).
+         * Row 0 is always in range; a row that skipped its advance reads a wrong anchor, which
+         * the acceptance path discards, instead of faulting or reading a neighbour's state. */
+        s.h_arow[i] = 0;
         if (e.is_prefill) { if (e.n_tokens > max_q_pf) max_q_pf = e.n_tokens; }
         else               { if (e.n_tokens > max_q_dec) max_q_dec = e.n_tokens; }
     }

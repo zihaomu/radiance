@@ -226,7 +226,10 @@ void Front::install_routes(const Router& model_router) {
         bool fleet = method == "GET" && (path == "/" || path == "/dashboard");
         for (const auto& [p, fn] : own) fleet |= method == "GET" && path == p;
         if (fleet) continue;
-        router_.add(method, path, [this](const HttpRequest& q) { return forward(q); });
+        /* Copy the guarded mark with the route: the front's wake-guard then reads the same fact
+         * the engine's registration set, through the same matcher. */
+        router_.add(method, path, [this](const HttpRequest& q) { return forward(q); },
+                    model_router.guarded(method, path));
     }
     for (const auto& [p, fn] : own)
         router_.get(p, [this, fn = fn](const HttpRequest& q) { return (this->*fn)(q); });
@@ -447,7 +450,7 @@ Front::Entry* Front::resolve(const std::string& model) {
 
 Front::Got Front::lease(const std::string& model, const std::string& path, int64_t wait_ms,
                         uint64_t* until_ns, Entry** out, std::shared_ptr<void>* held,
-                        HttpResponse* refusal) {
+                        HttpResponse* refusal, bool operator_ok) {
     std::unique_lock<std::mutex> lk(mu_);
     *out = nullptr;
     Entry* e = resolve(model);
@@ -490,8 +493,11 @@ Front::Got Front::lease(const std::string& model, const std::string& path, int64
         return Got::Refused;
     }
     if (e->state == State::Failed) {
+        /* The failure prose quotes fetch errors and filesystem paths: operator-facing. A
+         * stranger learns the model failed -- that is public anyway -- never WHY (A-05). */
         *refusal = refuse(path, 503, "service_unavailable",
-                          "model '" + e->name + "' could not be loaded: " + e->why);
+                          "model '" + e->name + "' could not be loaded" +
+                              (operator_ok ? ": " + e->why : std::string()));
         const uint64_t t = rad_mono_ns();
         refusal->set_header("Retry-After",
                             std::to_string(e->retry_ns > t ? (e->retry_ns - t) / 1000000000ull + 1 : 1));
@@ -550,10 +556,32 @@ std::vector<std::pair<Front::Entry*, std::shared_ptr<void>>> Front::hold_open() 
     return held;
 }
 
+/* The path Router::match actually dispatches on: split_path (http.cpp) drops empty segments,
+ * so "//stats" and "/stats/" ARE the route "/stats". Every guard that compares path text must
+ * read the canonical form, or a slash turns any exact match into a bypass. */
+static std::string path_canonical(const std::string& p) {
+    std::string out;
+    out.reserve(p.size());
+    for (const char c : p)
+        if (c != '/' || out.empty() || out.back() != '/') out += c;
+    if (out.size() > 1 && out.back() == '/') out.pop_back();
+    return out;
+}
+
 bool Front::dashboard_read(const HttpRequest& q) {
     if (q.method != "GET") return false;
-    return q.path == "/stats" || q.path == "/sessions" || q.path == "/graph" ||
-           q.path == "/server_info" || q.path == "/admin/control-vector";
+    const std::string p = path_canonical(q.path);
+    return p == "/stats" || p == "/sessions" || p == "/graph" ||
+           p == "/server_info" || p == "/admin/control-vector";
+}
+
+/* The routes Server::register_routes marks guarded are the ones whose handlers answer the local
+ * operator only keyless. The front reads that mark back off its own copied routes (each guarded
+ * at registration in server.cpp) rather than re-listing it: one source, and the match is the
+ * router's -- so slash forms and the DELETE /sessions/:label shape decide exactly as the handler
+ * is reached, and a route cannot be guarded in one place and not the other. */
+bool Front::guarded_route(const HttpRequest& q) const {
+    return router_.guarded(q.method, q.path);
 }
 
 void Front::keep_job(const std::string& id, int64_t expires_at, int64_t max_kept, Handler answer) {
@@ -631,6 +659,19 @@ HttpResponse Front::forward(HttpRequest q) {
     Entry* e = nullptr;
     std::shared_ptr<void> l;
     HttpResponse refusal;
+    /* A guarded route asked by someone the handler will refuse brings its model back for a
+     * 403 alone: the wake fetched, evicted, and charged for nothing. Answer the not-open
+     * state here and the stranger's request never touches the scheduler. An open model still
+     * dispatches -- its handler is the guard that answers -- and so does everything once the
+     * operator asks, rule or no rule. */
+    if (guarded_route(q) && operator_rule_ && !operator_rule_(q)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        Entry* r = resolve(model);
+        if (r && r->state != State::Open)
+            return refuse(q.path, 409, "model_not_open", "model '" + r->name + "' is " +
+                                                             state_name(r->state) +
+                                                             "; this request does not bring it back");
+    }
     /* A streaming request for a model that is not open gets its event stream at once. */
     if (keepalive_ms_ > 0 && wants_stream(q)) {
         bool open = false;
@@ -641,7 +682,7 @@ HttpResponse Front::forward(HttpRequest q) {
         }
         if (!open) return forward_waiting(std::move(q), model);
     }
-    const Got g = lease(model, q.path, -1, nullptr, &e, &l, &refusal);
+    const Got g = lease(model, q.path, -1, nullptr, &e, &l, &refusal, caller_is_operator(q));
     if (g != Got::Leased) {
         if (model.empty() && id_route(q.path) && refusal.status == 400) {
             /* Every loaded model that might hold the job, in turn; the first that knows it
@@ -690,7 +731,8 @@ HttpResponse Front::forward_waiting(HttpRequest q, const std::string& model) {
         }
         Entry* e = nullptr;
         HttpResponse refusal;
-        const Got g = lease(w->model, w->q.path, keepalive_ms_, &w->until, &e, &w->lease, &refusal);
+        const Got g = lease(w->model, w->q.path, keepalive_ms_, &w->until, &e, &w->lease, &refusal,
+                            caller_is_operator(w->q));
         if (g == Got::Waiting) {
             chunk = ": loading model " + w->model + "\n\n";
             return true;
@@ -724,7 +766,7 @@ void Front::forward_socket(const HttpRequest& q, WsConn& c) {
     Entry* e = nullptr;
     std::shared_ptr<void> l;
     HttpResponse refusal;
-    if (lease(model, q.path, -1, nullptr, &e, &l, &refusal) != Got::Leased) {
+    if (lease(model, q.path, -1, nullptr, &e, &l, &refusal, caller_is_operator(q)) != Got::Leased) {
         c.close(1008, model.empty() ? "name a model with ?model=" : "model '" + model + "' is not served here");
         return;
     }

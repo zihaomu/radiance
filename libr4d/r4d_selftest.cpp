@@ -6366,12 +6366,13 @@ static void i8a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_t N
  * scale on libquant's tcq_rb grid), `two` E4M3 scales under one f32, `rot` the fwht128 forms. */
 struct IqrCase { int kind, B, V, L, rb; bool two, rot; bool rowf = false; };
 
-static void iqr_gemm_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t N, int64_t K) {
+static void iqr_gemm_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t N, int64_t K,
+                          bool row_invariance = false) {
     const char* row = M <= 64 ? "gemm_iqr_nt_m64" : "gemm_iqr_tiled";
     const char* ref = M <= 64 ? "gemm_i8a8_nt_m16"
                     : f.rb >= 32 ? "gemm_i8a8_rb32_tiled"
                     : f.rb >= 8 ? "gemm_i8a8_rb8_tiled" : "gemm_i8a8_tiled";
-    if (!sel(row) && !sel("gemm_iqr")) return;
+    if (!row_invariance && !sel(row) && !sel("gemm_iqr")) return;
     static const char* kKind[] = { "", "signed", "zero", "table", "grid", "trellis", "trellis-mad" };
     const bool tr = f.kind == 5 || f.kind == 6;   /* 6: the computed trellis (tcq_code=mad) */
     char nm[200];
@@ -6649,6 +6650,52 @@ static void iqr_gemm_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t
     std::vector<uint16_t> y((size_t)(M * N)), yr((size_t)(M * N));
     st_memcpy(y.data(), d_y, y.size() * 2, hipMemcpyDeviceToHost);
     st_memcpy(yr.data(), d_yr, yr.size() * 2, hipMemcpyDeviceToHost);
+
+    /* A verify issues several rows where a plain decode issues one. Same weight and activation
+     * must give the same bytes at every position, not merely agree with an oracle to tolerance. */
+    if (row_invariance) {
+        std::vector<uint16_t> batch((size_t)(M * N)), single((size_t)N);
+        for (int64_t width = 2; width <= M; ++width) {
+            auto q = tq;
+            q[0] = T(d_a, RAD_I8, { width, K });
+            q[1] = T(d_as, RAD_F32, { width, nkb });
+            q[4] = T(d_y, RAD_BF16, { width, N });
+            std::vector<RadParam> p = { PI("M", width), PI("N", N), PI("K", K),
+                                        PI("group", 128), PS("dtype", dt) };
+            st_memset(d_y, 0x7f, (size_t)(M * N) * 2);
+            int rc = launch(r, q, p);
+            if (rc == RAD_OK)
+                st_memcpy(batch.data(), d_y, (size_t)(M * N) * 2, hipMemcpyDeviceToHost);
+            int64_t different = 0, first = -1, tail_touched = 0;
+            if (rc == RAD_OK)
+                for (int64_t n = width * N; n < M * N; ++n)
+                    if (batch[(size_t)n] != 0x7f7f) ++tail_touched;
+            for (int64_t j = 0; j < width && rc == RAD_OK; ++j) {
+                auto q1 = tq;
+                q1[0] = T((int8_t*)d_a + j * K, RAD_I8, { 1, K });
+                q1[1] = T((float*)d_as + j * nkb, RAD_F32, { 1, nkb });
+                q1[4] = T(d_yr, RAD_BF16, { 1, N });
+                std::vector<RadParam> p1 = { PI("M", 1), PI("N", N), PI("K", K),
+                                             PI("group", 128), PS("dtype", dt) };
+                rc = launch(r, q1, p1);
+                if (rc != RAD_OK) break;
+                st_memcpy(single.data(), d_yr, (size_t)N * 2, hipMemcpyDeviceToHost);
+                for (int64_t n = 0; n < N; ++n)
+                    if (batch[(size_t)(j * N + n)] != single[(size_t)n]) {
+                        if (first < 0) first = j * N + n;
+                        ++different;
+                    }
+            }
+            const std::string label = "U5 IQR verify M=" + std::to_string(width) +
+                                      " equals independent decodes N=" + std::to_string(N) +
+                                      " K=" + std::to_string(K);
+            ok(label.c_str(), rc == RAD_OK && different == 0 && tail_touched == 0,
+               "rc=" + std::to_string(rc) + ", differing BF16=" + std::to_string(different) +
+               ", first=" + std::to_string(first) + ", untouched-tail violations=" +
+               std::to_string(tail_touched));
+        }
+    }
+
     /* M <= 16 is the GEMV or the 16-token tile, which sum per wave before summing across waves:
      * the product within f32 rounding, so bf16 outputs a rounding apart. The computed trellis
      * under a bf16 scale a (row, 128) takes that tile to 64 tokens. Above, the int8 tiles' bytes. */
@@ -6695,7 +6742,7 @@ struct MoeIqrShape {
 };
 
 static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
-    if (!sel("moe_gemm_iqr")) return;
+    if (!sel("moe_gemm_iqr") && !sel("moe_iqr_row_invariance")) return;
     char nm[240];
     std::snprintf(nm, sizeof nm, "moe_gemm_iqr %s B=%d L=%d run=%lld E=%lld T=%lld N=%lld:%lld "
                   "K=%lld:%lld", sh.what, sh.B, sh.L, (long long)sh.run, (long long)sh.E,
@@ -6862,6 +6909,55 @@ static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
     if (rq != RAD_OK) { ok(nm, false, "rc " + std::to_string(rq)); dfree_all(); return; }
     std::vector<uint16_t> y((size_t)(Tr * N));
     st_memcpy(y.data(), d_y, y.size() * 2, hipMemcpyDeviceToHost);
+
+    /* Exact verify-vs-decode regression: each token's gate/up is routed to the same experts with
+     * the same activations and weights, once inside this batch and once as a single-token step.
+     * Preserve every expert/slot association while remapping the sorted rows for the latter. */
+    if (g_case && sel("moe_iqr_row_invariance")) {
+        if (sh.sorted || sh.drop) { ok(nm, false, "regression expects token-order inputs"); dfree_all(); return; }
+        void* d_so1 = dalloc((size_t)top_k * 4);
+        void* d_of1 = dalloc((size_t)(E + 1) * 4);
+        void* d_y1 = dalloc((size_t)(top_k * N) * 2);
+        if (!d_so1 || !d_of1 || !d_y1) { ok(nm, false, "regression allocation failed"); dfree_all(); return; }
+        int64_t bad = 0, total = 0;
+        for (int64_t tok = 0; tok < sh.Mtok; ++tok) {
+            std::vector<int32_t> so1, of1((size_t)E + 1), original;
+            for (int64_t e = 0; e < E; ++e) {
+                of1[(size_t)e] = (int32_t)so1.size();
+                for (int32_t i = off[(size_t)e]; i < off[(size_t)e + 1]; ++i) {
+                    const int32_t slot = sorted[(size_t)i];
+                    if (slot / top_k == tok) {
+                        so1.push_back((int32_t)(slot % top_k));
+                        original.push_back(i);
+                    }
+                }
+            }
+            of1[(size_t)E] = (int32_t)so1.size();
+            if ((int64_t)so1.size() != top_k) { ok(nm, false, "routing remap failed"); dfree_all(); return; }
+            st_memcpy(d_so1, so1.data(), so1.size() * 4, hipMemcpyHostToDevice);
+            st_memcpy(d_of1, of1.data(), of1.size() * 4, hipMemcpyHostToDevice);
+            auto t1 = ts;
+            t1[0] = T((int8_t*)d_a + tok * K, RAD_I8, { 1, K });
+            t1[1] = T((float*)d_as + tok * nkb, RAD_F32, { 1, nkb });
+            t1[4] = T(d_so1, RAD_I32, { top_k });
+            t1[5] = T(d_of1, RAD_I32, { E + 1 });
+            t1[8] = T(d_y1, RAD_BF16, { top_k, N });
+            auto p1 = ps; p1[0] = PI("M", 1);
+            const int r1 = launch(r, t1, p1);
+            if (r1 != RAD_OK) { ok(nm, false, "decode reference rc " + std::to_string(r1)); dfree_all(); return; }
+            std::vector<uint16_t> one((size_t)(top_k * N));
+            st_memcpy(one.data(), d_y1, one.size() * 2, hipMemcpyDeviceToHost);
+            for (int64_t i = 0; i < top_k; ++i)
+                for (int64_t col = 0; col < N; ++col) {
+                    ++total;
+                    if (one[(size_t)(i * N + col)] != y[(size_t)(original[(size_t)i] * N + col)]) ++bad;
+                }
+        }
+        ok(nm, bad == 0, std::to_string(bad) + " of " + std::to_string(total) +
+                            " BF16 outputs differ from independent decode");
+        dfree_all();
+        return;
+    }
 
     /* The reference, a run's rows at a time through the dense row over the same buffers. */
     std::vector<float> want((size_t)(Tr * N), 0.0f);
@@ -14986,6 +15082,75 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
         else same("gate_quant_fp8 at int8 codes is byte-identical to sigmoid + mul + quant_act_i8g");
     }
 
+    /* Rotated E4M3 gated output: compare its bf16 product to silu_mul and its FWHT and
+     * quantised values against an independent host butterfly. */
+    if (const RadKernelInfo* ghf = find(pl, "gated_had_quant_fp8")) {
+        rc = launch_row(smu, { T(d_gu, RAD_BF16, { M, 2 * K }), T(d_y[0], RAD_BF16, { M, K }) },
+                        { PI("M", M), PI("n", K), PS("dtype", "bf16") });
+        if (rc == RAD_OK)
+            rc = launch_row(ghf, { T(d_gu, RAD_BF16, { M, 2 * K }),
+                                   T(d_q[1], RAD_F8E4M3, { M, K }),
+                                   T(d_s[1], RAD_F32, { M, nkb }),
+                                   T(d_y[1], RAD_BF16, { M, K }) },
+                            { PI("M", M), PI("n", K), PI("group", 128),
+                              PS("dtype", "bf16"), PS("act", "silu") });
+        if (rc != RAD_OK) {
+            ok("gated_had_quant_fp8 vs host FWHT", false, "rc=" + std::to_string(rc));
+        } else {
+            std::vector<uint16_t> ref((size_t)(M * K)), out(ref.size());
+            std::vector<uint8_t> codes((size_t)(M * K));
+            std::vector<float> scales((size_t)(M * nkb));
+            st_memcpy(ref.data(), d_y[0], ref.size() * 2, hipMemcpyDeviceToHost);
+            st_memcpy(out.data(), d_y[1], out.size() * 2, hipMemcpyDeviceToHost);
+            st_memcpy(codes.data(), d_q[1], codes.size(), hipMemcpyDeviceToHost);
+            st_memcpy(scales.data(), d_s[1], scales.size() * 4, hipMemcpyDeviceToHost);
+            size_t bad_product = 0, bad_scale = 0, bad_code = 0;
+            for (size_t i = 0; i < ref.size(); ++i) bad_product += ref[i] != out[i];
+            for (int64_t r = 0; r < M; ++r) for (int64_t b = 0; b < nkb; ++b) {
+                float v[128];
+                for (int i = 0; i < 128; ++i) v[i] = rad_bf16_to_f32(ref[(size_t)(r*K+b*128+i)]);
+                for (int step = 1; step < 128; step *= 2)
+                    for (int i = 0; i < 128; i += 2 * step)
+                        for (int j = 0; j < step; ++j) {
+                            const float x = v[i+j], y = v[i+j+step];
+                            v[i+j] = x+y; v[i+j+step] = x-y;
+                        }
+                float mx = 0.0f;
+                for (float x : v) mx = std::max(mx, std::fabs(x));
+                const float want = mx > 0 ? mx / 448.0f : 1.0f;
+                const float got = scales[(size_t)(r*nkb+b)];
+                bad_scale += !std::isfinite(got) || std::fabs(got-want) > std::max(1e-7f, want*1e-5f);
+                for (int i = 0; i < 128; ++i) {
+                    const size_t at = (size_t)(r*K+b*128+i);
+                    const float decoded = rad_load_f32(codes.data(), RAD_F8E4M3, at) * got;
+                    bad_code += !std::isfinite(decoded) || std::fabs(decoded-v[i]) > std::max(1e-6f, mx*0.065f);
+                }
+            }
+            ok("gated_had_quant_fp8 matches host FWHT and E4M3 tolerance",
+               !bad_product && !bad_scale && !bad_code,
+               "product=" + std::to_string(bad_product) + " scale=" + std::to_string(bad_scale) +
+               " code=" + std::to_string(bad_code));
+            const auto saved_codes = codes;
+            const auto saved_scales = scales;
+            rc = launch_row(ghf, { T(d_gu, RAD_BF16, { M, 2 * K }),
+                                   T(d_q[1], RAD_F8E4M3, { M, K }),
+                                   T(d_s[1], RAD_F32, { M, nkb }), T(nullptr, RAD_BF16, {}) },
+                            { PI("M", M), PI("n", K), PI("group", 128),
+                              PS("dtype", "bf16"), PS("act", "silu") });
+            st_memcpy(codes.data(), d_q[1], codes.size(), hipMemcpyDeviceToHost);
+            st_memcpy(scales.data(), d_s[1], scales.size() * 4, hipMemcpyDeviceToHost);
+            ok("gated_had_quant_fp8 without bf16 output keeps codes and scales",
+               rc == RAD_OK && codes == saved_codes && scales == saved_scales);
+        }
+        rc = launch_row(ghf, { T(d_gu, RAD_BF16, { M, 2 * K }), T(d_q[1], RAD_I8, { M, K }),
+                               T(d_s[1], RAD_F32, { M, nkb }), T(nullptr, RAD_BF16, {}) },
+                        { PI("M", M), PI("n", K), PI("group", 128),
+                          PS("dtype", "bf16"), PS("act", "silu") });
+        ok("gated_had_quant_fp8 refuses int8 codes", rc != RAD_OK);
+    } else {
+        ok("gated_had_quant_fp8 is registered", false, "row absent");
+    }
+
     /* --- the rotated int8 twins, against their producer and had_quant_act_i8g ---
      *
      * For a trunk stored at i8a8h: the bf16 output must not move (it is unrotated), and codes and
@@ -19650,15 +19815,21 @@ static void hc_read_i8(const Plugin& pl, int64_t M, bool real_stream, int form) 
                    : "the int8 run changed" + bad);
 }
 
-/* The gated residual's read at its decode kernels, byte for byte: the launcher's rule (kernels A and
- * B as one grid at one to eight rows, the tiled up-mix pipelined from nine) against the two-grid
- * form, pinned through r4d_hc_read_pin_decode(1). E4M3 or int8 codes, on a real stream (the
- * one-grid form keys its counters on it). The two forms must dispatch different kernels, so a pin
- * that is ignored cannot pass by comparing a form with itself. */
+/* The gated residual's read at its decode kernels: the launcher's rule against the two-grid form,
+ * pinned through r4d_hc_read_pin_decode(1). E4M3 or int8 codes, on a real stream (the one-grid
+ * form keys its counters on it). The two forms must dispatch different kernels, so a pin that is
+ * ignored cannot pass by comparing a form with itself.
+ *
+ * Up to sixteen rows at this shape the rule serves decode forms G (1..8) and S (9..16) with kernel
+ * B3: bf16 WMMA dots, S scaling after the dot. Byte for byte they match neither the per-row kernels
+ * nor the tiled ones, so there d is held to an fp64 host reference - no further from it than the
+ * two-grid form's d - the inject gains must match byte for byte, and x must stay within rounding of
+ * the two-grid form's. Above sixteen rows both forms are the tiled path's and match byte for byte. */
 static void hc_decode_forms(const Plugin& pl, int64_t M, bool i8) {
-    const std::string nm = fmt("hc_read_e4m3 decode kernels at M=%lld, %s codes: the rule "
-                               "byte-identical to the two-grid form", (long long)M,
-                               i8 ? "int8" : "E4M3");
+    const bool level = M <= 16;
+    const std::string nm = fmt("hc_read_e4m3 decode kernels at M=%lld, %s codes: the rule %s the "
+                               "two-grid form", (long long)M, i8 ? "int8" : "E4M3",
+                               level ? "as exact as" : "byte-identical to");
     const RadKernelInfo* r = find(pl, "hc_read_e4m3");
     if (!r) { skip(nm.c_str(), "row absent"); return; }
     if (!pl.pin_hc_dec || !pl.record) { skip(nm.c_str(), "no r4d_hc_read_pin_decode"); return; }
@@ -19733,6 +19904,7 @@ static void hc_decode_forms(const Plugin& pl, int64_t M, bool i8) {
     }
     struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs; std::vector<const void*> fns; };
     Out out[2];
+    std::vector<uint8_t> dsv[2];   /* d: the scratch's first M x lr bf16 values */
     for (int form = 0; form < 2; ++form) {
         pl.pin_hc_dec(form);
         st_memset(d_x, 0, xb); st_memset(d_q, 0, qb); st_memset(d_qs, 0, sb);
@@ -19753,19 +19925,111 @@ static void hc_decode_forms(const Plugin& pl, int64_t M, bool i8) {
         };
         get(out[form].x, d_x, xb); get(out[form].inj, d_inj, ib); get(out[form].q, d_q, qb);
         get(out[form].qs, d_qs, sb); get(out[form].rq, d_rq, qb); get(out[form].rs, d_rs, sb);
+        if (a.scratch) {
+            dsv[form].resize((size_t)(M * lr * 2));
+            st_memcpy(dsv[form].data(), a.scratch, dsv[form].size(), hipMemcpyDeviceToHost);
+        }
     }
     pl.pin_hc_dec(0);
     (void)hipStreamDestroy(hs);
-    std::string bad;
-    if (out[0].x != out[1].x)     bad += " x";
-    if (out[0].inj != out[1].inj) bad += " inj";
-    if (out[0].q != out[1].q)     bad += " q";
-    if (out[0].qs != out[1].qs)   bad += " qs";
-    if (out[0].rq != out[1].rq)   bad += " rq";
-    if (out[0].rs != out[1].rs)   bad += " rs";
     int64_t nz = 0;
     for (uint8_t v : out[0].q) nz += v != 0;
     const bool distinct = out[0].fns != out[1].fns;
+    std::string bad;
+    /* Non-finite outputs first: the error sums below are blind to NaN (std::max drops it and every
+     * comparison with it is false), and NaN in x is what a broken form writes. */
+    {
+        auto nf16 = [](const std::vector<uint8_t>& v) {
+            int64_t c = 0;
+            const uint16_t* p = (const uint16_t*)v.data();
+            for (size_t i = 0; i < v.size() / 2; ++i) c += (p[i] & 0x7f80u) == 0x7f80u;
+            return c;
+        };
+        auto nf32 = [](const std::vector<uint8_t>& v) {
+            int64_t c = 0;
+            const float* p = (const float*)v.data();
+            for (size_t i = 0; i < v.size() / 4; ++i) c += !std::isfinite(p[i]);
+            return c;
+        };
+        for (int f = 0; f < 2; ++f) {
+            const int64_t a1 = nf16(out[f].x), a2 = nf16(out[f].inj), a3 = nf32(out[f].qs),
+                          a4 = nf32(out[f].rs), a5 = dsv[f].empty() ? 0 : nf16(dsv[f]);
+            if (a1 || a2 || a3 || a4 || a5)
+                bad += fmt(" non-finite (%s: x %lld, inj %lld, qs %lld, rs %lld, d %lld)",
+                           f ? "two-grid" : "rule", (long long)a1, (long long)a2, (long long)a3,
+                           (long long)a4, (long long)a5);
+        }
+    }
+    if (!level) {
+        if (out[0].x != out[1].x)     bad += " x";
+        if (out[0].inj != out[1].inj) bad += " inj";
+        if (out[0].q != out[1].q)     bad += " q";
+        if (out[0].qs != out[1].qs)   bad += " qs";
+        if (out[0].rq != out[1].rq)   bad += " rq";
+        if (out[0].rs != out[1].rs)   bad += " rs";
+    } else {
+        if (out[0].inj != out[1].inj) bad += " inj";
+        if (dsv[0].empty()) bad += " (no scratch for d)";
+        /* d against fp64: N unrounded, the dot over the decoded codes and their group scales. The
+         * error of each form as a fraction of the row's RMS of d, max and mean over every row. */
+        const int64_t G = r4d_hc8::down_group(HN);
+        double emax[2] = { 0, 0 }, esum[2] = { 0, 0 };
+        for (int64_t r0 = 0; r0 < M && !dsv[0].empty(); ++r0) {
+            std::vector<double> N((size_t)HN);
+            for (int64_t c = 0; c < hc; ++c) {
+                double ss = 0;
+                for (int64_t j = 0; j < n; ++j) {
+                    const double v = h_bf16(hh[(size_t)(r0 * HN + c * n + j)]);
+                    ss += v * v;
+                }
+                const double sc = 1.0 / std::sqrt(ss / (double)n + 1e-6);
+                for (int64_t j = 0; j < n; ++j)
+                    N[(size_t)(c * n + j)] = h_bf16(hh[(size_t)(r0 * HN + c * n + j)]) * sc
+                                             * ((double)wg[(size_t)(c * n + j)] + 1.0);
+            }
+            std::vector<double> dref((size_t)lr);
+            double ssd = 0;
+            for (int64_t j = 0; j < lr; ++j) {
+                const uint8_t* row = down.data() + j * dld;
+                const float* gsc = (const float*)(row + HN);
+                double dot = 0;
+                for (int64_t kk = 0; kk < HN; ++kk)
+                    dot += (double)h_e4m3(row[kk]) * (double)gsc[kk / G] * N[(size_t)kk];
+                const double z = dot / (double)hc;
+                dref[(size_t)j] = z / (1.0 + std::exp(-z));
+                ssd += dref[(size_t)j] * dref[(size_t)j];
+            }
+            const double rms = std::sqrt(ssd / (double)lr) + 1e-30;
+            for (int f = 0; f < 2; ++f) {
+                const uint16_t* df = (const uint16_t*)dsv[f].data();
+                for (int64_t j = 0; j < lr; ++j) {
+                    const double e = std::fabs(h_bf16(df[r0 * lr + j]) - dref[(size_t)j]) / rms;
+                    emax[f] = std::max(emax[f], e);
+                    esum[f] += e;
+                }
+            }
+        }
+        const double cnt = (double)(M * lr);
+        if (esum[0] > esum[1] * 1.05 + 1e-6 * cnt || emax[0] > emax[1] * 1.10 + 1e-4)
+            bad += fmt(" d (rule %.5f / %.4f, two-grid %.5f / %.4f of RMS, mean / max)",
+                       esum[0] / cnt, emax[0], esum[1] / cnt, emax[1]);
+        /* x: within rounding of the two-grid form's, as a fraction of the row's RMS. */
+        const uint16_t* x0 = (const uint16_t*)out[0].x.data();
+        const uint16_t* x1 = (const uint16_t*)out[1].x.data();
+        double xmax = 0, xsum = 0;
+        for (int64_t r0 = 0; r0 < M; ++r0) {
+            double ss = 0;
+            for (int64_t j = 0; j < n; ++j) { const double v = h_bf16(x1[r0 * n + j]); ss += v * v; }
+            const double rms = std::sqrt(ss / (double)n) + 1e-30;
+            for (int64_t j = 0; j < n; ++j) {
+                const double e = std::fabs(h_bf16(x0[r0 * n + j]) - h_bf16(x1[r0 * n + j])) / rms;
+                xmax = std::max(xmax, e);
+                xsum += e;
+            }
+        }
+        if (xsum / (double)(M * n) > 0.005 || xmax > 0.15)
+            bad += fmt(" x (%.5f mean, %.4f max of RMS)", xsum / (double)(M * n), xmax);
+    }
     ok(nm.c_str(), bad.empty() && nz > (int64_t)qb / 2 && distinct,
        !bad.empty() ? "differs in" + bad
        : !distinct  ? std::string("both forms dispatched the same kernels")
@@ -31923,6 +32187,12 @@ static void device_phase(const Plugin& pl) {
                     iqr_gated_case(pl, b, m, 1024, 1280);
             iqr_gated_case(pl, 4, 1, 17408, 5120);
             iqr_gated_case(pl, 4, 9, 17408, 5120);
+            if (sel("iqr_row_invariance")) {
+                const IqrCase f{ 6, 5, 0, 16, 1, false, true, true };
+                iqr_gemm_case(pl, f, 8, 2048, 2560, true);
+                iqr_gemm_case(pl, f, 8, 6144, 2560, true);
+                iqr_gemm_case(pl, f, 8, 8192, 2560, true);
+            }
             for (const IqrCase& f : fs) {
                 iqr_gemm_case(pl, f, 1, 512, 1024);
                 iqr_gemm_case(pl, f, 2, 4096, 1024);
@@ -32672,6 +32942,12 @@ static void device_phase(const Plugin& pl) {
             };
             for (const MoeIqrShape& sh : kIqr) moe_iqr_case(pl, sh);
         }
+        if (g_case && sel("moe_iqr_row_invariance")) {
+            for (int B : { 4, 5 })
+                for (int64_t m : { (int64_t)2, (int64_t)3, (int64_t)4, (int64_t)7 })
+                    moe_iqr_case(pl, { "row-invariance gate/up", B, 16, 128, 16, 10, m,
+                                       768, 512, 2560, 2560, 2, false, 0 });
+        }
         const bool w4 = sel("moe_gemm_w4a8i8"), w4m = sel("moe_gemm_w4a8i8_mod4");
         const bool w8 = sel("moe_gemm_i8a8"), w8m = sel("moe_gemm_i8a8_mod4");
         if ((w4 || w4m || w8 || w8m) && !g_case)
@@ -33031,9 +33307,9 @@ static void device_phase(const Plugin& pl) {
                 for (int form : { 1, 2 }) hc_read_i8(pl, m, true, form);
             for (int64_t m : { 700, 2048 }) hc_read_i8(pl, m, true, 3);
         }
-        /* The served decode kernels against the two-grid form: each one-grid instantiation (1 to
-         * 8 rows) and the tiled up-mix at both of its row tiles. */
-        for (int64_t m : { 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 32, 33, 64 })
+        /* The served decode kernels against the two-grid form: each row count of form G (1 to 8),
+         * form S at 9, 12 and 16 rows, and the tiled up-mix at both of its row tiles. */
+        for (int64_t m : { 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 32, 33, 64 })
             for (bool i8 : { false, true }) hc_decode_forms(pl, m, i8);
     }
     if (sel("hc_read_bf16")) {
@@ -33226,7 +33502,8 @@ static void device_phase(const Plugin& pl) {
     /* The fused quantisers are checked against the kernels they replace, gated on their own
      * rows. */
     if (sel("rmsnorm_quant_fp8") || sel("gated_quant_fp8") || sel("gate_quant_fp8") ||
-        sel("rmsnorm_had_quant_i8g") || sel("gated_had_quant_i8g")) {
+        sel("gated_had_quant_fp8") || sel("rmsnorm_had_quant_i8g") ||
+        sel("gated_had_quant_i8g")) {
         if (!g_case) std::printf("\nthe fp8 fusions, against the pair each one replaces\n");
         fused_quant_fp8_numeric(pl);
     }

@@ -3,7 +3,9 @@
 //
 //   gemm_iqr_nt_m64   M <= 64 (decode and speculative verify). At one token (a computed trellis;
 //                     M <= 8 for the other forms) a GEMV: a block a 16-row tile, its waves across
-//                     K, each lane's decoded values one sudot4 against the activation. To 16 tokens
+//                     K, each lane's decoded values one sudot4 against the activation. The U5
+//                     row-f32 trunk uses the GEMV through M=8, so its verify rows retain the
+//                     single-token decode's accumulation order. To 16 tokens
 //                     a WMMA tile of the same shape, each 128-K unit decoded and transposed into
 //                     fragment order through the wave's LDS just before its WMMA steps. Above, the
 //                     i8a8 narrow tile with the same per-unit decode.
@@ -155,6 +157,13 @@ void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restri
                      uint16_t* __restrict__ Y, uint32_t N, uint32_t x_ld, uint32_t xs_ld,
                      GatedOut go) {
     if (CH::on) r4d_chain_wait();
+    /* A non-gated single-token GEMV may put independent token rows on grid.y. Every block then
+     * executes exactly the M=1 arithmetic over its own row, including the chained launch. */
+    if constexpr (!GATED && MT == 1) {
+        X  += (size_t)blockIdx.y * x_ld;
+        XS += (size_t)blockIdx.y * xs_ld;
+        Y  += (size_t)blockIdx.y * N;
+    }
     using D = Dec<F, true>;
     constexpr uint32_t NW = (GATED ? 2u : 1u) * KW;
     __shared__ __attribute__((aligned(16))) int8_t s_tab[D::kTab];
@@ -952,6 +961,11 @@ int gemv_launch(const Operands& g, RadStream stream, const GatedOut* go = nullpt
      * 4 bits: gate_up 146.6 / 147.1 us, down 76.0 / 78.4, the 5120 x 6144 outputs 31.4 / 31.9,
      * attn_k 9.5 / 8.8). */
     const uint32_t kw = N >= 4096u ? 4u : 8u;
+    /* U5 row-f32's GEMV has the single-token fold order through MT=4. At MT>4 it uses a different
+     * fold, so put independent single-row blocks on grid.y instead. Gated GEMMs keep their
+     * existing dispatch and counter layout. */
+    const bool row_grid = !go && F::KIND == kTrellisMad && F::B == 5u && F::LRB == 0u &&
+                          F::SC == kRowF32 && M > 4u && M <= kGemvMaxM;
     const GatedOut gz = go ? *go : GatedOut{};
     uint16_t* const y = go ? nullptr : (uint16_t*)g.y->data;
     int rc = RAD_E_SHAPE;
@@ -959,7 +973,8 @@ int gemv_launch(const Operands& g, RadStream stream, const GatedOut* go = nullpt
     rc = go ? R4D_EMIT(stream, (iqr_gemv_kernel<F, mt_, kw_, true, ch_>), dim3(N / 32u),         \
                        dim3(2u * kw_ * kWave), 0, c, (const int8_t*)g.a->data,                    \
                        (const float*)g.as->data, y, N, (uint32_t)g.a_ld, (uint32_t)g.sa_ld, gz)   \
-            : R4D_EMIT(stream, (iqr_gemv_kernel<F, mt_, kw_, false, ch_>), dim3(N / 16u),        \
+            : R4D_EMIT(stream, (iqr_gemv_kernel<F, mt_, kw_, false, ch_>),                       \
+                       dim3(N / 16u, row_grid ? M : 1u),                                          \
                        dim3(kw_ * kWave), 0, c, (const int8_t*)g.a->data,                         \
                        (const float*)g.as->data, y, N, (uint32_t)g.a_ld, (uint32_t)g.sa_ld, gz)
 #define R4D_IQR_GV(mt_, kw_)                                                                     \
@@ -970,7 +985,9 @@ int gemv_launch(const Operands& g, RadStream stream, const GatedOut* go = nullpt
              R4D_IQR_GV_E(mt_, kw_, R4dUnchained);                                               \
          } } while (0)
 #define R4D_IQR_GVK(mt_) do { if (kw == 4u) R4D_IQR_GV(mt_, 4u); else R4D_IQR_GV(mt_, 8u); } while (0)
-    switch (M) {
+    if (row_grid) {
+        R4D_IQR_GVK(1u);
+    } else switch (M) {
         case 1u: R4D_IQR_GVK(1u); break;
         case 2u: R4D_IQR_GVK(2u); break;
         case 3u: R4D_IQR_GVK(3u); break;
@@ -1052,7 +1069,8 @@ template <class F>
 int m64_launch(const Operands& g, void* scratch, long long scratch_bytes, int split_n,
                RadStream stream) {
     const uint32_t N = (uint32_t)g.N, K = (uint32_t)g.K, M = (uint32_t)g.M;
-    if (M <= gemv_max<F>()) return gemv_launch<F>(g, stream);
+    const bool row_grid = F::KIND == kTrellisMad && F::B == 5u && F::LRB == 0u && F::SC == kRowF32;
+    if (M <= gemv_max<F>() || (row_grid && M <= kGemvMaxM)) return gemv_launch<F>(g, stream);
     if (M <= (tiles_form<F>() ? 64u : 16u) && ((uintptr_t)g.y->data & 15u) == 0u)
         return m16_launch<F>(g, stream);
     /* At most eight waves a block: each has its own transpose tile in LDS. The wave count changes

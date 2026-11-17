@@ -162,6 +162,10 @@ static const Flag g_flags[] = {
     "                                    disabled -- the default, also with no flag at all -- loads\n"
     "                                    nothing: no projection op is declared, and a request that\n"
     "                                    asks for the vector is refused" },
+    { "--control-vector-variant", "NAME", "list MODEL:NAME, a name of this model whose\n"
+    "                                    requests run with the control vector on; the model's\n"
+    "                                    own name keeps --control-vector's default. Needs\n"
+    "                                    --control-vector off or on" },
     { "--deterministic",      nullptr,  "pin placement to the plan the loader made, so the resident\n"
     "                                    set cannot change under the heat engine. The sampler is\n"
     "                                    already order-independent and needs no pinning; note that\n"
@@ -548,6 +552,18 @@ static bool parse_template_kwargs(const char* v, std::map<std::string, std::stri
     return true;
 }
 
+/* A name a request may give as `model`, by the rule a fleet applies to model ids and aliases
+ * (fleet::valid_name, in a file this one does not include): not empty, and no ':' (reserved for
+ * base:adapter), whitespace or control character. */
+static bool plain_name(const char* s) {
+    if (!*s) return false;
+    for (; *s; ++s) {
+        const unsigned char ch = (unsigned char)*s;
+        if (ch == ':' || std::isspace(ch) || std::iscntrl(ch)) return false;
+    }
+    return true;
+}
+
 /* Returns 0 on success, 1 for --help (caller exits 0), negative on a bad argument. An unknown flag
  * is an error, not a warning, since a mistyped budget flag changes the plan. */
 int config_parse(int argc, char** argv, Config* c) {
@@ -805,6 +821,15 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
             c->control_vector = v;
+        }
+        else if (S("--control-vector-variant")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!plain_name(v)) {
+                RAD_ERR("--control-vector-variant takes a name with no ':' or whitespace -- "
+                        "got '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->control_vector_variant = v;
         }
         else if (S("--deterministic"))         c->deterministic = true;
         else if (S("--checkpoint-interval"))   { if (!num(0, INT64_MAX, &c->checkpoint_interval)) return RAD_E_INVAL; }
@@ -1263,6 +1288,21 @@ int config_parse(int argc, char** argv, Config* c) {
         RAD_ERR("--calib-corpus records into --calib-dir; give one");
         return RAD_E_INVAL;
     }
+    if (!c->control_vector_variant.empty()) {
+        if (c->control_vector == "disabled") {
+            RAD_ERR("--control-vector-variant needs --control-vector off or on: with no vector "
+                    "loaded, '%s' would have nothing to switch on",
+                    c->control_vector_variant.c_str());
+            return RAD_E_INVAL;
+        }
+        /* An adapter is named the same way, `base:name`, so the two must differ. */
+        for (const auto& [name, dir] : c->lora.adapters)
+            if (name == c->control_vector_variant) {
+                RAD_ERR("--control-vector-variant '%s' is also a --lora adapter's name, so a "
+                        "request naming it could mean either; rename one", name.c_str());
+                return RAD_E_INVAL;
+            }
+    }
     if ((!c->calib_dir.empty() || c->calib_layer_hi) && !c->calib() && c->kld_record.empty()) {
         RAD_ERR("--calib-dir and --calib-layers belong to a --calib-corpus or --kld-record run");
         return RAD_E_INVAL;
@@ -1473,6 +1513,8 @@ const ShowRow kShow[] = {
           return o.empty() ? std::string(c.lora.enabled() ? "the adapters' own" : "-") : o; } },
     { "--placement",          [](const Config& c) { return c.placement; } },
     { "--control-vector",     [](const Config& c) { return c.control_vector; } },
+    { "--control-vector-variant", [](const Config& c) {
+          return or_none(c.control_vector_variant, "none: no variant listed"); } },
     { "--deterministic",      [](const Config& c) { return onoff(c.deterministic); } },
     { "--checkpoint-interval", [](const Config& c) { return num(c.checkpoint_interval); } },
     { "--prefill-span",       [](const Config& c) { return num(c.prefill_span); } },

@@ -1238,10 +1238,6 @@ void resize_lanczos_torch(const Frame& in, int32_t w, int32_t h, Frame* out) {
     resize_bicubic_impl(in, w, h, out, true, lanczos, 3.0);
 }
 
-/* Python's round(): the nearest integer, a tie to the even one. The default floating-point
- * environment rounds that way, which nearbyint follows. */
-static inline int64_t py_round(double x) { return (int64_t)std::nearbyint(x); }
-
 void radio_size(int64_t w, int64_t h, const VisionConfig& c, int32_t* wp, int32_t* hp) {
     const int64_t div = c.merge, lo = c.radio_min_patches;
     const int64_t hi = c.radio_max_patches > 0 ? c.radio_max_patches : INT64_MAX;
@@ -1249,8 +1245,8 @@ void radio_size(int64_t w, int64_t h, const VisionConfig& c, int32_t* wp, int32_
     const int64_t avail = std::max<int64_t>(std::min<int64_t>(budget, hi), lo);
     /* round(x + 0.5): x + 1 rounded down for a fraction, and for a whole x, x or x + 1 by parity
      * (Python's tie to even), which the reference's comment does not say but its code does. */
-    const int64_t ch = py_round((double)h / (double)c.patch + 0.5);
-    const int64_t cw = py_round((double)w / (double)c.patch + 0.5);
+    const int64_t ch = pyround((double)h / (double)c.patch + 0.5);
+    const int64_t cw = pyround((double)w / (double)c.patch + 0.5);
     const double factor = std::min(std::sqrt((double)avail / (double)(ch * cw)), 1.0);
     int64_t th = (int64_t)std::floor(factor * (double)ch);
     int64_t tw = (int64_t)std::floor(factor * (double)cw);
@@ -1270,8 +1266,8 @@ void radio_size(int64_t w, int64_t h, const VisionConfig& c, int32_t* wp, int32_
 void radio_video_size(int64_t w, int64_t h, const VisionConfig& c, int32_t* wp, int32_t* hp) {
     const int64_t div = c.merge, target = c.radio_video_patches;
     const double aspect = (double)w / (double)std::max<int64_t>(h, 1);
-    int64_t ph = std::max<int64_t>(py_round(std::sqrt((double)target / aspect)), 1);
-    int64_t pw = std::max<int64_t>(py_round(std::sqrt((double)target * aspect)), 1);
+    int64_t ph = std::max<int64_t>(pyround(std::sqrt((double)target / aspect)), 1);
+    int64_t pw = std::max<int64_t>(pyround(std::sqrt((double)target * aspect)), 1);
     if (div > 1) {
         const int64_t rh = ph % div, rw = pw % div;
         const int64_t phu = ph + (rh ? div - rh : 0), pwu = pw + (rw ? div - rw : 0);

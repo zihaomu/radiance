@@ -11,7 +11,7 @@ namespace ggufw {
 
 struct GKv {
     std::string key;
-    uint32_t type;                     /* 4 u32, 6 f32, 8 string, 9 array of strings */
+    uint32_t type;                     /* 4 u32, 6 f32, 8 string, 9 array of strings, 10 i64 */
     double num = 0;
     std::vector<std::string> strs;
 };
@@ -42,6 +42,7 @@ inline bool write_gguf(const std::string& path, const std::vector<GKv>& kvs,
         put_str(&b, kv.key);
         put_bytes(&b, &kv.type, 4);
         if (kv.type == 4) { const uint32_t v = (uint32_t)kv.num; put_bytes(&b, &v, 4); }
+        else if (kv.type == 10) { const int64_t v = (int64_t)kv.num; put_bytes(&b, &v, 8); }
         else if (kv.type == 6) { const float v = (float)kv.num; put_bytes(&b, &v, 4); }
         else if (kv.type == 8) put_str(&b, kv.strs.at(0));
         else {

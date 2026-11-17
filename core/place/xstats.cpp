@@ -7,9 +7,11 @@
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <fcntl.h>
 #include <set>
 #include <unistd.h>
 
@@ -347,9 +349,29 @@ std::string xs_json(const XsSnapshot& s) {
 
 int xs_write_atomic(const std::string& path, const std::string& text) {
     const std::string tmp = path + ".tmp." + std::to_string((long long)getpid());
-    FILE* f = std::fopen(tmp.c_str(), "w");
+    /* Created fresh, exclusive, never through a symlink. The name is predictable -- the PID
+     * is public -- and fopen("w") follows links and truncates: a local user pre-creating it
+     * as a symlink had the serving process overwrite whatever file the link named, as the
+     * serving user. An existing name, of any kind, is now a refusal. */
+    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0 && errno == EEXIST) {
+        /* A crash can leave our own tmp name behind, and a reboot can reuse the PID; the
+         * name is then ours to clear, its contents nobody's to overwrite. The retry is
+         * exclusive again, so whoever else pre-created it wins only a refusal -- we never
+         * follow it, truncate it, or write through it. */
+        ::unlink(tmp.c_str());
+        fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    }
+    if (fd < 0) {
+        RAD_WARN("--expert-stats: cannot create %s: %s", tmp.c_str(), std::strerror(errno));
+        return RAD_E_IO;
+    }
+    FILE* f = ::fdopen(fd, "w");
     if (!f) {
-        RAD_WARN("--expert-stats: cannot write %s: %s", tmp.c_str(), std::strerror(errno));
+        const int err = errno;
+        ::close(fd);
+        ::unlink(tmp.c_str());
+        RAD_WARN("--expert-stats: cannot open %s: %s", tmp.c_str(), std::strerror(err));
         return RAD_E_IO;
     }
     const bool wrote = std::fwrite(text.data(), 1, text.size(), f) == text.size() &&
@@ -492,17 +514,34 @@ int xs_profile_load(const std::string& path, std::vector<RadFileProfile>* out, i
     }
     std::string text;
     char buf[1 << 16];
-    while (const size_t n = std::fread(buf, 1, sizeof buf, f)) text.append(buf, n);
+    /* Capped WHILE reading. A profile is a handful of integers per layer and expert even for
+     * the largest shipped MoE; anything far past that is not a profile, and the old loop
+     * grew memory with any file it was pointed at before any check ran. */
+    static const size_t kMaxProfileBytes = 64u << 20;
+    bool too_big = false;
+    while (const size_t n = std::fread(buf, 1, sizeof buf, f)) {
+        text.append(buf, n);
+        if (text.size() > kMaxProfileBytes) { too_big = true; break; }
+    }
     const bool bad = std::ferror(f) != 0;
     std::fclose(f);
+    if (too_big) {
+        RAD_ERR("--expert-profile: %s is past %zu MiB; an expert profile is a handful of "
+                "integers per layer and expert, and this is not one",
+                path.c_str(), (size_t)(kMaxProfileBytes >> 20));
+        return RAD_E_INVAL;
+    }
     if (bad) {
         RAD_ERR("--expert-profile: reading %s failed", path.c_str());
         return RAD_E_IO;
     }
-    Json j;
-    try { j = Json::parse(text); }
-    catch (const Json::exception& e) {
-        RAD_ERR("--expert-profile: %s is not JSON: %s", path.c_str(), e.what());
+    /* A file like any other the container or a colleague supplies: bounded read, so a hostile
+     * one is refused during the read instead of grown into a tree. */
+    bool over = false, deep = false;
+    Json j = Json::parse_container(text, &over, &deep);
+    if (over || deep || j.is_discarded()) {
+        RAD_ERR("--expert-profile: %s is not JSON (%s)", path.c_str(),
+                Json::bound_why(over, deep));
         return RAD_E_INVAL;
     }
     if (!j.is_object() || j.value("format", "") != "radiance-expert-stats/1" ||
@@ -512,21 +551,38 @@ int xs_profile_load(const std::string& path, std::vector<RadFileProfile>* out, i
                 path.c_str());
         return RAD_E_INVAL;
     }
-    if (n_trunk && j.contains("n_trunk_layers") && j["n_trunk_layers"].is_number_integer())
-        *n_trunk = j["n_trunk_layers"].get<int32_t>();
+    if (n_trunk && j.contains("n_trunk_layers") && j["n_trunk_layers"].is_number_integer()) {
+        /* int64, range-checked: read through int32, a value that wraps past 2^32 can land on
+         * exactly the layer count the "this profile is another model" refusal compares
+         * against -- the check the file would be escaping. */
+        const int64_t t = j["n_trunk_layers"].get<int64_t>();
+        if (t < 0 || t > INT32_MAX) {
+            RAD_ERR("--expert-profile: %s carries n_trunk_layers %lld, outside 0..%d",
+                    path.c_str(), (long long)t, (int)INT32_MAX);
+            return RAD_E_INVAL;
+        }
+        *n_trunk = (int32_t)t;
+    }
     const auto& rows = j["counts"]["decode"];
     int64_t kept = 0;
     for (size_t l = 0; l < rows.size(); ++l) {
         if (!rows[l].is_array()) continue;
+        /* Counts are unsigned. The facade's arithmetic read casts -- a negative read as
+         * uint64_t wraps to 2^64-ish, and a wrapped count reads as a ~100% share, steering the
+         * planner's pinning at whatever the file's author named. Under the old JSON library a
+         * negative threw its way out of here; refuse the file by name instead. */
+        for (size_t e = 0; e < rows[l].size(); ++e)
+            if (!rows[l][e].is_number_unsigned()) {
+                RAD_ERR("--expert-profile: %s carries a negative or fractional count at decode "
+                        "layer %zu expert %zu; the format's counts are unsigned",
+                        path.c_str(), l, e);
+                return RAD_E_INVAL;
+            }
         uint64_t sum = 0;
-        for (const auto& c : rows[l])
-            if (c.is_number_unsigned() || c.is_number_integer())
-                sum += c.get<uint64_t>();
+        for (const auto& c : rows[l]) sum += c.get<uint64_t>();
         if (sum == 0) continue;
         for (size_t e = 0; e < rows[l].size(); ++e) {
-            const auto& c = rows[l][e];
-            if (!(c.is_number_unsigned() || c.is_number_integer())) continue;
-            const uint64_t n = c.get<uint64_t>();
+            const uint64_t n = rows[l][e].get<uint64_t>();
             if (n == 0) continue;
             RadFileProfile p{};
             p.layer = (int32_t)l;

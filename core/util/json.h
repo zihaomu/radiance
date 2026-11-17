@@ -894,6 +894,20 @@ public:
      * of a tree when a bound trips; returns discarded on a syntax error. */
     static Json parse_bounded(std::string_view text, int64_t budget, int max_depth, bool* over,
                               bool* deep);
+    /* A JSON file the container, an adapter or a download supplied. The wire's bounded read,
+     * sized generously instead: these files legitimately carry huge FLAT value sets (a
+     * tokenizer's vocabulary), and nothing legitimate nests 256 deep. A file past either bound
+     * comes back discarded, like a syntax error -- deep enough to refuse, never deep enough
+     * to overflow a dump's or a destructor's stack on the way there. */
+    static Json parse_container(std::string_view text, bool* over = nullptr,
+                                bool* deep = nullptr);
+     /* The refusal message behind `over`/`deep`: one wording for all callers, so the bound and
+      * the phrase that names it live together instead of being re-typed at each refuse site
+      * (six near-copies had drifted). The phrase for whichever bound tripped. */
+     static const char* bound_why(bool over, bool deep);
+     /* The container read's own bounds, for a caller that states them in its refusal. */
+     static constexpr int64_t kContainerBudget = 1LL << 24;
+     static constexpr int     kContainerDepth  = 256;
 
 private:
     using difference_type = std::ptrdiff_t;

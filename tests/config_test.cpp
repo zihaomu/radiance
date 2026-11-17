@@ -594,6 +594,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--trusted-proxy", { "127.0.0.0/8" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
         { "--control-vector", { "off" } },
+        { "--control-vector-variant", { "uncensored", "--control-vector", "off" } },
         { "--generation-config", { "/g.json" } }, { "--override-chat-template", { "/t.jinja" } },
         { "--temp", { "0.7" } }, { "--top-k", { "40" } }, { "--top-p", { "0.9" } },
         { "--min-p", { "0.05" } }, { "--reasoning-effort", { "low" } },
@@ -799,6 +800,37 @@ TEST(the_control_vector_flag_is_off_on_or_disabled) {
         CHECK_EQ(st, (int)RAD_E_INVAL);
         CHECK(has(log, "--control-vector"));
     }
+}
+
+/* The variant is a name a request gives as `model`, so it keeps the rule names keep, and it needs a
+ * loaded vector: with none it would answer as the stock model while the client asked for the
+ * vector. A --lora adapter of the same name would make `base:name` mean two things. */
+TEST(the_control_vector_variant_needs_a_vector_and_a_plain_name_of_its_own) {
+    {
+        Config c;
+        CHECK_EQ(parse({ "--control-vector", "off", "--control-vector-variant", "uncensored" }, &c),
+                 RAD_OK);
+        CHECK_EQ(c.control_vector_variant, std::string("uncensored"));
+    }
+    {
+        Config c;
+        CHECK_EQ(parse({}, &c), RAD_OK);
+        CHECK(c.control_vector_variant.empty());
+    }
+    auto refused = [](std::initializer_list<const char*> v) {
+        Config c;
+        int st = RAD_OK;
+        const std::string log = stderr_of([&] { st = parse(v, &c); });
+        CHECK_EQ(st, (int)RAD_E_INVAL);
+        CHECK(has(log, "--control-vector-variant"));
+    };
+    refused({ "--control-vector-variant", "uncensored" });
+    refused({ "--control-vector", "disabled", "--control-vector-variant", "uncensored" });
+    refused({ "--control-vector", "off", "--control-vector-variant", "base:uncensored" });
+    refused({ "--control-vector", "off", "--control-vector-variant", "two words" });
+    refused({ "--control-vector", "off", "--control-vector-variant", "" });
+    refused({ "--control-vector", "off", "--lora", "uncensored=/ad/u",
+              "--control-vector-variant", "uncensored" });
 }
 
 TEST(the_wire_mode_is_one_of_two_names) {

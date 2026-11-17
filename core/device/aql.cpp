@@ -958,7 +958,11 @@ void stuck_watch() {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         const int64_t ms = stuck_ms();
         const int64_t limit = rad::dev_stuck_exit_ms.load(std::memory_order_relaxed);
-        if (limit > 0 && ms >= limit) {
+        /* The load phase is exempt (device.h): a verdict standing before the first engine
+         * finished bringup is a slow load, not a hang, and killing on it trades a patient
+         * start for a crash loop. The dumps and the log line still fire -- an operator
+         * watching a stuck load sees the queue state exactly as before. */
+        if (limit > 0 && ms >= limit && rad::dev_engine_ready.load(std::memory_order_acquire)) {
             dump_queues("the device");
             fatal("the device has advanced nothing for %lld s (the queue dumps above name the "
                   "packets it is stuck on); exiting so a restart can bring the server back",
@@ -1008,11 +1012,21 @@ struct Stall {
             g_stuck_progress.store(p, std::memory_order_relaxed);
             g_stuck_at.store(steady_ns() - (uint64_t)kStallMs * 1000000u, std::memory_order_release);
             dump_queues(where);
-            RAD_ERR("device: nothing has advanced in the %u s since: the GPU is not running the "
-                    "packet named above -- a hung kernel, or a queue the driver evicted and could "
-                    "not restore (amdgpu cwsr_enable=0 is one cause). The process exits once this "
-                    "has stood for scheduler.stuck-exit (%lld s; 0 never)", kStallMs / 1000,
-                    (long long)(rad::dev_stuck_exit_ms.load(std::memory_order_relaxed) / 1000));
+            /* The verdict says what the verdict will DO (L-02's rule: never a silent difference):
+             * before the first engine finished bringup the exit is not armed -- a stall standing
+             * during a load is a slow load (device.h's dev_engine_ready). */
+            if (rad::dev_engine_ready.load(std::memory_order_acquire))
+                RAD_ERR("device: nothing has advanced in the %u s since: the GPU is not running the "
+                        "packet named above -- a hung kernel, or a queue the driver evicted and could "
+                        "not restore (amdgpu cwsr_enable=0 is one cause). The process exits once this "
+                        "has stood for scheduler.stuck-exit (%lld s; 0 never)", kStallMs / 1000,
+                        (long long)(rad::dev_stuck_exit_ms.load(std::memory_order_relaxed) / 1000));
+            else
+                RAD_ERR("device: nothing has advanced in the %u s since: the GPU is not running the "
+                        "packet named above -- a hung kernel, or a queue the driver evicted and could "
+                        "not restore (amdgpu cwsr_enable=0 is one cause). The engine is still in "
+                        "bringup, so scheduler.stuck-exit is not armed yet: this verdict is reported, "
+                        "not fatal, until the first engine has finished loading", kStallMs / 1000);
             if (!g_stuck_watch.exchange(true, std::memory_order_acq_rel))
                 std::thread(stuck_watch).detach();
             return;

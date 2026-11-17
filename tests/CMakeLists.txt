@@ -10,7 +10,7 @@
 #   fast     every test with none of slow, gpu, oot and perf, set at the end of this file: the
 #            inner loop (`ctest --preset fast`, or `ctest -L fast`)
 #
-# arch_test, bailing_hybrid_arch_test, flint_arch_test, glm5next_test, museglimmer_test, nemotron35_test, spark25_arch_test and nemotronh_test do not link rad_core: they supply
+# The tests named in RAD_TESTS_NO_CORE below do not link rad_core: they supply
 # their own recording fake of the declare-phase C ABI (arch_fakes.h), so plugins are tested without
 # depending on core/build/'s builder. With the archive linked, a new ABI call missing from the fake
 # would pull in rad_builder.cpp.o and collide on every rad_decl_* symbol; without it the error is a
@@ -851,6 +851,12 @@ if(RAD_PYTHON3 AND EXISTS ${CMAKE_SOURCE_DIR}/dashboard/package.json)
     LABELS "fast;unit"
     TIMEOUT ${RAD_TEST_TIMEOUT})
 endif()
+# The header's digest proves sources and its own claim agree, nothing more: it cannot catch a
+# tamper of the committed served bytes that rewrites that digest to match. This hashes the
+# artifacts themselves from outside, so tampering with one alone fails.
+add_test(NAME artifact_sums
+         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/artifact_sums.sh ${CMAKE_SOURCE_DIR})
+set_tests_properties(artifact_sums PROPERTIES LABELS "fast;unit" TIMEOUT ${RAD_TEST_TIMEOUT})
 if(RAD_PYTHON3)
   add_test(NAME rad_export_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/rad_export_test.py)
   set_tests_properties(rad_export_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
@@ -1029,4 +1035,4 @@ endif()
 # machine state, so it runs wherever the suite runs.
 add_test(NAME vendor_sums
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/vendor_sums.sh ${CMAKE_SOURCE_DIR})
-set_tests_properties(vendor_sums PROPERTIES LABELS "fast;unit" TIMEOUT 120)
+set_tests_properties(vendor_sums PROPERTIES LABELS "fast;unit" TIMEOUT ${RAD_TEST_TIMEOUT})

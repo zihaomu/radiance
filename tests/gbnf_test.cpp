@@ -1515,6 +1515,22 @@ TEST(gbnf_a_grammar_whose_masks_need_unbounded_context_is_refused) {
     std::fprintf(stderr, "    refused: %s\n", err.c_str());
 }
 
+/* `pattern` is client data, and the group scanner recurses once per nested '('. Unbounded, a
+ * few tens of KB of '(' -- one JSON string, so the body's depth and value bounds never see it --
+ * stack-overflows the request worker past any catch. Nesting past the cap is refused the way
+ * every other unsupported syntax is, and a pattern no real schema exceeds stays legal. */
+TEST(gbnf_a_pattern_nesting_past_the_cap_is_refused_not_fatal) {
+    const std::string deep = "^" + std::string(20000, '(') + "a" + std::string(20000, ')') + "$";
+    const std::string schema = std::string(R"({"type":"string","pattern":")") + deep + R"("})";
+    std::string gbnf, err;
+    CHECK(grammar_from_json_schema(schema, "root", &gbnf, &err) != 0);
+    CHECK(err.find("deep") != std::string::npos);
+    const std::string sane = "^" + std::string(40, '(') + "a" + std::string(40, ')') + "$";
+    const std::string schema_ok = std::string(R"({"type":"string","pattern":")") + sane + R"("})";
+    std::string gbnf2, err2;
+    CHECK_OK(grammar_from_json_schema(schema_ok, "root", &gbnf2, &err2));
+}
+
 /* A rule that can never match is refused by name. `r ::= r` passes the left-recursion check (the
  * reference is in tail position) but only leads back into itself, and upstream reads the resulting
  * empty stack set as admitting every token. A grammar that merely never ends still compiles. */

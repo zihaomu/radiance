@@ -1,6 +1,9 @@
 /* rad_util.cpp -- logging, string formatting, Geometry and constraint matching. */
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include "../rad_internal.h"
 
 #include <cstdio>
@@ -90,6 +93,19 @@ std::string log_sanitize(const std::string& s) {
         if ((b < 0x20 && b != '\t') || b == 0x7f) c = '?';
     }
     return out;
+}
+
+int read_text_file(const std::string& path, std::string& out, size_t cap) {
+    std::error_code ec;
+    const std::uintmax_t sz = std::filesystem::file_size(path, ec);
+    if (ec) return RAD_E_IO;
+    if (sz > cap) return RAD_E_FORMAT;  /* refused before the bytes are read */
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return RAD_E_IO;
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    out = ss.str();
+    return RAD_OK;
 }
 
 void log_emit(Log l, const char* file, int line, const char* fmt, ...) {

@@ -877,6 +877,68 @@ TEST(a_codebook_indexes_its_table_and_the_scale_multiplies_it) {
     }
 }
 
+/* A vq= codebook file is attacker data, and its loader appended every line to memory before
+ * checking any count, while its "# unit" line parsed `inf` through %lf -- and the fallback
+ * guard `!(unit > 0.0)` let infinity through, where a NaN falls back to the entries' rms. The
+ * count is now checked while appending (the widest code is u12: past 4096 codewords could not
+ * be indexed even with the memory), and only a finite positive names the unit. */
+TEST(the_codebook_loader_caps_while_reading_and_refuses_an_infinite_unit) {
+    NEED_LIBQUANT();
+    TempDir dir("vqcap");
+    auto write_cb = [&](const char* name, const char* head, int lines) -> std::string {
+        const std::string p = dir.path + "/" + name;
+        /* No REQUIRE in here: its failure spelling returns void, and this lambda returns a
+         * path. An unopenable path yields an empty/short file, which the loaders refuse --
+         * the surrounding CHECKs catch it either way. */
+        std::FILE* f = std::fopen(p.c_str(), "wb");
+        if (f != nullptr) {
+            if (head) std::fprintf(f, "%s\n", head);
+            for (int i = 0; i < lines; ++i) std::fprintf(f, "%d %d %d %d\n", i % 5 - 2, 3, -4, 5);
+            std::fclose(f);
+        }
+        return p;
+    };
+    const int64_t R = 8, C = 128;
+    const std::vector<float> w = draw(R * C, 5, 0.0f);
+
+    /* vq= is gptq's path -- rtn refuses it ("vq= is quantised by gptq") -- so every case here
+     * goes through gptq and every refusal below is the LOADER's, not a quantizer mismatch. */
+    /* One past the cap: refused by name. 4097 entries used to build an encoding whose u12
+     * codes could not index its own last codeword. */
+    {
+        Opts o;
+        o.s("vq", write_cb("big.txt", "# unit 1.0", 4097).c_str()).i("group", 128).s("scale", "bf16");
+        CHECK(quantise(quantizer("gptq"), o, "x", R, C, w).status != RAD_OK);
+    }
+    /* The cap itself is the largest honest codebook: it reads. */
+    {
+        Opts o;
+        o.s("vq", write_cb("cap.txt", "# unit 1.0", 4096).c_str()).i("group", 128).s("scale", "bf16");
+        CHECK_EQ(quantise(quantizer("gptq"), o, "x", R, C, w).status, RAD_OK);
+    }
+    /* "# unit inf" used to multiply every decoded value by infinity; ignored now, the entries'
+     * own rms takes over and the decode stays finite. */
+    {
+        Opts o;
+        o.s("vq", write_cb("inf.txt", "# unit inf", 256).c_str()).i("group", 128).s("scale", "bf16");
+        Quantised q = quantise(quantizer("gptq"), o, "x", R, C, w);
+        REQUIRE_EQ(q.status, RAD_OK);
+        const std::vector<float> d = decode(q, R, C);
+        REQUIRE(!d.empty());
+        int bad = 0;
+        for (float x : d) bad += !std::isfinite(x);
+        CHECK_EQ(bad, 0);
+    }
+    /* tcq's sibling flow: a zero tcq_gain used to divide the unit by zero and every code
+     * became inf; the loader refuses it by name now. */
+    {
+        Opts o;
+        o.s("codes", "u2").i("tcq", 10).i("tcq_rows", 256).i("group", 128).s("scale", "bf16")
+            .f("tcq_gain", 0.0);
+        CHECK(quantise(quantizer("gptq"), o, "x", R, C, w).status != RAD_OK);
+    }
+}
+
 /* A trellis grid (tcq=L): each column's codes are the bits a 2^L-state bitshift trellis shifts in,
  * row by row, and a value is its state's table entry times the block's scale. Its own scheme,
  * decoded by libquant's hook: the decode is the values the Viterbi search chose, and at the same

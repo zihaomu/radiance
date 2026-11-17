@@ -116,7 +116,9 @@ struct ChatFormat {
     std::string call_open, call_close;
     /* "<function=", ">\n". name_suffix may be empty: in the object family the name then ends at
      * the object's `{`; in the tagged family, where name_prefix must open the call (no
-     * call_open), at the first arg_prefix or call_end, which stay part of the call's body. */
+     * call_open), at the first arg_prefix or call_end, which stay part of the call's body. A
+     * suffix of only whitespace is read as that second ending: the name stops at the whitespace
+     * (`<tool_call>NAME\n<arg_key>`, Ling 3.0), which the grammar still writes. */
     std::string name_prefix, name_suffix;
     std::string call_end;                     /* "</function>\n"; may be empty for an object */
 

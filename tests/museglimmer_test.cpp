@@ -532,6 +532,12 @@ TEST(museglimmer_refuses_a_vision_tower_it_does_not_serve) {
         { "vision_config.merge_size", "4", RAD_E_UNSUPPORTED },
         { "out_hidden_size", "256", RAD_E_INVAL },
         { "vision_config.pos_emb_width", "8", RAD_E_INVAL },
+        /* the counts the declare walks and hosts-allocates by: a container naming a layer count
+         * or grid past what a tower is must refuse, not throw a vector length out of bringup.
+         * 129 is the first depth the bound refuses; the published maximum is 48. */
+        { "vision_config.num_hidden_layers", "129", RAD_E_INVAL },
+        { "vision_config.num_hidden_layers", "4611686018427387904", RAD_E_INVAL },
+        { "vision_config.pos_emb_height", "4611686018427387904", RAD_E_INVAL },
     };
     for (const auto& kc : kCases) {
         MetaKV mk = with_vision(muse_meta());
@@ -542,6 +548,18 @@ TEST(museglimmer_refuses_a_vision_tower_it_does_not_serve) {
         if (rc != kc.rc) fprintf(stderr, "    %s = %s: rc %d\n", kc.key, kc.val, rc);
         CHECK_EQ(rc, kc.rc);
     }
+}
+
+TEST(museglimmer_refuses_a_position_grid_past_its_bounds) {
+    /* One key at a time cannot pin the grid bound: pos_emb_height alone the height==width
+     * rule refuses before the cap is consulted. Both sides together reach it -- 513 is the
+     * first side the bound refuses, against a published maximum of 92. */
+    MetaKV mk = with_vision(muse_meta());
+    mk.set("vision_config.pos_emb_height", "513");
+    mk.set("vision_config.pos_emb_width", "513");
+    RadBuilder b;
+    RadBuildCtx ctx = muse_ctx(0, 1, 64);
+    CHECK_EQ(stderr_of_rc([&] { return museglimmer::declare(&b, mk.meta(), &ctx); }), RAD_E_INVAL);
 }
 
 /* ==================================================================== 5. the encoder step */

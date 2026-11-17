@@ -152,6 +152,13 @@ struct MtpHcBlock {
     MoeFP8       mlp{};
 
     rad_op op_gather = 0, op_embed = 0, op_embed_ar = 0, op_enter = 0, op_carry = 0;
+    /* The selected draft calibration also records the bf16 attention input shared by
+     * qg/k/v, independently of the expert gate's later input. */
+    rad_buf b_attn_gram = 0;
+    rad_op op_attn_gram = 0;
+    const char* attn_gram_stem = nullptr;
+    mutable int64_t attn_gram_rows = 0;
+    mutable bool attn_gram_done = false;
 
     /* Media rows over the head's embedding (see MtpBlockFP8::media). Set before declare when the
      * program has an encoder. */
@@ -258,6 +265,20 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
      * order. */
     RAD_ARCH_TRY(hc_attn.declare(b, nm, g, nm.f("mtp.attn_hc"), hc, HyperConn::Wire{w.hw, w.x, w.inj},
                                  src.hc_attn));
+    if (src.mlp.cfg.calib) {
+        /* Only a BF16 source supplies domain-0 inputs for this calibration. The input
+         * is replicated, so each TP rank records the same width and GPTQ sums them. */
+        if (!src.mlp.cfg.expert_bf16 || !w.attn.h.x) return RAD_E_UNSUPPORTED;
+        attn_gram_stem = nm.f("blk.%d.attn_qg", l);
+        b_attn_gram = decl_b(b, nm.f("blk.%d.mtp_attn_gram", l), RAD_F32,
+                             {g.n_embd, g.n_embd}, RAD_BUF_PERSIST);
+        op_attn_gram = rw(b, RAD_OP(b, "gram_accum",
+                              RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", g.n_embd),
+                                         RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16")),
+                              RAD_NOWEIGHTS),
+                          {w.attn.h.x, b_attn_gram}, {b_attn_gram});
+        if (!b_attn_gram || !op_attn_gram) return RAD_E_INVAL;
+    }
     RAD_ARCH_TRY(rad_bind_layer_kv(b, l, kv));
     attn.ar_out_take = hc_attn.ar_take();
     RAD_ARCH_TRY(attn.declare(b, nm, g, l, kv, rotary_dim, w.attn, src.attn,
@@ -471,6 +492,17 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
 inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
     const int64_t T = batch->n_tok;
     const int     r = batch->draft_pass;
+    /* Expert calibration needs real draft-layer inputs, not the trunk's Hessian. In a
+     * selected calibration layer, run the history's teacher-forced rows through the full
+     * draft block before selecting the rows needed by the drafter. Normal inference and
+     * a tap that has reached its target retain the ordinary history-only fast path. */
+    const bool tap_history = r < 0 && mlp.c.calib && !mlp.calib_done;
+    /* serial_batch names one trunk hidden row per history token. Refuse an incomplete
+     * gather instead of silently calibrating stale hin rows if that contract changes. */
+    if (tap_history && (batch->n_out != T || !batch->out_ids)) {
+        rad_step_fail(c, "MTP calibration needs one trunk hidden row per history token");
+        return;
+    }
 
     /* The history pass continues from the trunk's wide stream; later rounds from the head's,
      * which the carry left in the same buffer. */
@@ -493,11 +525,26 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
               RAD_W(w_fc_h), RAD_W(w_fc_e), brows(w.hw, T));
 
     hc_attn.read_pieces(c, T);
+    if (tap_history && op_attn_gram && !attn_gram_done) {
+        if (attn_gram_rows == 0)
+            rad_memset_async(rad_buf_ptr(c, b_attn_gram), 0,
+                             g.n_embd * g.n_embd * 4, rad_stream(c));
+        RAD_ISSUE_N(c, op_attn_gram, T, brows(w.attn.h.x, T), RAD_NONE,
+                    brows(b_attn_gram, g.n_embd));
+        attn_gram_rows += T;
+        if (attn_gram_rows >= calib_target()) {
+            if (!calib_write(c, b_attn_gram, g.n_embd, attn_gram_rows, attn_gram_stem, 0)) {
+                rad_step_fail(c, "MTP calibration could not write its attention input Gram");
+                return;
+            }
+            attn_gram_done = true;
+        }
+    }
 
     /* A history pass with no drafting rows (every prefill chunk but a prompt's last) only stores
      * the head's state: K and V, and the indexer's block keys and tail. `n_draft_out` is the same
      * on every rank, so skipped collectives match. */
-    if (r < 0 && batch->n_draft_out <= 0) {
+    if (r < 0 && batch->n_draft_out <= 0 && !tap_history) {
         qsa.store(c, attn.w.h, batch);
         attn.store_kv(c, batch);
         return;
@@ -513,7 +560,7 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
     /* A history pass with drafting rows continues on those rows alone (round 1): they are moved
      * to the front of `hw` and the rest of the head runs over them. */
     int64_t L = T;                      /* the rows the stream goes on with */
-    if (r < 0) {
+    if (r < 0 && !tap_history) {
         L = batch->n_draft_out;
         RAD_ISSUE_N(c, op_dsel, L, RAD_B(w.hw), praw(batch->draft_out_ids, RAD_I32, L),
                     brows(w.hin, L));
@@ -523,6 +570,16 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
     hc_mlp.read_pieces(c, L);
     mlp.step_rows(c, L);
     hc_mlp.write(c, L, 0, L);
+
+    if (tap_history) {
+        /* History-only chunks have no proposal. For the last chunk, select the same
+         * round-1 rows the ordinary path would have selected before its feed-forward. */
+        L = batch->n_draft_out;
+        if (L <= 0) return;
+        RAD_ISSUE_N(c, op_dsel, L, RAD_B(w.hw), praw(batch->draft_out_ids, RAD_I32, L),
+                    brows(w.hin, L));
+        RAD_ISSUE_N(c, op_dback, L, brows(w.hin, L), brows(w.hw, L));
+    }
 
     /* The carry, only if a later round reads it: a history pass is round 1, followed by round 2
      * when depth > 1; the last round is followed by a trunk step. */

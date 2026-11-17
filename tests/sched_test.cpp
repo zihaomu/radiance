@@ -378,6 +378,47 @@ TEST(chunk_geometry_snapshots_a_trunk_window_and_not_a_drafters) {
     }
 }
 
+/* Gemma 4 exact group layout: a non-drafter RAD_KV_WINDOW trunk group (sliding layers) beside a
+ * non-drafter RAD_KV_FULL trunk group (full layers) and a drafter own RAD_KV_FULL group. The
+ * window group is what a prefix hit resumes from (scheduler.cpp trunk share clamp): it must
+ * still enable window checkpoints and a non zero interval even with a drafter riding a separate
+ * full group. A drafter own group is RAD_KV_FULL here so it never feeds has window; only the
+ * trunk window group does. */
+TEST(gemma4_layout_window_group_enables_prefix_cache_checkpoints) {
+    Program prog;
+    prog.meta.n_layers = 30;
+    prog.kv_groups.emplace_back();   /* index 0 sentinel */
+    KVGroupInfo swa;
+    swa.name = "kv_swa";
+    swa.decl.kind = RAD_KV_WINDOW;
+    swa.decl.window = 1024;
+    swa.block_size = 16;
+    swa.layers = { 0 };   /* trunk sliding layer < n_layers, not a drafter group */
+    prog.kv_groups.push_back(swa);
+    KVGroupInfo full;
+    full.name = "kv_full";
+    full.decl.kind = RAD_KV_FULL;
+    full.block_size = 16;
+    full.layers = { 1 };   /* trunk full layer < n_layers */
+    prog.kv_groups.push_back(full);
+    KVGroupInfo draft;
+    draft.name = "kv_draft";
+    draft.decl.kind = RAD_KV_FULL;
+    draft.block_size = 16;
+    draft.layers = { 30 };   /* drafter own group, bound at n_layers and above */
+    draft.drafter = true;
+    prog.kv_groups.push_back(draft);
+    Config cfg;
+    cfg.max_tok = 512;
+    cfg.checkpoint_interval = 2048;   /* the default (rad_core.h) */
+    cfg.prefix_cache = true;
+    ChunkGeometry g;
+    CHECK_OK(chunk_geometry_resolve(prog, cfg, &g));
+    CHECK(g.checkpoint_interval > 0);
+    CHECK(g.window_ckpt);
+    CHECK(window_snapshots(prog, cfg));
+}
+
 TEST(chunk_geometry_refuses_a_budget_it_cannot_serve) {
     Fixture f;
     f.build();

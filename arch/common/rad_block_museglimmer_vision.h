@@ -132,11 +132,24 @@ inline int MuseTower::declare(RadBuilder* b, const RadModelMeta* m, const RadBui
     proj_ff    = rad_meta_geti(m, "projector_hidden_size", 4096);
     out_hidden = rad_meta_geti(m, "out_hidden_size", 6144);
     n_embd     = model_embd;
-    if (depth <= 0 || width <= 0 || heads <= 0 || ff <= 0 || patch <= 0 || temporal <= 0 ||
-        merge <= 0 || side <= 0 || proj_ff <= 0 || out_hidden <= 0 || width % heads ||
+    /* Bounds the walk and the host allocations below take at face value, set against published
+     * maxima rather than round numbers: the deepest vision encoder ever shipped is 48 layers
+     * (ViT-22B, InternViT-6B; this family's towers are SigLIP-class, tens), and the largest
+     * stored position table a side of 92 (SigLIP at 1292 px over patch 14; CLIP 16, SAM 64 --
+     * native-resolution towers store no side x side table at all). The caps sit ~2.6x and
+     * ~5.5x past those maxima, so they never bite an honest container, and at the cap the
+     * guarded shapes are harmless: the depth vectors cost KiB and the grid products reach 2^18
+     * at most. Past the caps the container is not describing a model but a vector size
+     * (full.assign(depth) and L.assign(depth) would throw past max_size, and the grid products
+     * below overflow signed 64 before any comparison could notice). Refuse like every other
+     * bad config: say so and RAD_E_INVAL. */
+    if (depth <= 0 || depth > 128 || width <= 0 || heads <= 0 || ff <= 0 || patch <= 0 ||
+        temporal <= 0 || merge <= 0 || side <= 0 || side > 512 || proj_ff <= 0 ||
+        out_hidden <= 0 || width % heads ||
         rad_meta_geti(m, "vision_config.pos_emb_width", 0) != side) {
-        fprintf(stderr, "radiance: museglimmer: the container's vision_config is incomplete or "
-                        "inconsistent (depth %lld, hidden %lld, heads %lld, ff %lld, patch %lld, "
+        fprintf(stderr, "radiance: museglimmer: the container's vision_config is incomplete, "
+                        "inconsistent, or past what this tower walks (depth %lld, hidden %lld, "
+                        "heads %lld, ff %lld, patch %lld, "
                         "temporal %lld, merge %lld, position grid %lld x %lld, projector %lld, "
                         "merged %lld)\n", (long long)depth, (long long)width, (long long)heads,
                 (long long)ff, (long long)patch, (long long)temporal, (long long)merge,

@@ -3789,6 +3789,9 @@ static const RadOpSchema kSchemas[] = {
            "the two-rank exact all-reduce of x and rmsnorm_quant_i8g after it, in one kernel."),
     SCHEMA("gated_quant_fp8", pGatedQuantFp8, oGatedQuantFp8,
            "silu(a)*b or sigmoid(a)*b, then the same quantiser, in one pass."),
+    SCHEMA("gated_had_quant_fp8", pGatedQuantFp8, oGatedQuantFp8,
+           "Gated product rounded to bf16, FWHT128, and per-group E4M3 quantisation; "
+           "the optional bf16 output is the unrotated product."),
     SCHEMA("gated_had_quant_i8g", pGatedQuantFp8, oGatedQuantFp8,
            "gated_had_quant_fp8 at int8 codes: silu(a)*b or sigmoid(a)*b, a `group`-wide Hadamard "
            "and had_quant_act_i8g's quantiser, in one pass. `out_bf16` receives the UNROTATED "
@@ -9308,8 +9311,15 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   /* `silu_mul` + `quant_act_fp8`, silu arm only (r4d_fuse.cpp). */
   r4d_fuse_gated_quant_fp8 },
 
-/* The rotated twin, for a down projection whose weight is stored at w4a8h. No fusion hook:
- * nothing emits `silu_mul` + `had_quant_act_fp8`; the MoE block declares this op directly. */
+/* The rotated E4M3 twin, used by rotated codebook down projections. */
+{ "gated_had_quant_fp8", "gated_had_quant_fp8", "quant",
+  "a bf16-rounded gated product, FWHT128, and the per-group E4M3 activation quantiser",
+  "n a multiple of 128; packed gate then up; group 128",
+  "bf16 in, E4M3 codes and f32 scales, with optional unrotated bf16 product",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGatedHadQuantFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_gated_had_quant_fp8, nullptr, nullptr, nullptr,
+  r4d_shape_gated_quant_fp8 },
 
 /* Its int8 twin, for a down projection whose weight is stored at i8a8h. */
 { "gated_had_quant_i8g", "gated_had_quant_i8g", "quant",

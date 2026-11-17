@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstdarg>
+#include <atomic>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -34,6 +35,25 @@ uint64_t log_last_line_ns();
  * unfiltered newline forges a line while an ESC sequence drives the terminal that reads it.
  * Multi-byte UTF-8 is left alone; only control bytes are replaced. */
 std::string log_sanitize(const std::string& s);
+
+/* The once-log idiom: true on the first call for this flag, false forever after -- a warning
+ * that would otherwise repeat every step logs its first occurrence and stays quiet. Thread-safe
+ * by compare_exchange, so exactly one thread wins. */
+inline bool log_once(std::atomic<bool>& flag) {
+    bool expected = false;
+    return flag.compare_exchange_strong(expected, true);
+}
+
+/* The whole text of a file, refused BEFORE it is read when it is bigger than `cap`. Files a
+ * container supplies are screened by size as well as by JSON budget: the bounded read counts
+ * values, not bytes, and the slurp used to be the unbounded step -- a multi-gigabyte
+ * tokenizer.json grew the string before anything said no. RAD_E_IO when unreadable,
+ * RAD_E_FORMAT when past the cap; nothing is read then. */
+int read_text_file(const std::string& path, std::string& out, size_t cap);
+
+/* What one container-supplied JSON file may be: past the largest real tokenizer.json by wide
+ * margin, far below what turns a load into an OOM. Weight files are not read this way. */
+inline constexpr size_t kMaxContainerFile = 1u << 28;  /* 256 MiB */
 
 /* Rank tags on log lines. Per-rank components (pools, planner, mover, sampler) print the same
  * line once per rank, so under TP each line needs its rank. LogRank sets the tag as a scope

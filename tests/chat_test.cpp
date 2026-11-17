@@ -229,6 +229,45 @@ TEST(a_concatenated_string_equals_its_text) {
 
 /* Tool-call arguments sent as an object reach a template that only takes them as text as their
  * compact JSON, as when the request sent that text. */
+TEST(a_refused_request_cannot_grow_an_unbounded_dom_in_its_tool_call_arguments) {
+    /* bad_arguments runs on the !served path -- template refused, merge refused -- and probes the
+     * arguments strings as JSON to name the offender. Probing with the unbounded parser let a
+     * client that had already failed the template hand the probe a few million flat values to
+     * grow into a DOM nothing would read. The probe is bounded now; these bounds reject the
+     * oversized and over-deep strings as the refusal they name, and a real call is unaffected. */
+    ChatTemplate t;
+    CHECK_OK(t.load(
+        "{%- for m in messages %}"
+        "{%- if m.role == 'system' and not loop.first %}"
+        "{{- raise_exception('System message must be at the beginning.') }}{%- endif %}"
+        "{%- if m.role == 'user' and m.content == 'boom' %}{{- raise_exception('no boom') }}{%- endif %}"
+        "<{{ m.role }}>{{ m.content }}</{{ m.role }}>"
+        "{%- endfor %}", "", ""));
+    ChatOptions opt;
+    opt.quiet = true;
+    auto with_args = [](const std::string& args) {
+        return json::parse(R"([{"role":"system","content":"s1"},{"role":"system","content":"s2"},)"
+                           R"({"role":"user","content":"boom"},)"
+                           R"({"role":"assistant","content":"","tool_calls":[{"id":"c","type":"function",)"
+                           R"("function":{"name":"f","arguments":)" + json(args).dump() + R"(}}]}])");
+    };
+    ChatPrompt huge_p;
+    std::string many = "[";
+    for (int v = 0; v < 1100000; ++v) many += v ? ",1" : "1";
+    many += "]";
+    const int huge_rc = t.apply(with_args(many), json(), opt, &huge_p);
+    CHECK(huge_rc < 0);
+    CHECK(huge_p.error.find("carries far more values") != std::string::npos);
+    ChatPrompt deep_p;
+    CHECK(t.apply(with_args(std::string(1200, '[') + std::string(1200, ']')), json(), opt, &deep_p) < 0);
+    CHECK(deep_p.error.find("nests far deeper") != std::string::npos);
+    /* An honest refusal of an honest call still comes back in the template's own words. */
+    ChatPrompt ok_p;
+    CHECK(t.apply(with_args("{\"z\":1}"), json(), opt, &ok_p) < 0);
+    CHECK(ok_p.error.find("chat template refused") != std::string::npos);
+    CHECK(ok_p.error.find("function.arguments") == std::string::npos);
+}
+
 TEST(object_arguments_reach_a_string_only_template_as_compact_json) {
     ChatTemplate t;
     REQUIRE(t.load(
@@ -1093,6 +1132,50 @@ TEST(mc_a_reply_with_no_call_is_just_content) {
  *   Capabilities are probed by rendering synthetic inputs, not assumed; a default answer would
  *   report tool support for a template without it.
  */
+
+/* The template is container data and the engine parses and runs it. Both sides of that had no
+ * budget: the parser recursed once per nesting paren/block -- tens of KB of brackets in a
+ * container's tokenizer.chat_template was an uncatchable stack overflow of the probe or the
+ * first render -- and range() materialised one value per step, so {{ range(4000000000) }} was
+ * an OOM per render. The budgets refuse; the refusals cross this seam as the error values the
+ * block above promises, and templates past any real nesting still render. */
+TEST(template_budgets_refuse_as_values_never_as_crashes) {
+    json msgs = json::array();
+    msgs.push_back({{"role", "user"}, {"content", "x"}});
+    ChatOptions opt;
+    opt.add_generation_prompt = true;
+    ChatPrompt p;
+
+    ChatTemplate parens;
+    const std::string deep = "{{ " + std::string(5000, '(') + "1" + std::string(5000, ')') + " }}";
+    CHECK(parens.load(deep, "", "") < 0 || parens.apply(msgs, json(), opt, &p) < 0);
+
+    ChatTemplate ifs;
+    std::string nested;
+    for (int i = 0; i < 5000; ++i) nested += "{% if 1 %}";
+    nested += "ok";
+    for (int i = 0; i < 5000; ++i) nested += "{% endif %}";
+    CHECK(ifs.load(nested, "", "") < 0 || ifs.apply(msgs, json(), opt, &p) < 0);
+
+    /* The engine constant-folds at load, so the huge range is refused at load already; the
+     * seam's promise is that SOME step refuses with an error value -- same shape as above. */
+    ChatTemplate big;
+    CHECK(big.load("{{ range(4000000000)|length }}", "", "") < 0 ||
+          big.apply(msgs, json(), opt, &p) < 0);
+
+    /* Repetition is range()'s sibling: "x" * 4e9 materialised a byte per step. The cap
+     * refuses at load or at render -- the seam still answers with a value, never memory. */
+    ChatTemplate rep;
+    CHECK(rep.load("{{ 'x' * 4000000000 }}", "", "") < 0 ||
+          rep.apply(msgs, json(), opt, &p) < 0);
+
+    /* The shape no real template reaches is refused; what real ones do still renders. */
+    ChatTemplate sane;
+    CHECK_OK(sane.load("A{{ (((1))) }}{% if 1 %}{% if 1 %}B{% endif %}{% endif %}{{ range(10)|length }}",
+                       "", ""));
+    CHECK_OK(sane.apply(msgs, json(), opt, &p));
+    CHECK(p.prompt.find("A1B10") != std::string::npos);
+}
 
 TEST(an_empty_template_is_the_chatml_fallback_and_says_which_one_it_is) {
     ChatTemplate t;

@@ -20,6 +20,13 @@ import sys
 KINDS = ("prefill", "decode", "mixed", "draft")
 
 
+def safe(s):
+    """A string for display. A stats file can come from someone else's run, and its model,
+    arch and map strings reach the operator's terminal: ESC there starts an OSC sequence that
+    could retitle the window or worse, so control characters print as '?' and never raw."""
+    return "".join("?" if (c < " " or c == "\x7f" or 0x80 <= ord(c) <= 0x9F) else c for c in str(s))
+
+
 def gini(xs):
     """Gini coefficient of non-negative counts: 0 flat, (n-1)/n when one expert takes everything."""
     n = len(xs)
@@ -92,7 +99,7 @@ def main():
     topk = d["top_k"]
 
     up = d.get("uptime_s", 0.0)
-    print(f"{a.file}: {d.get('model', '?')} ({d.get('arch', '?')}), TP{d.get('tp', '?')}, "
+    print(f"{a.file}: {safe(d.get('model', '?'))} ({safe(d.get('arch', '?'))}), TP{d.get('tp', '?')}, "
           f"{'final' if d.get('final') else 'periodic'} write after {up / 60:.1f} min")
     tok = d.get("tokens", {})
     stp = d.get("steps", {})
@@ -101,7 +108,7 @@ def main():
     ranks = d.get("ranks", {})
     print(f"  drain: {sum(ranks.get('credited', []))} histograms credited, {sum(ranks.get('dropped', []))} lost by the "
           f"ring, {sum(ranks.get('unmapped', []))} unmapped selections, {sum(ranks.get('unclassified', []))} unclassified")
-    maps = sorted(set(m for m, n in zip(d.get("map", []), lex) if n > 0))
+    maps = sorted(set(safe(m) for m, n in zip(d.get("map", []), lex) if n > 0))
     print(f"  ids: {', '.join(maps)}; summing {'+'.join(kinds)} as 'all'")
 
     # Self-check: selections == observed tokens x top_k, per kind and layer.
@@ -216,4 +223,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (TypeError, ValueError, KeyError, IndexError, AttributeError) as e:
+        # A file that passes the format check but has the wrong shape underneath is untrusted
+        # data too: name the fault on one line rather than print a traceback to read past.
+        sys.exit(f"expert_stats_report: malformed stats file: {e}")

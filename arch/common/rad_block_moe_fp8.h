@@ -810,7 +810,10 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             fmt_of(e, enc, fe, nmv);
             if (fe[0] == 3 && fe[1] == 3) continue;
             for (int i = 0; i < 2; ++i) {
-                if (family(want) && family(fe[i])) fmt[i] = fe[i];
+                /* A trellis gate_up reads rotated int8, but the down projection can use the
+                 * W5NL E4M3 kernel: its gated intermediate is quantised independently below. */
+                const bool mixed_w5_down = a8f && want == 11 && i == 1 && fe[i] == 7;
+                if (family(want) && (family(fe[i]) || mixed_w5_down)) fmt[i] = fe[i];
                 fenc[i] = enc[i];
             }
             break;
@@ -1079,9 +1082,12 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                         "architecture declared the routed arm's codes E4M3\n", l);
         return RAD_E_UNSUPPORTED;
     }
+    const bool down_w5_fp8 = a8 && fmt[0] == 11 && fmt[1] == 7;
     if (a8) {
         const bool pair = w.eff.q8 && w.eff.s8 && w.eff.q8_rot && w.eff.g8 == RAD_FP8_BLOCK;
-        if (!pair || !c.expert_rot || !kServed8[fmt[0]] || !kServed8[fmt[1]] || c.calib ||
+        const bool down_supported = down_w5_fp8 ? (w.eff.q && w.eff.s && kServed[fmt[1]])
+                                                : kServed8[fmt[1]] != nullptr;
+        if (!pair || !c.expert_rot || !kServed8[fmt[0]] || !down_supported || c.calib ||
             c.swiglu_limit > 0) {
             fprintf(stderr, "radiance: layer %d: int8 activations meet rotated experts (int8, "
                             "four-bit, or the codebook at E4M3 scales a 64 or 32 of K) through "
@@ -1105,7 +1111,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * experts' encoding or the kernel is not a candidate. */
     gu_trellis = fmt[0] == 11;
     const char* const edtype[2] = { a8 ? kServed8[fmt[0]] : kServed[fmt[0]],
-                                    a8 ? kServed8[fmt[1]] : kServed[fmt[1]] };
+                                    a8 && !down_w5_fp8 ? kServed8[fmt[1]] : kServed[fmt[1]] };
     /* This class's slice of each expert: gate and up rows [lo, hi), down columns [lo, hi), scale
      * planes the same in their own units. */
     auto span = [&](rad_weight h, int q, int64_t unit) -> int {
@@ -1302,9 +1308,13 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * which takes the codes alone (no bf16 product is written), so the gated quantiser resolves to
      * the rotated op at no extra launch. */
     gq_exp.fuse_clamped = c.swiglu_quant != 0;
-    /* Fed int8, `eff` names the rotating int8 quantiser itself (ActFP8::q8_rot). */
-    RAD_ARCH_TRY(gq_exp.declare(b, g, w.egu, w.eff, c.n_ff_exp, gact, c.rows * c.top_k,
-                                false, rot && !a8, c.swiglu_limit, c.swiglu_step != 0));
+    /* Gate_up and down are separate GEMMs. A trellis gate uses int8 input while W5NL down
+     * reads rotated E4M3: select the latter pair only for the gated intermediate. */
+    ActFP8 down_eff = w.eff;
+    if (down_w5_fp8) down_eff.q8_fed = down_eff.q8_rot = false;
+    RAD_ARCH_TRY(gq_exp.declare(b, g, w.egu, down_eff, c.n_ff_exp, gact, c.rows * c.top_k,
+                                false, rot && (!a8 || down_w5_fp8), c.swiglu_limit,
+                                c.swiglu_step != 0));
     {
         const std::vector<rad_weight> tab = tables(w_dn, w_dns);
         const RadParam p4[] = { RAD_RANGE("M", 1, c.rows), RAD_INT("N", g.n_embd),
@@ -1321,13 +1331,13 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                 RAD_STR("a_order", "sorted"), RAD_STR("dtype", edtype[1]),
                                 RAD_INT("N_odd", g.n_embd), RAD_INT("K_odd", wq[1]),
                                 RAD_INT("parts", 1), RAD_INT("a_group", RAD_FP8_BLOCK) };
-        const int cut = a8 ? 0 : 1;
+        const int cut = a8 && !down_w5_fp8 ? 0 : 1;
         rad_op h = ncls == 4
             ? rad_decl_op(b, "moe_gemm_q_mod4", p4, (int)(sizeof p4 / sizeof *p4) - cut,
                           tab.data(), (int)tab.size())
             : rad_decl_op(b, "moe_gemm_q", p2, (int)(sizeof p2 / sizeof *p2) - cut,
                           tab.data(), (int)tab.size());
-        op_dn = rw(b, h, {w.eff.cq(), w.eff.cs(), w.sorted, w.eoff}, {w.edn});
+        op_dn = rw(b, h, {down_eff.cq(), down_eff.cs(), w.sorted, w.eoff}, {w.edn});
     }
     /* ---- The protected experts' own GEMM pair. Their weights belong to the layer group, not to
      * expert slots: each container expert unit has a fixed size and these are four times larger, so
@@ -1925,7 +1935,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
     else if (ncls == 4)
         RAD_ISSUE_N(c_, op_dn, rows,
-                    brows(w.eff.cq(), rows * k), brows(w.eff.cs(), rows * k),
+                    brows(gq_exp.a.cq(), rows * k), brows(gq_exp.a.cs(), rows * k),
                     RAD_WTAB(w_dn[0], n4[0]), RAD_WTAB(w_dns[0], n4[0]),
                     brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
                     RAD_WTAB(w_dn[1], n4[1]), RAD_WTAB(w_dns[1], n4[1]),
@@ -1934,7 +1944,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brows(w.edn, rows * k));
     else
         RAD_ISSUE_N(c_, op_dn, rows,
-                    brows(w.eff.cq(), rows * k), brows(w.eff.cs(), rows * k),
+                    brows(gq_exp.a.cq(), rows * k), brows(gq_exp.a.cs(), rows * k),
                     RAD_WTAB(w_dn[0], n_reg / 2), RAD_WTAB(w_dns[0], n_reg / 2),
                     brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
                     RAD_WTAB(w_dn[1], n_reg / 2), RAD_WTAB(w_dns[1], n_reg / 2),

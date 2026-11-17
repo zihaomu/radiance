@@ -1081,6 +1081,17 @@ inline bool linear_is_wnh(const RadEncoding& e) {
            zp->block[1] == RAD_FP8_BLOCK;
 }
 
+/* Whether a trunk whose first linear probed as `e` is rotated int8 -- w8h or wnh -- and if so
+ * how wide its activation codes' scale group is: 256 for IQ8R, 128 for the other rotated forms
+ * (linear_w8h_group spells the rule). An arch learns this by probing layer 0's q projection
+ * before declaring activations; the probe and the fields are the arch's, the question belongs
+ * beside the predicates it is made of. */
+inline bool trunk_rotation(const RadEncoding& e, int64_t* g8) {
+    if (!linear_is_w8h(e) && !linear_is_wnh(e)) return false;
+    *g8 = linear_w8h_group(e);
+    return true;
+}
+
 /* The OCP-MXFP4 weight LinearFP8 serves at mxfp4a8: e2m1 codes and an E8M0 exponent per [1 x 32],
  * no transform (libr4d's MXFP4 layout hook). */
 enum { RAD_MX_GROUP = 32 };

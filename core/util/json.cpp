@@ -93,8 +93,11 @@ Json yy_scalar(yyjson_val* v) {
     }
 }
 
-/* Convert, counting against budget (containers after their children) and depth. Returns
- * discarded when either bound trips after setting the matching flag. */
+/* Convert, counting against budget (every value, containers included, as the pre-migration
+ * parser callback counted) and depth. Both bounds are enforced where the value is DISCOVERED,
+ * not in a second pass over the whole document: a body past either bound is refused while the
+ * scratch is still budget-sized, not after the tree's worth of frames has been collected.
+ * Returns discarded when either bound trips, after setting the matching flag. */
 Json yy_convert(yyjson_val* root, int64_t budget, int max_depth, bool* over, bool* deep) {
     *over = false;
     *deep = false;
@@ -104,21 +107,36 @@ Json yy_convert(yyjson_val* root, int64_t budget, int max_depth, bool* over, boo
     };
     std::vector<Frame> order;
     std::vector<Frame> stack;
+    int64_t seen = 1;
+    auto push = [&](yyjson_val* val, int depth) -> bool {
+        if (++seen > budget) {
+            *over = true;
+            return false;
+        }
+        if (depth > max_depth) {
+            *deep = true;
+            return false;
+        }
+        stack.push_back({ val, depth });
+        return true;
+    };
     stack.push_back({ root, 0 });
     while (!stack.empty()) {
         const Frame f = stack.back();
         stack.pop_back();
-        if (f.depth > max_depth) *deep = true;
+        if (f.depth > max_depth) { *deep = true; return Json(Json::value_t::discarded); }
         order.push_back(f);
         const yyjson_type t = yyjson_get_type(f.v);
         if (t == YYJSON_TYPE_ARR) {
             size_t idx, max;
             yyjson_val* el;
-            yyjson_arr_foreach(f.v, idx, max, el) stack.push_back({ el, f.depth + 1 });
+            yyjson_arr_foreach(f.v, idx, max, el)
+                if (!push(el, f.depth + 1)) return Json(Json::value_t::discarded);
         } else if (t == YYJSON_TYPE_OBJ) {
             size_t idx, max;
             yyjson_val *k, *val;
-            yyjson_obj_foreach(f.v, idx, max, k, val) stack.push_back({ val, f.depth + 1 });
+            yyjson_obj_foreach(f.v, idx, max, k, val)
+                if (!push(val, f.depth + 1)) return Json(Json::value_t::discarded);
         }
     }
     if (*deep) return Json(Json::value_t::discarded);
@@ -216,10 +234,33 @@ Json Json::parse_bounded(std::string_view text, int64_t budget, int max_depth, b
     YyDoc d(text, budget, false);
     *over = false;
     *deep = false;
-    if (!d.doc) return Json(value_t::discarded);
+    if (!d.doc) {
+        /* A syntax error comes back plain-discarded, like the parser's own refusal. But when
+         * the READ itself ran the arena out -- a well-formed document whose DOM outgrew the
+         * cap set at its open -- that IS the too-many-values refusal, reached one level below
+         * the discovery count (a 200k-empty-array swarm carries no scalar for the count to
+         * trip on, and yyjson refuses its DOM long before the converter sees a frame). Say
+         * so, so every caller's bound speaks with one voice. */
+        if (d.err.code == YYJSON_READ_ERROR_MEMORY_ALLOCATION) *over = true;
+        return Json(value_t::discarded);
+    }
     Json out = yy_convert(yyjson_doc_get_root(d.doc), budget, max_depth, over, deep);
     if (*over || *deep) return Json();
     return out;
+}
+
+Json Json::parse_container(std::string_view text, bool* over, bool* deep) {
+    bool o = false, d = false;
+    Json j = parse_bounded(text, kContainerBudget, kContainerDepth, &o, &d);
+    if (over) *over = o;
+    if (deep) *deep = d;
+    return j;
+}
+
+const char* Json::bound_why(bool over, bool deep) {
+    return over ? "carries far too many values"
+                : deep ? "nests far too deep"
+                       : "is not valid JSON";
 }
 
 Json Json::parse(std::string_view text) { return parse(text, nullptr, true, false); }

@@ -746,8 +746,8 @@ struct ReplyFormat::Impl {
     /* Object family. `object`: a call's arguments are one object. `ns_object`: the object's own
      * `{` ends the name (name_suffix empty), and ns_core is "{". */
     bool object = false, ns_object = false;
-    /* Tagged family, name_suffix empty: a call's name ends where arg_prefix or end_core begins,
-     * and that tag is the first of the call's body. */
+    /* Tagged family, no core in name_suffix (empty, or whitespace alone): a call's name ends
+     * where arg_prefix or end_core begins, and that tag is the first of the call's body. */
     bool name_open = false;
     /* Where a key or value may begin, besides the object's punctuation: the dialect string's
      * opener, and the call's close and end (written there by a reply that leaves its object
@@ -810,7 +810,9 @@ int ReplyFormat::compile(const ChatFormat& f, std::shared_ptr<const ReplyFormat>
     m.name_end = f.arg_name_suffix + f.arg_value_prefix;
     if (f.typed_tags()) m.name_end_json = f.arg_name_suffix + f.arg_json_value_prefix;
     m.object = f.has_tools() && f.object_args();
-    m.name_open = f.has_tools() && !m.object && f.name_suffix.empty();
+    /* A suffix with no core of its own ends the name at whitespace, and the name then runs to
+     * the first argument tag or the call's end, as it does without a suffix (Ling 3.0). */
+    m.name_open = f.has_tools() && !m.object && m.ns_core.empty();
     if (m.object && f.name_suffix.empty()) {
         m.ns_object = true;
         m.ns_core = "{";
@@ -1316,7 +1318,6 @@ struct ReplyStream::Impl {
             if (think_text) { msg.reasoning += think_pend; think_pend.clear(); }
             return;
         }
-        touch(0);
         think_hold.append(p, n);
         flush_think_hold(false);
     }

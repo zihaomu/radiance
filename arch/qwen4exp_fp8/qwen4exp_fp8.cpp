@@ -936,8 +936,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (m.arm8) {
         /* The int8 routed arm's two pairs, rotated at a scale a 128 and written by their
          * producers: the gated product's by gated_had_quant_i8g, the input's by the read. */
-        RAD_ARCH_TRY(m.a_eff.declare_qs(b, nm, g, "moe_eff", m.moecfg.n_ff_exp, ER, true, false,
-                                        RAD_FP8_BLOCK));
+        /* A trellis gate_up may be paired with W5NL down. Keep its E4M3 pair as well so that
+         * the gated intermediate can use the down projection's own activation format. */
+        RAD_ARCH_TRY(m.a_eff.declare_qs(b, nm, g, "moe_eff", m.moecfg.n_ff_exp, ER, true,
+                                        m.moecfg.expert_iqr != 0, RAD_FP8_BLOCK));
         m.a_eff.q8_fed = m.a_eff.q8_rot = true;
         if (!m.trunk_rot) {
             RAD_ARCH_TRY(m.a_hr.declare_qs(b, nm, g, "moe_hr", g.n_embd, 0, true, false,
@@ -1238,6 +1240,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
         MoeFP8::Src ms{};
         ms.cfg              = m.moecfg;
+        /* The legacy expert tap can be limited to selected layers, including the MTP
+         * layer below. Keep the whole-expert placement selected by m.moecfg.calib. */
+        ms.cfg.calib        = m.moecfg.calib && calib_layer_on((int)l);
         ms.router           = nm.ckpt("%s.%lld.mlp.gate.weight", pre, (long long)l);
         RAD_ARCH_TRY(moe_expert_sources(b, nm, "layer",
                                         nm.ckpt("%s.%lld.mlp.experts", pre, (long long)l), &ms));
@@ -1462,6 +1467,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         ts.attn.o      = nm.ckpt("%s.layers.0.self_attn.o_proj.weight", mpre);
 
         ts.mlp.cfg             = m.moecfg;
+        ts.mlp.cfg.calib       = m.moecfg.calib && calib_layer_on((int)g.n_layer);
         ts.mlp.router          = nm.ckpt("%s.layers.0.mlp.gate.weight", mpre);
         RAD_ARCH_TRY(moe_expert_sources(b, nm, "mtp", nm.ckpt("%s.layers.0.mlp.experts", mpre),
                                         &ts.mlp));

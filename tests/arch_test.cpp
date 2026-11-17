@@ -2633,6 +2633,233 @@ TEST(the_encodings_the_model_holds_choose_the_flash_next_kernels) {
     CHECK(!p.layers[0].hc_mix.mix_e4m3);
 }
 
+/* The input to gate_up and the gated input to down are distinct activations: a trellis
+ * gate may read rotated int8 while a W5NL down reads a rotated E4M3 gated product. */
+TEST(flashnext_trellis_gate_and_w5nl_down_use_separate_activation_formats) {
+    RadEncoding tq{};
+    rad_enc_clear(&tq);
+    rad_enc_copy_str(tq.scheme, "trellis");
+    rad_enc_add_plane(&tq, "codes", RAD_U5, 1, 1);
+    rad_enc_add_plane(&tq, "scale", RAD_F32, 1, 0);
+    const int t = rad_enc_add_table(&tq, "trellis", RAD_I8, 1 << 16, 1);
+    tq.plane[t].block[0] = 128;
+    rad_enc_add_table(&tq, "trellis.mad", RAD_U32, 2, 1);
+    rad_enc_add_plane(&tq, "scale.col", RAD_F32, 0, 128);
+    rad_enc_copy_str(tq.transform, "fwht128");
+
+    RadEncoding w5{};
+    rad_enc_clear(&w5);
+    rad_enc_copy_str(w5.scheme, "affine");
+    rad_enc_add_plane(&w5, "codes", RAD_U5, 1, 1);
+    rad_enc_add_plane(&w5, "scale", RAD_F8E4M3, 1, 64);
+    rad_enc_add_plane(&w5, "scale.1", RAD_F32, 0, 0);
+    rad_enc_add_table(&w5, "table", RAD_F32, 1, 32);
+    rad_enc_copy_str(w5.transform, "fwht128");
+    REQUIRE(rad_enc_valid(&tq));
+    REQUIRE(rad_enc_valid(&w5));
+    RadEncoding r8 = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+    rad_enc_copy_str(r8.transform, "fwht128");
+    REQUIRE(rad_enc_valid(&r8));
+
+    for (int rank = 0; rank < 2; ++rank) {
+        RadModelMeta meta = qwen4exp_meta();
+        RadBuildCtx c = build_ctx(rank, 2);
+        c.max_tok = 64; c.max_seqs = 2; c.max_spec = 0; c.max_ctx = 4096;
+        RadBuilder b;
+        b.encs = { { "ffn_gate_up_exps", tq }, { "ffn_down_exps", w5 },
+                   { "ssm_inz.weight", tq }, { "attn_qg.weight", tq } };
+        for (const char* name : { "qsa_qk.weight", "attn_k.weight", "attn_v.weight",
+                                  "attn_output.weight", "ssm_out.weight",
+                                  "ffn_gate_up_shexp", "ffn_down_shexp" })
+            b.encs.push_back({ name, r8 });
+        REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+        const auto& m = qwen4exp_fp8::g_model[rank];
+        const auto& moe = m.layers[0].mlp;
+        CHECK_EQ(moe.fmt[0], 11);
+        CHECK_EQ(moe.fmt[1], 7);
+        CHECK(m.a_eff.q && m.a_eff.s && m.a_eff.q8 && m.a_eff.s8);
+        CHECK_EQ(moe.gq_exp.a.cq(), m.a_eff.q);
+        CHECK_EQ(moe.gq_exp.a.cs(), m.a_eff.s);
+        const RecOp* gate = b.op_of(moe.op_gu);
+        const RecOp* down = b.op_of(moe.op_dn);
+        const RecOp* quant = b.op_of(moe.gq_exp.op);
+        REQUIRE(gate && down && quant);
+        CHECK_EQ(quant->op, std::string("gated_had_quant_fp8"));
+        REQUIRE(!down->reads.empty());
+        CHECK_EQ(down->reads[0], m.a_eff.q);
+        bool gate_i8 = false, down_w5 = false;
+        for (const auto& p : gate->p) gate_i8 |= p.key == "dtype" && p.sval == "i8a8h";
+        for (const auto& p : down->p) down_w5 |= p.key == "dtype" && p.sval == "w5nl64a8h";
+        CHECK(gate_i8);
+        CHECK(down_w5);
+
+        /* Declaration alone cannot verify the step's actual wiring. Inspect the issued
+         * gate -> rotated E4M3 producer -> down chain on each TP rank as well. */
+        std::unique_ptr<Kit> k = kit(b, { 1 }, {});
+        RadCtx ctx;
+        ctx.b = &b;
+        ctx.batch = &k->b;
+        qwen4exp_fp8::step(&ctx, &k->b);
+        const RecIssue *gu_issue = nullptr, *quant_issue = nullptr, *dn_issue = nullptr;
+        size_t igu = 0, iq = 0, idn = 0;
+        for (size_t i = 0; i < ctx.issues.size(); ++i) {
+            const RecIssue& issue = ctx.issues[i];
+            if (issue.op == moe.op_gu) { gu_issue = &issue; igu = i; }
+            if (issue.op == moe.gq_exp.op) { quant_issue = &issue; iq = i; }
+            if (issue.op == moe.op_dn) { dn_issue = &issue; idn = i; }
+        }
+        REQUIRE(gu_issue && quant_issue && dn_issue);
+        CHECK(igu < iq && iq < idn);
+        REQUIRE(gu_issue->opd.size() >= 9);
+        REQUIRE(quant_issue->opd.size() >= 3);
+        REQUIRE(dn_issue->opd.size() >= 2);
+        CHECK_EQ(gu_issue->opd.back().handle, quant_issue->opd[0].handle);
+        CHECK_EQ(quant_issue->opd[1].handle, m.a_eff.q);
+        CHECK_EQ(quant_issue->opd[2].handle, m.a_eff.s);
+        CHECK_EQ(dn_issue->opd[0].handle, quant_issue->opd[1].handle);
+        CHECK_EQ(dn_issue->opd[1].handle, quant_issue->opd[2].handle);
+        CHECK_EQ(dn_issue->opd[0].offset, quant_issue->opd[1].offset);
+        CHECK_EQ(dn_issue->opd[1].offset, quant_issue->opd[2].offset);
+        CHECK(gu_issue->opd[0].handle != quant_issue->opd[1].handle);
+    }
+}
+
+/* The MTP-only expert tap must see history rows even in chunks that would ordinarily
+ * store only KV. When round 1 is needed it selects after, not before, the routed block. */
+TEST(flashnext_mtp_calibration_runs_the_history_rows_through_the_experts) {
+    for (int rank = 0; rank < 2; ++rank) {
+    RadModelMeta meta = qwen4exp_meta();
+    RadBuildCtx build = build_ctx(rank, 2);
+    build.max_tok = 64; build.max_seqs = 2; build.max_spec = 1; build.max_ctx = 4096;
+    RadBuilder b;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &build), RAD_OK);
+    auto& model = qwen4exp_fp8::g_model[rank];
+    REQUIRE(model.have_mtp);
+    auto k = kit(b, {}, { 8 }, 10);
+    k->b.draft_pass = -1;
+    k->b.phase = RAD_PHASE_DECODE;
+    k->out = { 0, 1, 2, 3, 4, 5, 6, 7 };
+    k->b.out_ids = k->out.data();
+    k->b.n_out = 8;
+    k->dout = { 7 };
+    k->b.draft_out_ids = k->dout.data();
+    auto issue = [](const RadCtx& ctx, rad_op op) {
+        for (size_t i = 0; i < ctx.issues.size(); ++i)
+            if (ctx.issues[i].op == op) return (int)i;
+        return -1;
+    };
+
+    /* A normal history-only chunk skips the expensive draft feed-forward. */
+    k->b.n_draft_out = 0;
+    model.mtp.mlp.c.calib = 0;
+    RadCtx normal{ .b = &b, .batch = &k->b, .rank = rank, .world = 2 };
+    model.mtp.step(&normal, &k->b);
+    CHECK_EQ(issue(normal, model.mtp.mlp.op_gu), -1);
+
+    model.mtp.mlp.c.calib = 1;
+    for (int incomplete : { 0, 1, 7 }) {
+        k->b.n_out = incomplete;
+        RadCtx invalid{ .b = &b, .batch = &k->b, .rank = rank, .world = 2 };
+        model.mtp.step(&invalid, &k->b);
+        CHECK(!invalid.step_fail.empty());
+        CHECK_EQ(issue(invalid, model.mtp.mlp.op_gu), -1);
+    }
+    k->b.n_out = 8;
+    RadCtx tap{ .b = &b, .batch = &k->b, .rank = rank, .world = 2 };
+    model.mtp.step(&tap, &k->b);
+    CHECK(tap.step_fail.empty());
+    CHECK(issue(tap, model.mtp.mlp.op_gu) >= 0);
+    CHECK(issue(tap, model.mtp.mlp.op_dn) >= 0);
+    CHECK_EQ(issue(tap, model.mtp.op_dsel), -1);
+    CHECK_EQ(issue(tap, model.mtp.op_logits), -1);
+
+    k->b.n_draft_out = 1;
+    RadCtx draft{ .b = &b, .batch = &k->b, .rank = rank, .world = 2 };
+    model.mtp.step(&draft, &k->b);
+    const int dn = issue(draft, model.mtp.mlp.op_dn);
+    const int select = issue(draft, model.mtp.op_dsel);
+    const int back = issue(draft, model.mtp.op_dback);
+    const int logits = issue(draft, model.mtp.op_logits);
+    CHECK(dn >= 0 && dn < select && select < back && back < logits);
+
+    /* Once the target was written the ordinary history fast path returns. */
+    model.mtp.mlp.calib_done = true;
+    k->b.n_draft_out = 0;
+    RadCtx done{ .b = &b, .batch = &k->b, .rank = rank, .world = 2 };
+    model.mtp.step(&done, &k->b);
+    CHECK_EQ(issue(done, model.mtp.mlp.op_gu), -1);
+    model.mtp.mlp.c.calib = 0;
+    model.mtp.mlp.calib_done = false;
+    }
+}
+
+/* Run this case separately with RADIANCE_CALIB_DIR set and RADIANCE_CALIB_LAYERS=8:
+ * the synthetic model has eight trunk layers, so 8 is its MTP layer. */
+TEST(flashnext_mtp_calibration_selects_only_the_requested_layer) {
+    const char* dir = std::getenv("RADIANCE_CALIB_DIR");
+    const char* layers = std::getenv("RADIANCE_CALIB_LAYERS");
+    if (!dir || !*dir || !layers || std::strcmp(layers, "8") != 0) {
+        CHECK(true);             /* the ordinary suite does not enable a calibration */
+        return;
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        RadModelMeta meta = qwen4exp_meta();
+        RadBuildCtx c = build_ctx(rank, 2);
+        c.max_tok = 64; c.max_seqs = 2; c.max_spec = 1; c.max_ctx = 4096;
+        RadBuilder b;
+        const RadEncoding bf16 = rad_enc_plain(RAD_BF16);
+        b.encs = { { "ffn_gate_up_exps", bf16 }, { "ffn_down_exps", bf16 } };
+        REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+        auto& m = qwen4exp_fp8::g_model[rank];
+        CHECK(m.moecfg.calib);
+        for (const auto& layer : m.layers) {
+            CHECK_EQ(layer.mlp.c.calib, 0);
+            CHECK_EQ(layer.mlp.op_gram_gu, 0u);
+        }
+        CHECK_EQ(m.mtp.mlp.c.calib, 1);
+        CHECK(m.mtp.op_attn_gram);
+        CHECK(m.mtp.b_attn_gram);
+        CHECK(m.mtp.mlp.op_gram_gu);
+        CHECK(m.mtp.mlp.op_gram_dn);
+        CHECK(m.mtp.mlp.op_gram_dne);
+        CHECK_EQ(m.mtp.mlp.c.n_ff_exp, 640);
+        CHECK_EQ(m.mtp.mlp.c.n_expert, 256);
+
+        /* The fake stream cannot populate per-expert offsets; retain the pooled tap
+         * and lint the full trunk -> calibrated history issue order instead. */
+        m.mtp.mlp.op_gram_dne = 0;
+        auto k = kit(b, {}, { 8 }, 10);
+        RadCtx trunk{ .b = &b, .batch = &k->b, .rank = rank, .world = 2 };
+        qwen4exp_fp8::step(&trunk, &k->b);
+        /* The trunk samples only its last prompt row. Serial history separately names
+         * all eight of the trunk's wide hidden rows as its own out_ids. */
+        k->out = { 0, 1, 2, 3, 4, 5, 6, 7 };
+        k->b.out_ids = k->out.data();
+        k->b.n_out = 8;
+        k->b.draft_pass = -1;
+        k->b.phase = RAD_PHASE_DECODE;
+        k->b.n_draft_out = 1;
+        k->dout = { 7 };
+        k->b.draft_out_ids = k->dout.data();
+        RadCtx history{ .b = &b, .batch = &k->b, .rank = rank, .world = 2 };
+        qwen4exp_fp8::step(&history, &k->b);
+        CHECK(history.step_fail.empty());
+        CHECK_EQ(m.mtp.attn_gram_rows, 8);
+        CHECK(issue_of(b, history, "gram_accum") != nullptr);
+        const auto lint = lint_step(b, { &trunk, &history });
+        for (const std::string& problem : lint) std::fprintf(stderr, "MTP tap lint: %s\n", problem.c_str());
+        CHECK(lint.empty());
+        k->b.n_draft_out = 0;   /* an intermediate, history-only prefill chunk */
+        RadCtx middle{ .b = &b, .batch = &k->b, .rank = rank, .world = 2 };
+        qwen4exp_fp8::step(&middle, &k->b);
+        CHECK(middle.step_fail.empty());
+        const auto mlint = lint_step(b, { &trunk, &middle });
+        for (const std::string& problem : mlint)
+            std::fprintf(stderr, "MTP history-only lint: %s\n", problem.c_str());
+        CHECK(mlint.empty());
+    }
+}
+
 /* A quantised container may keep one linear as the checkpoint holds it. Flash-Next's recipe leaves
  * the QSA indexer's projection plain bf16 (its top-k is a hard choice between blocks), so in a
  * four-bit model with fp8 linears it is declared bf16 and read by `gemm_nt` over its input's bf16
@@ -5734,17 +5961,20 @@ TEST(a_gemma4_moe_trunk_declares_both_arms_and_the_joins) {
 
 /* The sliding group is RAD_KV_FULL with the window on the attention op, since a window group is
  * not prefix-cached (arch/gemma4/gemma4.cpp, the KV groups). */
-TEST(gemma4_moe_kv_groups_are_both_full_and_the_window_rides_the_op) {
+TEST(gemma4_moe_kv_groups_are_window_and_full_and_the_window_rides_the_op) {
     RadBuilder b;
     RadModelMeta meta = gemma4_moe_meta();
     RadBuildCtx  ctx  = build_ctx();
     CHECK_OK(gemma4::declare(&b, &meta, &ctx));
 
+    /* The sliding group is a window group: the pool caps at what attn_paged_qrow can read. */
     REQUIRE((int)b.kv_groups.size() == 2);
-    for (const auto& g : b.kv_groups) {
-        CHECK_EQ((int)g.d.kind, RAD_KV_FULL);
-        CHECK_EQ(g.d.window, 0);
-    }
+    CHECK_EQ(b.kv_groups[0].name, std::string("kv_swa"));
+    CHECK_EQ((int)b.kv_groups[0].d.kind, RAD_KV_WINDOW);
+    CHECK_EQ(b.kv_groups[0].d.window, 1024);
+    CHECK_EQ(b.kv_groups[1].name, std::string("kv_full"));
+    CHECK_EQ((int)b.kv_groups[1].d.kind, RAD_KV_FULL);
+    CHECK_EQ(b.kv_groups[1].d.window, 0);
     const RecOp* sl = find_op(b, "attn_paged_qrow", 0);
     REQUIRE(sl != nullptr);
     CHECK_EQ(pint(sl, "head_dim"), 256);
@@ -11361,10 +11591,10 @@ struct ArchCases {
             nullptr, 0, {}, 0x7be4844610b039d8ull);
         add("gemma4", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return gemma4::declare(b, &g4m, &c); },
-            gemma4::step, 0, {}, 0x0f227f5853b6488cull);
+            gemma4::step, 0, {}, 0xfe8442fba92e5d6dull);
         add("gemma4 + DFlash", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 15); return gemma4::declare(b, &g4df, &c); },
-            gemma4::step, 15, {}, 0x37bffcc9bd749b88ull);
+            gemma4::step, 15, {}, 0x5d420566673e5a19ull);
         add("embgemma2", [this](RadBuilder* b) {
                 auto c = eg2_ctx(); return embgemma2::declare(b, eg2.meta(), &c); },
             embgemma2::step, 0, {}, 0xac72c705bc97d2b3ull);

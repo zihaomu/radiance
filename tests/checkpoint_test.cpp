@@ -136,6 +136,32 @@ TEST(the_metadata_names_the_architecture_and_the_quantisation) {
     CHECK_EQ(ck.dir(), dir);
 }
 
+/* The index is checkpoint-supplied data like the tensors, and its weight_map values are paths:
+ * a poisoned one must not lead the loader to open files outside the model dir as the serving
+ * user. hfget screens the listing's names; nothing screened the index's until here. */
+TEST(a_poisoned_index_cannot_lead_the_shard_list_out_of_the_model_dir) {
+    auto dir_with_index = [](const char* shard) -> std::string {
+        const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) }, kConfig);
+        const std::string idx = std::string("{\"metadata\":{\"total_size\":8},\"weight_map\":"
+                                            "{\"x\":\"") + shard + "\"}}";
+        /* No REQUIRE in here: its failure spelling returns void, and this lambda returns a
+         * directory. A null FILE* just fails to write, and every caller checks the open. */
+        std::FILE* f = std::fopen((dir + "/model.safetensors.index.json").c_str(), "wb");
+        if (f != nullptr) {
+            std::fwrite(idx.data(), 1, idx.size(), f);
+            std::fclose(f);
+        }
+        return dir;
+    };
+    /* The honest index still reads: the name is the real shard's own. */
+    Checkpoint ok;
+    CHECK_EQ(ok.open(dir_with_index("model.safetensors")), RAD_OK);
+    for (const char* bad : { "../../../../etc/passwd", "/etc/passwd", "..", "a/..", "./x", "" }) {
+        Checkpoint ck;
+        CHECK(ck.open(dir_with_index(bad)) < 0);
+    }
+}
+
 TEST(routed_expert_metadata_accepts_the_deepseek_and_glm_config_spellings) {
     const std::string dir = write_checkpoint({ bf16("x", {2, 2}, 0) },
         "{\"model_type\":\"glm5_next\",\"text_config\":{\"hidden_size\":4096,"
@@ -3553,6 +3579,55 @@ TEST(single_files_merge_by_name_and_read_their_metadata_elsewhere) {
     const char* mt = ck.meta().get("model_type");
     CHECK_EQ(std::string(mt ? mt : ""), std::string("qwen3"));
     CHECK_EQ(ck.tok_dir(), meta);
+}
+
+TEST(a_bailing_gguf_must_promise_a_walkable_layer_count) {
+    /* bailingmoe3_layouts rebuilds the release layout by walking every layer the container
+     * claims, on the open path and before any plugin runs. A GGUF naming 2^62 layers is
+     * therefore not a slow load but a permanent hang -- and a negative dense prefix opens a
+     * second loop of the same order. Both must refuse at open, quickly, RAD_E_FORMAT. */
+    const std::string dir = fresh_dir();
+    auto bailing_kvs = [](int64_t layers, int64_t dense, int64_t heads = 4, int64_t latent = 512) {
+        return std::vector<GKv>{
+            { "general.architecture", 8, 0, { "bailingmoe3" } },
+            { "bailingmoe3.block_count", 10, (double)layers, {} },
+            { "bailingmoe3.embedding_length", 4, 64, {} },
+            { "bailingmoe3.attention.head_count", 10, (double)heads, {} },
+            { "bailingmoe3.feed_forward_length", 4, 128, {} },
+            { "bailingmoe3.context_length", 4, 4096, {} },
+            { "bailingmoe3.kda.head_dim", 4, 128, {} },
+            { "bailingmoe3.rope.dimension_count", 4, 64, {} },
+            { "bailingmoe3.attention.key_length_mla", 4, 192, {} },
+            { "bailingmoe3.attention.value_length_mla", 4, 128, {} },
+            { "bailingmoe3.attention.kv_lora_rank", 10, (double)latent, {} },
+            { "bailingmoe3.expert_feed_forward_length", 4, 256, {} },
+            { "bailingmoe3.leading_dense_block_count", 10, (double)dense, {} },
+        };
+    };
+    const std::string huge = dir + "/huge.gguf";
+    write_gguf(huge, bailing_kvs(4611686018427387904LL, 0), {});
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(huge), RAD_E_FORMAT);
+    const std::string neg = dir + "/neg.gguf";
+    write_gguf(neg, bailing_kvs(4, -4611686018427387904LL), {});
+    Checkpoint ck2;
+    REQUIRE_EQ(ck2.open(neg), RAD_E_FORMAT);
+    /* The bound must not bite the honest: a small stack opens (no tensors, so the walk finds
+     * nothing to rebuild, and open returns OK exactly as before). */
+    const std::string sane = dir + "/sane.gguf";
+    write_gguf(sane, bailing_kvs(4, 1), {});
+    Checkpoint ck3;
+    REQUIRE_EQ(ck3.open(sane), RAD_OK);
+    /* The widths the layout products are built from are bounded too: past the caps they are
+     * vector sizes and wrapped row products, not geometry. */
+    const std::string wide = dir + "/wide.gguf";
+    write_gguf(wide, bailing_kvs(4, 1, 4611686018427387904LL), {});
+    Checkpoint ck4;
+    REQUIRE_EQ(ck4.open(wide), RAD_E_FORMAT);
+    const std::string deep_rank = dir + "/deep_rank.gguf";
+    write_gguf(deep_rank, bailing_kvs(4, 1, 4, 4611686018427387904LL), {});
+    Checkpoint ck5;
+    REQUIRE_EQ(ck5.open(deep_rank), RAD_E_FORMAT);
 }
 
 RAD_TEST_MAIN()

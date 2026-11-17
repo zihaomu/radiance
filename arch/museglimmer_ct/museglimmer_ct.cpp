@@ -29,7 +29,7 @@
 #include <arch/rad_block_museglimmer_vision.h>
 #include <arch/rad_block_muse_dflash.h>
 #include <arch/rad_calib_full.h>
-#include "../museglimmer/chat.h"
+#include <arch/rad_museglimmer_chat.h>
 
 #include <cmath>
 #include <cstdlib>
@@ -49,19 +49,6 @@ using namespace rad::arch;
 /* ---- the checkpoint's config. A multimodal model keeps the trunk under `text_config.`; accept
  * the bare spelling too, so a text-only GGUF container of the same family reads the same way. */
 namespace {
-
-double cfg_f(const RadModelMeta* m, const char* key, double dflt) {
-    return rad_meta_getf(m, (std::string("text_config.") + key).c_str(),
-                         rad_meta_getf(m, key, dflt));
-}
-long long cfg_i(const RadModelMeta* m, const char* key, long long dflt) {
-    return rad_meta_geti(m, (std::string("text_config.") + key).c_str(),
-                         rad_meta_geti(m, key, dflt));
-}
-const char* cfg_s(const RadModelMeta* m, const char* key, const char* dflt) {
-    return rad_meta_gets(m, (std::string("text_config.") + key).c_str(),
-                         rad_meta_gets(m, key, dflt));
-}
 
 }  // namespace
 
@@ -489,13 +476,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* ---- the family's own config. Everything that changes the mathematics is required or read
      * from the family defaults the reference config class states; a wrong default yields fluent
      * wrong text, so nothing here falls back to a "reasonable" value silently. */
-    m.qk_mult  = (float)cfg_f(meta, "qk_scale_factor", 3.87);
-    m.post_eps = (float)cfg_f(meta, "post_norm_eps", 1e-8);
-    m.out_mult = (float)cfg_f(meta, "output_multiplier", 0.19611613513818404);
-    m.softcap  = (float)cfg_f(meta, "final_logit_softcapping", 20.0);
-    m.window   = cfg_i(meta, "sliding_window", 2048);
-    const double theta_rope = cfg_f(meta, "rope_parameters.rope_theta",
-                                    cfg_f(meta, "rope_theta", 0.0));
+    m.qk_mult  = (float)meta_text_getf(meta, "qk_scale_factor", 3.87);
+    m.post_eps = (float)meta_text_getf(meta, "post_norm_eps", 1e-8);
+    m.out_mult = (float)meta_text_getf(meta, "output_multiplier", 0.19611613513818404);
+    m.softcap  = (float)meta_text_getf(meta, "final_logit_softcapping", 20.0);
+    m.window   = meta_text_geti(meta, "sliding_window", 2048);
+    const double theta_rope = meta_text_getf(meta, "rope_parameters.rope_theta",
+                                    meta_text_getf(meta, "rope_theta", 0.0));
     if (!(m.qk_mult > 0.0f) || !(m.out_mult > 0.0f) || !(m.post_eps > 0.0f) || m.window <= 0 ||
         !(theta_rope > 0.0)) {
         fprintf(stderr, "radiance: museglimmer: qk_scale_factor %g output_multiplier %g "
@@ -518,7 +505,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * interval rule stands in. The two must agree where both exist: the schedule decides which
      * layers keep a long context, and a wrong layer still generates fluent text. */
     std::vector<int> full;
-    const char* kinds = cfg_s(meta, "layer_types", nullptr);
+    const char* kinds = meta_text_gets(meta, "layer_types", nullptr);
     if (kinds && *kinds)
         RAD_ARCH_TRY(parse_layer_kinds("museglimmer", kinds, {"full_attention"},
                                        "sliding_attention", &full));
@@ -546,7 +533,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* Per-layer rotary: the shipped `layer_rope_theta`, else the family pattern (theta on the
      * sliding layers, 0 -- NoPE -- on the full ones). */
     std::vector<float> theta((size_t)g.n_layer, 0.0f);
-    const char* thetas = cfg_s(meta, "layer_rope_theta", nullptr);
+    const char* thetas = meta_text_gets(meta, "layer_rope_theta", nullptr);
     if (thetas && *thetas) {
         size_t i = 0;
         for_each_token(thetas, [&](const char* t, size_t n) {

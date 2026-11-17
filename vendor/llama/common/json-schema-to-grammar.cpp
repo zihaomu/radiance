@@ -590,7 +590,29 @@ private:
             auto s = ls.first;
             return is_literal ? "\"" + s + "\"" : s;
         };
+        int pw_nesting = 0;
+        bool pw_too_deep = false;
+        constexpr int kMaxPatternNesting = 64;
         std::function<literal_or_rule()> transform = [&]() -> literal_or_rule {
+            // RADIANCE: `client_pattern` is client data, and every nested `(` recurses this
+            // lambda once. A few tens of KB of '(' is an uncatchable stack overflow of the
+            // request worker -- the JSON depth and value bounds cannot help, because the
+            // brackets are string content, not JSON nesting. A pattern nesting past a depth
+            // no real one reaches is refused like any other unsupported syntax. Once only:
+            // every unwinding frame meets the same '(' again, and the error text travels.
+            if (++pw_nesting > kMaxPatternNesting) {
+                --pw_nesting;
+                if (!pw_too_deep) {
+                    _errors.push_back("Pattern nests groups more than " +
+                                      std::to_string(kMaxPatternNesting) + " deep");
+                    pw_too_deep = true;
+                }
+                return std::make_pair(std::string(), false);
+            }
+            struct Leave {
+                int& d;
+                ~Leave() { --d; }
+            } leave{ pw_nesting };
             size_t start = i;
             std::vector<literal_or_rule> seq;
 
