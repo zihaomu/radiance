@@ -192,8 +192,12 @@ static bool w4_asym(const RadParam* p, int n_p) {
 static int moe_w4_nl(const RadParam* p, int n_p) {
     const char* d = halo_pgets(p, n_p, "dtype");
     return d && (std::strcmp(d, "w4nla8h") == 0 || std::strcmp(d, "w4nl64a8h") == 0 ||
-                 std::strcmp(d, "w4nl32a8h") == 0 || std::strcmp(d, "w5nl64a8h") == 0);
+                 std::strcmp(d, "w4nl32a8h") == 0 || std::strcmp(d, "w5nl64a8h") == 0 ||
+                 std::strcmp(d, "w4nl64a8i8h") == 0 || std::strcmp(d, "w4nl32a8i8h") == 0);
 }
+/* The `a8i8` names are the same stored planes met by an int8 activation (moe_gemm_w4a8i8):
+ * `w4a8i8h` is w4a8h's, `w4nl64a8i8h` and `w4nl32a8i8h` the subgroup-scaled codebook's. The hooks
+ * answer for them as for the names they stand beside, as libr4d's do. */
 /* `w5nl64a8h` is w4nl64a8h at five bits: `u5*fp8_e4m3[1x64]*f32[*x*]/fwht128`, codes indexing
  * libquant's 32-entry `table=w5nl`. Its codes view relays each row into HALO_DT_MOEW5 (the low four
  * bits of every code as w4nla8h's nibble plane, then each code's high bit, the sign, one dword per
@@ -213,12 +217,14 @@ static bool moe_w5(const RadParam* p, int n_p) {
 static int moe_w4_g64(const RadParam* p, int n_p) {
     const char* d = halo_pgets(p, n_p, "dtype");
     if (!d) return 0;
-    return (std::strcmp(d, "w4nl64a8h") == 0 || std::strcmp(d, "w5nl64a8h") == 0) ? 2
-           : std::strcmp(d, "w4nl32a8h") == 0 ? 4 : 0;
+    return (std::strcmp(d, "w4nl64a8h") == 0 || std::strcmp(d, "w5nl64a8h") == 0 ||
+            std::strcmp(d, "w4nl64a8i8h") == 0) ? 2
+           : (std::strcmp(d, "w4nl32a8h") == 0 || std::strcmp(d, "w4nl32a8i8h") == 0) ? 4 : 0;
 }
 static int moe_w4_rot(const RadParam* p, int n_p) {
     const char* d = halo_pgets(p, n_p, "dtype");
-    return d && (std::strcmp(d, "w4a8h") == 0 || moe_w4_nl(p, n_p));
+    return d && (std::strcmp(d, "w4a8h") == 0 || std::strcmp(d, "w4a8i8h") == 0 ||
+                 moe_w4_nl(p, n_p));
 }
 
 /* ================================================================== moe_gemm_q's two classes

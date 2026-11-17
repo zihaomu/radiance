@@ -4625,6 +4625,36 @@ static int64_t i8_code_misses(const uint16_t* x, int64_t x_ld, const int8_t* q, 
     return miss;
 }
 
+/* had_quant_act_i8g's codes of a bf16 plane on the host: an unnormalised 128-wide Walsh-Hadamard
+ * per (row, group) in double, then amax / 127 and round to nearest even. The device sums the
+ * butterflies in float in its own order, so a code may sit one off at a rounding edge: `hard`
+ * counts codes more than one off and scales off by more than 1e-6 relative, `soft` the codes
+ * exactly one off. */
+static void i8_rot_code_misses(const uint16_t* x, int64_t x_ld, const int8_t* q, int64_t q_ld,
+                               const float* s, int64_t s_ld, int64_t rows, int64_t n,
+                               int64_t* hard, int64_t* soft) {
+    *hard = *soft = 0;
+    double v[128];
+    for (int64_t i = 0; i < rows; ++i)
+        for (int64_t g = 0; g < n / 128; ++g) {
+            const uint16_t* xr = x + i * x_ld + g * 128;
+            for (int j = 0; j < 128; ++j) v[j] = h_bf16(xr[j]);
+            for (int h = 1; h < 128; h <<= 1)
+                for (int j = 0; j < 128; ++j)
+                    if (!(j & h)) { const double a0 = v[j], b0 = v[j + h]; v[j] = a0 + b0; v[j + h] = a0 - b0; }
+            double amax = 0.0;
+            for (int j = 0; j < 128; ++j) amax = std::max(amax, std::fabs(v[j]));
+            const double sc = amax > 0 ? amax / 127.0 : 1.0;
+            *hard += std::fabs(s[i * s_ld + g] - sc) > 1e-6 * sc;
+            for (int j = 0; j < 128; ++j) {
+                const double c = std::max(-127.0, std::min(127.0, v[j] / sc));
+                const int d = std::abs((int)q[i * q_ld + g * 128 + j] - (int)std::nearbyint(c));
+                *hard += d > 1;
+                *soft += d == 1;
+            }
+        }
+}
+
 /* The decode convolution folded into the recurrent update, against the pair it replaces.
  *
  * gdn_conv_recurrent_update must leave every byte gdn_conv_update + gdn_recurrent_update leave:
@@ -4640,9 +4670,14 @@ static int64_t i8_code_misses(const uint16_t* x, int64_t x_ld, const int8_t* q, 
  * The key heads' conv state must have moved, so the check is sensitive. The anchor form runs in a
  * child process, as in gdn_recurrent_anchor. `i8` runs both at int8 codes and also holds the pair's
  * codes to quant_act_i8g over its `o`. */
+/* `had`: the fold under test is gdn_conv_recurrent_update_had at int8 codes: o, the states and the
+ * conv state as the pair leaves them, and o_q / o_scale had_quant_act_i8g's over that o (the
+ * pair's codes are the unrotated ones, so those two are checked against the host instead). */
 static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form,
-                              bool i8 = false) {
-    const RadKernelInfo* rf = find(pl, "gdn_conv_recurrent_update_k128_v128_bf16");
+                              bool i8 = false, bool had = false) {
+    if (had) i8 = true;
+    const RadKernelInfo* rf = find(pl, had ? "gdn_conv_recurrent_update_had_k128_v128_bf16"
+                                           : "gdn_conv_recurrent_update_k128_v128_bf16");
     const RadKernelInfo* rc = find(pl, "gdn_conv_update_w4_h128_bf16");
     const RadKernelInfo* rr = find(pl, "gdn_recurrent_update_k128_v128_bf16_fp32state");
     if (!rf || !rc || !rr) { ok(nm, false, "a row is absent"); return; }
@@ -4772,6 +4807,7 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
             { "conv_state", d_cs[0], d_cs[1], cs_b },
         };
         for (const auto& c : cmp) {
+            if (had && (c.a == d_oq[0] || c.a == d_os[0])) continue;
             const std::vector<uint8_t> A = fetch(c.a, c.n), B = fetch(c.b, c.n);
             dump_out(fmt("%s step%d %s", nm, step, c.what), { &B });
             size_t diff = 0;
@@ -4784,7 +4820,20 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
         }
         /* At int8 codes, the real sequences' tokens (all but the padded last) against
          * quant_act_i8g over the pair's `o`. A (token, head) row is one group. */
-        if (i8 && why.empty()) {
+        if (had && why.empty()) {
+            const std::vector<uint8_t> O = fetch(d_o[1], o_b), Q = fetch(d_oq[1], oq_b),
+                                       S = fetch(d_os[1], os_b);
+            const int64_t rows = (int64_t)cu[(size_t)N - 1] * H;
+            int64_t hard = 0, soft = 0, nz = 0;
+            i8_rot_code_misses((const uint16_t*)O.data(), V, (const int8_t*)Q.data(), V,
+                               (const float*)S.data(), 1, rows, V, &hard, &soft);
+            for (int64_t i = 0; i < rows * V; ++i) nz += Q[(size_t)i] != 0;
+            if (hard || soft * 1000 > rows * V || nz <= rows * V / 2)
+                why = "step " + std::to_string(step) + ": rotated codes " + std::to_string(hard) +
+                      " hard, " + std::to_string(soft) + " one-off, " + std::to_string(nz) +
+                      " non-zero of " + std::to_string(rows * V);
+        }
+        if (i8 && !had && why.empty()) {
             const std::vector<uint8_t> O = fetch(d_o[0], o_b), Q = fetch(d_oq[0], oq_b),
                                        S = fetch(d_os[0], os_b);
             const int64_t rows = (int64_t)cu[(size_t)N - 1] * H;
@@ -4817,6 +4866,15 @@ static void gdn_conv_fold(const Plugin& pl) {
                           "per_candidate", true);
     }
     if (sel(row) || sel(nma)) gdn_conv_fold_run(pl, nma, "anchor");
+    const char* rowh = "gdn_conv_recurrent_update_had_k128_v128_bf16";
+    if (sel(rowh) && find(pl, rowh)) {
+        gdn_conv_fold_run(pl, "gdn_conv_recurrent_update_had leaves the pair's o and states, its "
+                              "codes had_quant_act_i8g's over o, per_candidate",
+                          "per_candidate", true, true);
+        gdn_conv_fold_run(pl, "gdn_conv_recurrent_update_had leaves the pair's o and states, its "
+                              "codes had_quant_act_i8g's over o, anchor",
+                          "anchor", true, true);
+    }
 }
 
 /* --perfgdn SEQS T NACC: gdn_conv_recurrent_update at Qwen3.8-Flash-Next's decode shape (48 value
@@ -19744,8 +19802,9 @@ static void mx_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_
 }
 
 /* The gated residual's read at int8 codes. The same inputs run with the codes plane as E4M3 and
- * as I8: the bf16 block input and the rotated E4M3 twin must be byte-identical, and the int8 codes
- * must equal quant_act_i8g's over the bf16 input (per (row, 128) at amax / 127). Row counts reach
+ * as I8: the bf16 block input must be byte-identical, the int8 codes must equal quant_act_i8g's
+ * over the bf16 input (per (row, 128) at amax / 127), and the rotated twin, which takes the plain
+ * codes' dtype (libr4d's hc_rot_group<I8>), had_quant_act_i8g's over it. Row counts reach
  * the per-row kernels, decode tiles and prefill tile; the null stream takes the unfused path, a
  * real one the fused finishers. `form` pins one kernel family where exported (0: the rule). */
 /* `band` > M: the op declared at a band of `band` rows and issued at M, the engine's normal case
@@ -19815,7 +19874,7 @@ static void hc_read_i8(const Plugin& pl, int64_t M, bool real_stream, int form, 
             T(d_dn, RAD_F8E4M3, { lr, HN }),    T(d_up, RAD_F8E4M3, { HN, lr }),
             T(d_iw, RAD_BF16,   { hc, HN }),    T(d_x,  RAD_BF16,   { M, n }),
             T(d_inj, RAD_BF16,  { M, hc }),     T(d_q,  qdt,        { M, n }),
-            T(d_qs, RAD_F32,    { M, nkb }),    T(d_rq, RAD_F8E4M3, { M, n }),
+            T(d_qs, RAD_F32,    { M, nkb }),    T(d_rq, qdt,        { M, n }),
             T(d_rs, RAD_F32,    { M, nkb }),
         };
         std::vector<RadParam> ps = {
@@ -19853,16 +19912,22 @@ static void hc_read_i8(const Plugin& pl, int64_t M, bool real_stream, int form, 
     std::string bad;
     if (out[0].x != out[1].x)     bad += " x";
     if (out[0].inj != out[1].inj) bad += " inj";
-    if (out[0].rq != out[1].rq) bad += " rq";
-    if (out[0].rs != out[1].rs) bad += " rs";
     const int64_t miss = i8_code_misses((const uint16_t*)out[1].x.data(), n,
                                         (const int8_t*)out[1].q.data(), n,
                                         (const float*)out[1].qs.data(), nkb, M, n);
-    int64_t nz = 0;
+    int64_t rhard = 0, rsoft = 0;
+    i8_rot_code_misses((const uint16_t*)out[1].x.data(), n, (const int8_t*)out[1].rq.data(), n,
+                       (const float*)out[1].rs.data(), nkb, M, n, &rhard, &rsoft);
+    int64_t nz = 0, rnz = 0;
     for (uint8_t v : out[1].q) nz += v != 0;
-    ok(nm.c_str(), bad.empty() && miss == 0 && nz > (int64_t)qb / 2,
-       bad.empty() ? fmt("%lld codes or scales differ from the host quantiser, %lld non-zero",
-                         (long long)miss, (long long)nz)
+    for (uint8_t v : out[1].rq) rnz += v != 0;
+    ok(nm.c_str(),
+       bad.empty() && miss == 0 && nz > (int64_t)qb / 2 && rhard == 0 &&
+           rsoft * 1000 <= (int64_t)qb && rnz > (int64_t)qb / 2,
+       bad.empty() ? fmt("%lld codes or scales differ from the host quantiser, %lld non-zero; "
+                         "rotated: %lld hard, %lld one-off of %lld, %lld non-zero",
+                         (long long)miss, (long long)nz, (long long)rhard, (long long)rsoft,
+                         (long long)qb, (long long)rnz)
                    : "the int8 run changed" + bad);
 }
 

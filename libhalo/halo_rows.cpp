@@ -526,6 +526,41 @@ static const RadOperandSpec oGdnConvRecurrentUpdate[] = {
     { "o_q",          RAD_OPD_OUT,    1 },
     { "o_scale",      RAD_OPD_OUT,    1 },
 };
+static const RadParamSpec pGdnConvRecurrentUpdateHad[] = {
+    P_INT("q_len"),
+    P_INT("head_k"),
+    P_INT("head_v"),
+    P_INT("conv_width"),
+    P_INTO("n_head_v"),
+    P_F64O("scale"),
+    P_F64O("eps"),
+    P_F64O("l2_eps"),
+    P_F64O("softplus_thr"),
+    P_STRO("act"),
+    P_INTO("state_fp16"),
+    P_STRO("state_form"),
+    P_INTO("group"),
+};
+static const RadOperandSpec oGdnConvRecurrentUpdateHad[] = {
+    { "x",            RAD_OPD_IN,     0 },
+    { "conv_w",       RAD_OPD_WEIGHT, 0 },
+    { "conv_b",       RAD_OPD_WEIGHT, 1 },
+    { "conv_state",   RAD_OPD_INOUT,  0 },
+    { "conv_idx",     RAD_OPD_IN,     0 },
+    { "a",            RAD_OPD_IN,     0 },
+    { "b",            RAD_OPD_IN,     0 },
+    { "A_log",        RAD_OPD_WEIGHT, 0 },
+    { "dt_bias",      RAD_OPD_WEIGHT, 0 },
+    { "state",        RAD_OPD_INOUT,  0 },
+    { "state_idx",    RAD_OPD_IN,     0 },
+    { "num_accepted", RAD_OPD_IN,     0 },
+    { "cu",           RAD_OPD_IN,     0 },
+    { "z",            RAD_OPD_IN,     0 },
+    { "norm_w",       RAD_OPD_WEIGHT, 0 },
+    { "o",            RAD_OPD_OUT,    0 },
+    { "o_q",          RAD_OPD_OUT,    0 },
+    { "o_scale",      RAD_OPD_OUT,    0 },
+};
 
 /* The control vector's projection (halo_hc_bf16.hip, with the other gated-residual kernels): a bf16
  * stream, one unit f32 direction for every stream, an int32 switch per row. */
@@ -3197,6 +3232,12 @@ static const RadOpSchema kSchemas[] = {
            "gdn_conv_update followed by gdn_recurrent_update, with the convolution computed in "
            "the recurrent update's prologue: q, k and v never reach memory. Byte-identical to "
            "the two ops it replaces."),
+    SCHEMA("gdn_conv_recurrent_update_had", pGdnConvRecurrentUpdateHad, oGdnConvRecurrentUpdateHad,
+           "gdn_conv_recurrent_update whose `o_q` / `o_scale` are had_quant_act_i8g's codes of "
+           "`o` (int8, a 128-wide Hadamard before the per-(token, head) amax), for an out "
+           "projection stored rotated (i8a8h). Byte-identical to gdn_conv_recurrent_update "
+           "followed by had_quant_act_i8g. `group` 256 is IQ8R's: one scale per two value heads "
+           "(`o_scale` [tokens, n_head_v / 2]), each head still rotated on its own."),
     SCHEMA("hc_enter", pHcPlain, oHcEnter,
            "h[s] = x for each of the hc streams -- the wide residual stream's first value."),
     SCHEMA("mhc_pre", pMhcPre, oMhcPre,
@@ -4645,6 +4686,15 @@ static const RadConstraint cMoeGemmW4[] = {
     C_GE("top_k", 1), C_EQ("group", 128),
     C_IN("dtype", "w4a8 w4a8h w4nla8h w4nl64a8h w4nl32a8h w5nl64a8h"),
 };
+/* The int8-activation experts (halo_moe_i8.hip): only the stored forms that file decodes. */
+static const RadConstraint cMoeGemmW4nlI8[] = {
+    C_GE("M", 1), C_DIV("N", 16), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 65536),
+    C_GE("top_k", 1), C_EQ("group", 128), C_IN("dtype", "w4nl64a8i8h"), C_IN("a_group", "128 256"),
+};
+static const RadConstraint cMoeGemmIqrI8[] = {
+    C_GE("M", 1), C_DIV("N", 16), C_DIV("K", 256), C_GE("n_expert", 1), C_LE("n_expert", 512),
+    C_GE("top_k", 1), C_EQ("group", 128), C_IN("dtype", "i8a8h"), C_IN("a_group", "128 256"),
+};
 /* The bf16 expert GEMM: 64-wide column tiles and 64-deep K passes, one table, no group. */
 static const RadConstraint cMoeGemmBf16[] = {
     C_GE("M", 1), C_DIV("N", 64), C_DIV("K", 64), C_GE("n_expert", 1), C_LE("n_expert", 65536),
@@ -4750,6 +4800,19 @@ static const RadConstraint cGemmNtI8A8M16[] = {
 };
 static const RadConstraint cGemmNtI8A8Tiled[] = {
     C_DIV("K", HALO_FP8_BLOCK), C_DIV("N", HALO_FP8_BLOCK), C_EQ("group", HALO_FP8_BLOCK),
+    C_IN("dtype", "i8a8 i8a8h"),
+};
+/* The IQR weights (halo_gemm_iqr.hip), libr4d's bands: K a multiple of 256 as both rows check. */
+static const RadConstraint cGemmNtIqrM64[] = {
+    C_LE("M", 64), C_DIV("K", 256), C_DIV("N", 16), C_EQ("group", HALO_FP8_BLOCK),
+    C_IN("dtype", "i8a8 i8a8h"),
+};
+static const RadConstraint cGemmNtQGatedIqr[] = {
+    C_LE("M", 16), C_DIV("K", 256), C_DIV("N", 256), C_EQ("group", HALO_FP8_BLOCK),
+    C_IN("dtype", "i8a8h"), C_IN("act", "silu"),
+};
+static const RadConstraint cGemmNtIqrTiled[] = {
+    C_DIV("K", 256), C_DIV("N", HALO_FP8_BLOCK), C_EQ("group", HALO_FP8_BLOCK),
     C_IN("dtype", "i8a8 i8a8h"),
 };
 /* libhalo's `K DIV 4`, renamed to docs/OPS.md's `n` as in every quantiser row here. */
@@ -7263,6 +7326,15 @@ HALO_WIN_PAIR(512, 1) HALO_WIN_PAIR(512, 2) HALO_WIN_PAIR(512, 4) HALO_WIN_PAIR(
   nullptr, nullptr, halo_rad_gdn_conv_recurrent_update, nullptr, nullptr, nullptr, nullptr,
   nullptr, halo_fuse_gdn_conv_recurrent_update },
 
+{ "gdn_conv_recurrent_update_had_k128_v128_bf16", "gdn_conv_recurrent_update_had", "gdn",
+  "gdn_conv_recurrent_update_k128_v128_bf16, then had_quant_act_i8g over its `o` on the same "
+  "stream (libr4d fuses the second pass into the epilogue; the pair is byte-identical to it)",
+  "as gdn_conv_recurrent_update_k128_v128_bf16; int8 codes, group 128 only",
+  "as gdn_conv_recurrent_update_k128_v128_bf16, the codes had_quant_act_i8g's over `o`",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cGdnConvRecurrentUpdate), NOTUNE,
+  nullptr, nullptr, halo_rad_gdn_conv_recurrent_update_had },
+
 { "kda_update_k128_v128_bf16", "kda_update", "gdn", "per-channel KDA recurrence and candidate rollback",
   "heads 1..65535, K=V=128, prefill and verify", "bf16 activations, f32 gates and state",
   RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY, ROW(cKdaUpdate), NOTUNE,
@@ -7804,6 +7876,44 @@ HALO_WIN_PAIR(512, 1) HALO_WIN_PAIR(512, 2) HALO_WIN_PAIR(512, 4) HALO_WIN_PAIR(
   halo_rad_layout_i8_block, halo_rad_relayout_i8_block,
   nullptr, halo_rad_unrelayout_i8_block },
 
+{ "gemm_iqr_nt_m64", "gemm_nt_q", "gemm",
+  "gemm_nt_q over an IQR weight (halo_iqr.h) kept at its codes' width: the call decodes the codes "
+  "into an int8 plane in its scratch and runs one iu8 WMMA GEMM over it",
+  "M <= 64; K a multiple of 256; N a multiple of 16, and of a trellis's run",
+  "i8 A with an f32 scale per (row, 128 K), W an IQR form's codes decoding to int8 values with a "
+  "scale per row per 128 K (bf16, E4M3 under an f32, a tcq_rb block's, or one f32 a row times one "
+  "a 128-K block), bf16 C; each group's exact int32 sum folded in f32: the product within f32 "
+  "rounding",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_GEMM_FP8_M16,
+  ROW(cGemmNtIqrM64), NOTUNE,
+  nullptr, nullptr, halo_rad_gemm_iqr_m64, halo_rad_gemm_iqr_m64_scratch,
+  halo_rad_layout_iqr, halo_rad_relayout_iqr,
+  nullptr, halo_rad_unrelayout_iqr },
+
+{ "gemm_iqr_gated", "gemm_nt_q_gated", "gemm",
+  "gemm_iqr_nt_m64 over an IQR gate_up weight into the op's scratch, then gated_had_quant_i8g "
+  "over that product (libr4d folds the second pass into the GEMM's epilogue; the pair is "
+  "byte-identical to it)",
+  "M <= 16; K a multiple of 256; N a multiple of 256 (the gated width of the 128-column group), "
+  "and of a trellis's run; act silu; an IQR weight's codes, gate rows then up rows",
+  "i8 A with an f32 scale per (row, 128 K), W an IQR form's codes (as gemm_iqr_nt_m64), and the "
+  "QUANTISER's outputs: int8 codes of the rotated product, an f32 scale per (row, 128 columns) and "
+  "an optional bf16 product. Byte-identical to gemm_iqr_nt_m64 followed by gated_had_quant_i8g",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cGemmNtQGatedIqr), NOTUNE,
+  nullptr, nullptr, halo_rad_gemm_iqr_gated, halo_rad_gemm_iqr_gated_scratch,
+  halo_rad_layout_iqr, halo_rad_relayout_iqr, nullptr, halo_rad_unrelayout_iqr },
+
+{ "gemm_iqr_tiled", "gemm_nt_q", "gemm",
+  "the prefill GEMM over an IQR weight: gemm_iqr_nt_m64's decode and GEMM at any M",
+  "any M; K a multiple of 256 and N of 128",
+  "as gemm_iqr_nt_m64",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_GEMM_FP8_TILED,
+  ROW(cGemmNtIqrTiled), NOTUNE,
+  nullptr, nullptr, halo_rad_gemm_iqr_tiled, halo_rad_gemm_iqr_tiled_scratch,
+  halo_rad_layout_iqr, halo_rad_relayout_iqr,
+  nullptr, halo_rad_unrelayout_iqr },
+
 /* Band read off the entry point's own rejection tests, not a kernel-side row. */
 { "gemm_w8a8_nt_m64", "gemm_nt_q", "gemm",
   "skinny GEMM with an 8-bit weight and an 8-bit activation: the promoted linears of the INT4 "
@@ -8117,6 +8227,32 @@ HALO_WIN_PAIR(512, 1) HALO_WIN_PAIR(512, 2) HALO_WIN_PAIR(512, 4) HALO_WIN_PAIR(
   nullptr, nullptr, halo_rad_moe_gemm_w4a8_mod4, halo_rad_moe_gemm_w4a8_scratch,
   halo_rad_layout_moe_w4_mod4, halo_rad_relayout_moe_w4_mod4, nullptr,
   halo_rad_unrelayout_moe_w4_mod4 },
+
+{ "moe_gemm_w4a8i8", "moe_gemm_q", "moe",
+  "moe_gemm_w4a8's stored codebook experts against an INT8 activation: each wave a 16 x 16 tile of "
+  "the sorted rows, the tile's experts in turn, the codes read as libr4d's int8 levels for the iu8 "
+  "WMMA and each 64-of-K group's int32 sum folded in f32",
+  "N a multiple of 16, K of 128, group 128; dtype w4nl64a8i8h only",
+  "i8 activation with an f32 scale per (row, 128 or 256 of K); w4nl codes (moe_gemm_w4a8's planes) "
+  "read as kW4nlI8 * kW4nlI8Unit under an E4M3 scale per (row, 64 of K) and the fixed 2^-13; "
+  "bf16 out, the product within f32 rounding of those levels",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cMoeGemmW4nlI8), NOTUNE,
+  nullptr, nullptr, halo_rad_moe_gemm_w4a8i8, nullptr,
+  halo_rad_layout_moe_w4, halo_rad_relayout_moe_w4, nullptr, halo_rad_unrelayout_moe_w4 },
+
+{ "moe_gemm_iqr", "moe_gemm_q", "moe",
+  "moe_gemm_q over experts stored as IQR weights: each wave a 16 x 16 tile of the sorted rows, the "
+  "tile's experts in turn, each 128-K unit decoded by halo_iqr_dec.h into the wave's LDS tile just "
+  "before its iu8 WMMA steps",
+  "N a multiple of 16 a part and of the trellis's run, K of 256, group 128, at most 512 experts; "
+  "a computed trellis (tcq_code=mad) under one f32 scale a row, pointer tables",
+  "i8 activation with an f32 scale per (row, 128 or 256 of K), each expert an IQR weight and its "
+  "scales (f32 a row, f32 a 128-K block), /fwht128; bf16 out, the product within f32 rounding",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cMoeGemmIqrI8), NOTUNE,
+  nullptr, nullptr, halo_rad_moe_gemm_iqr, nullptr,
+  halo_rad_layout_moe_iqr, halo_rad_relayout_moe_iqr, nullptr, halo_rad_unrelayout_moe_iqr },
 
 { "moe_gemm_bf16", "moe_gemm", "moe",
   "the grouped GEMM with unquantised experts: one run of expert-sorted rows a block, bf16 WMMA over "

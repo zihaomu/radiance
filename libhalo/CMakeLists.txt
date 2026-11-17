@@ -81,6 +81,7 @@ set(HALO_UNITS
   "halo_gemm_fp8_f32scale|"
   "halo_gemm_fp8a16_m1|"
   "halo_gemm_fp8a8|"
+  "halo_gemm_iqr|"
   "halo_gemm_mxfp4a8_decode|"
   "halo_gemm_mxfp4a8_gated|"
   "halo_gemm_mxfp4a8_gemv|"
@@ -117,6 +118,7 @@ set(HALO_UNITS
   "halo_moe|"
   "halo_moe_gemm_bf16|"
   "halo_moe_gemm_q|"
+  "halo_moe_i8|"
   "halo_moe_mxfp4|"
   "halo_mtp_enter|"
   "halo_ngram_ids|"
@@ -176,8 +178,13 @@ endforeach()
 # descriptions and fusion claims, plus the generated stubs for units not yet ported. They are pure
 # host C++ that includes neither halo.h nor hip_runtime.h, so these tables compile and can be
 # inspected without ROCm.
-set(HALO_DECLARATION halo_rows.cpp halo_layout.cpp halo_fp8_layout.cpp halo_shapes.cpp halo_fuse.cpp
-                     halo_stubs.cpp)
+set(HALO_DECLARATION halo_rows.cpp halo_layout.cpp halo_fp8_layout.cpp halo_iqr_layout.cpp halo_shapes.cpp halo_fuse.cpp
+                     halo_stubs.cpp halo_hsimd.cpp)
+# The IQR relayout's hot loops, once per CPU level (halo_hsimd.h), as libr4d builds them.
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/RadSimdLevels.cmake)
+rad_simd_level_objects(halo_hsimd ${CMAKE_CURRENT_SOURCE_DIR}/halo_hsimd_kernels.cpp HALO_HSIMD_OBJS
+                       DEFINE HALO_HSIMD_LEVEL INCLUDES ${CMAKE_CURRENT_SOURCE_DIR})
+list(APPEND HALO_DECLARATION ${HALO_HSIMD_OBJS})
 
 rad_add_plugin(libhalo kernels
   SOURCES     ${HALO_DECLARATION}

@@ -1224,3 +1224,32 @@ extern "C" int halo_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s)
         (int)Hg, scale, thr, state->dtype == RAD_F16 ? 1 : 0, s,
         oq && oq->dtype == RAD_I8 ? 1 : 0, anc != 0);
 }
+
+/* gdn_conv_recurrent_update_had, composed: the fold above writes `o` (its own codes epilogue off),
+ * then had_quant_act_i8g quantises `o` into `o_q` / `o_scale` on the same stream. libr4d fuses
+ * the second pass into the fold's epilogue and r4d_selftest proves it byte-identical to this
+ * pair; here it costs one more launch and one more read of `o` ([T, H*V] bf16) per GDN layer.
+ * Only the 128 group: the IQ8R pairwise 256 form is refused. */
+extern "C" int halo_rad_had_quant_act_i8g(const RadArgs*, RadStream);
+extern "C" int halo_rad_gdn_conv_recurrent_update_had(const RadArgs* a, RadStream s) {
+    if (!a || !a->t || a->n_t <= OPD_CR_OS || a->n_t > 32) return HALO_NO(RAD_E_INVAL);
+    const RadTensor* o  = halo_opt(a, OPD_CR_O);
+    const RadTensor* oq = halo_opt(a, OPD_CR_OQ);
+    const RadTensor* os = halo_opt(a, OPD_CR_OS);
+    if (!o || !oq || !os) return HALO_NO(RAD_E_INVAL);
+    if (oq->dtype != RAD_I8) return HALO_NO(RAD_E_DTYPE);
+    if (halo_geti_or(a, "group", 128) != 128) return HALO_NO(RAD_E_UNSUPPORTED);
+    RadTensor t[32];
+    for (int i = 0; i < a->n_t; ++i) t[i] = a->t[i];
+    t[OPD_CR_OQ].data = nullptr;
+    t[OPD_CR_OS].data = nullptr;
+    RadArgs fold = *a;
+    fold.t = t;
+    int rc = halo_rad_gdn_conv_recurrent_update(&fold, s);
+    if (rc != RAD_OK) return rc;
+    const RadTensor qt[3] = { *o, *oq, *os };
+    RadArgs q = *a;
+    q.t = qt; q.n_t = 3; q.p = nullptr; q.n_p = 0;
+    q.scratch = nullptr; q.scratch_bytes = 0; q.instance = nullptr;
+    return halo_rad_had_quant_act_i8g(&q, s);
+}

@@ -1,0 +1,483 @@
+/* moe_gemm_q against an int8 activation on gfx1151: the routed experts' grouped GEMM at the two
+ * stored forms Qwen3.8-Flash-Next's IQR-V4 container reads with an int8 activation (libr4d's
+ * moe_gemm_w4a8i8 and moe_gemm_iqr, r4d_moe.hip / r4d_moe_iqr.hip):
+ *
+ *   halo_rad_moe_gemm_w4a8i8   dtype w4nl64a8i8h: libquant's w4nl codes (the stored planes of
+ *                              moe_gemm_w4a8, halo_layout.cpp's moew4_permute order) read as
+ *                              libr4d's int8 levels kW4nlI8 times kW4nlI8Unit, an E4M3 scale per
+ *                              (row, 64 of K) under the fixed kW4G64Scale
+ *   halo_rad_moe_gemm_iqr      dtype i8a8h over IQR experts (halo_iqr.h), each decoded by
+ *                              halo_iqr_dec.h's decoders where it is read
+ *
+ * One wave a 16-row x 16-column output tile of the sorted rows. The tile's rows may belong to
+ * several experts (sorted, so a few at most); the wave takes them in turn, each expert's WMMAs
+ * reading only its own rows' activation (the rest are zero), so every row sums its own expert's
+ * product. A weight unit of 16 rows x 128 of K is laid out row-major in the wave's LDS tile and
+ * read back as gfx1151 iu8 B fragments: lane l takes row (l & 15)'s sixteen K bytes; the
+ * accumulator's slot e is output row 2e + (l >> 4), column (l & 15) (halo_gemm_fp8a8.hip).
+ * Each scale group's int32 sum is folded in f32: the product within f32 rounding. */
+
+#include "halo.h"
+#include "halo_args.h"
+#include "halo_iqr.h"
+#include "halo_iqr_dec.h"
+
+#include <hip/hip_runtime.h>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+
+namespace {
+
+using namespace halo_iqr;
+using namespace halo_iqr_dev;
+
+constexpr uint32_t kWave = 32, kWaves = 4, kPitch = 136;
+
+typedef int v4i __attribute__((ext_vector_type(4)));
+typedef int v8i __attribute__((ext_vector_type(8)));
+
+/* libr4d's w4nl int8 levels (r4d_args.h kW4nlI8: the magnitudes, then their negatives) and their
+ * unit, and the fixed second scale level of w4nl64a8h (kW4G64Scale). */
+constexpr float kW4nlI8Unit = 0.18965f;
+constexpr float kW4G64Scale = 0x1p-13f;
+__constant__ int8_t c_w4nl_i8[16] = { 6, 17, 29, 42, 58, 74, 95, 116,
+                                      -6, -17, -29, -42, -58, -74, -95, -116 };
+
+/* One class of experts: entry `i` of a weight-table operand (a device pointer array when the
+ * stacked stride is 0). */
+struct Cls {
+    const void* const* w;
+    const void* const* s;
+    uint64_t w_s0, s_s0;
+    uint32_t n, k, w_ld, s_ld, run_tiles;
+};
+__device__ __forceinline__ const uint8_t* tab_at(const void* const* t, uint64_t s0, uint32_t i) {
+    return s0 == 0 ? (const uint8_t*)t[i] : (const uint8_t*)t + (size_t)i * s0;
+}
+
+struct Route {
+    const int8_t* A;
+    const float* As;
+    const int32_t* sorted;
+    const int32_t* off;
+    uint16_t* Y;
+    uint32_t T, N, n_expert, top_k, a_ld, as_ld, y_ld, a_group, a_sorted;
+};
+
+__device__ __forceinline__ uint16_t f32_to_bf16(float f) {
+    uint32_t u = __float_as_uint(f);
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    return (uint16_t)(u >> 16);
+}
+__device__ __forceinline__ float e4m3f(uint32_t b) {
+    const uint32_t sign = (b & 0x80u) << 24, ex = (b >> 3) & 0x0Fu, mn = b & 0x07u;
+    const float nrm = __uint_as_float(((ex + 120u) << 23) | (mn << 20));
+    const float sub = (float)mn * (1.0f / 512.0f);
+    return __uint_as_float(__float_as_uint(ex ? nrm : sub) | sign);
+}
+
+/* The w4nl expert: a unit's 16 rows of lane l's four columns, as the IQR decoders give them. */
+struct W4nl {
+    static constexpr uint32_t kSub = 64;   /* K per weight scale */
+    const uint8_t* w;
+    const uint8_t* s;
+    uint32_t w_ld, s_ld;
+    __device__ void unit(uint32_t row0, uint32_t kb, uint32_t lane, uint32_t (&o)[16]) const {
+#pragma unroll
+        for (uint32_t q = 0; q < 16; ++q) {
+            const uint32_t d = *(const uint32_t*)(w + (size_t)(row0 + q) * w_ld + kb * 64u + (lane >> 1) * 4u);
+            const uint32_t nib = (lane & 1u) ? (d >> 4) & 0x0F0F0F0Fu : d & 0x0F0F0F0Fu;
+            uint32_t v = 0;
+#pragma unroll
+            for (uint32_t b = 0; b < 4; ++b)
+                v |= (uint32_t)(uint8_t)c_w4nl_i8[(nib >> (8u * b)) & 0xFu] << (8u * b);
+            o[q] = v;
+        }
+    }
+    /* The f32 a sub-group's int32 sum of row r takes, and the row's own factor (1). */
+    __device__ float fold(uint32_t r, uint32_t sub) const {
+        return e4m3f(s[(size_t)r * s_ld + sub]) * (kW4G64Scale * kW4nlI8Unit);
+    }
+    __device__ float row(uint32_t) const { return 1.0f; }
+};
+
+/* An IQR expert: the dense GEMM's decoders over this expert's buffers. */
+template <class F>
+struct Iqr {
+    static constexpr uint32_t kSub = 128;
+    Ctx c;
+    __device__ void unit(uint32_t row0, uint32_t kb, uint32_t lane, uint32_t (&o)[16]) const {
+        using D = Dec<F>;
+        const uint32_t rt = row0 / 16u;
+        const typename D::Raw raw = D::fetch(c, rt, kb, lane, true);
+        D::rows(raw, c, rb_ratio<F>(c, rt * 16u + (lane & 15u), kb), o);
+        D::unzero(c, rt, kb, o);
+    }
+    __device__ float fold(uint32_t r, uint32_t kb) const { return fold_f32<F>(c, r, kb); }
+    __device__ float row(uint32_t r) const { return row_scale<F>(c, r); }
+};
+
+template <class F>
+__device__ __forceinline__ Iqr<F> make_iqr(const Cls& cl, uint32_t idx, int8_t* tab) {
+    Iqr<F> x;
+    x.c.W = tab_at(cl.w, cl.w_s0, idx);
+    x.c.S = tab_at(cl.s, cl.s_s0, idx);
+    x.c.tab = tab;
+    x.c.N = cl.n;
+    x.c.nkb = cl.k / 128u;
+    x.c.run_tiles = cl.run_tiles;
+    return x;
+}
+
+__device__ __forceinline__ uint32_t expert_of(const int32_t* off, uint32_t n_expert, uint32_t i) {
+    uint32_t lo = 0, hi = n_expert;
+    while (hi - lo > 1u) {
+        const uint32_t mid = (lo + hi) / 2u;
+        if ((uint32_t)off[mid] <= i) lo = mid; else hi = mid;
+    }
+    return lo;
+}
+
+/* The wave's 16 x 16 tile: rows r0.., columns n0... `make` builds expert e's weight view, whose
+ * scales cover SUB of K each. */
+/* `zj` of `zn`: the experts of the tile are split over zn waves (grid z), the wave taking the
+ * ones whose rank in the tile (ascending) is zj modulo zn, and writing only their rows; wave 0
+ * also writes the rows no expert owns (dropped, past the live rows), as zeros. */
+template <uint32_t SUB, class MAKE>
+__device__ void tile(const Route& R, const Cls (&cl)[2], uint32_t r0, uint32_t n0, uint8_t* tr,
+                     int8_t* tab, MAKE make, uint32_t zj, uint32_t zn) {
+    const uint32_t lane = threadIdx.x & (kWave - 1u), half = lane >> 4, slot = lane & 15u;
+    const uint32_t live = (uint32_t)R.off[R.n_expert];
+    /* This lane's activation row (slot) and accumulator rows (2e + half): expert and source. */
+    const uint32_t ia = r0 + slot;
+    int32_t tok = -1;
+    uint32_t ea = 0xFFFFFFFFu;
+    if (ia < live && ia < R.T) {
+        const int32_t f = R.sorted[ia];
+        if (f >= 0) {
+            tok = R.a_sorted ? (int32_t)ia : f / (int32_t)R.top_k;
+            ea = expert_of(R.off, R.n_expert, ia);
+        }
+    }
+    uint32_t eo[8];
+#pragma unroll
+    for (uint32_t e = 0; e < 8; ++e) {
+        const uint32_t i = r0 + 2u * e + half;
+        eo[e] = 0xFFFFFFFFu;
+        if (i < live && i < R.T && R.sorted[i] >= 0) eo[e] = expert_of(R.off, R.n_expert, i);
+    }
+    v8f acc = (v8f)0.f;
+    /* The tile's experts in ascending order: the smallest not yet done, over the lanes. */
+    uint32_t done = 0u, rank = 0u;
+    for (;; ++rank) {
+        uint32_t mine = (ea != 0xFFFFFFFFu && (done == 0u || ea >= done)) ? ea : 0xFFFFFFFFu;
+        for (uint32_t o = 16; o >= 1; o >>= 1) {
+            const uint32_t other = __shfl_xor(mine, o, kWave);
+            mine = other < mine ? other : mine;
+        }
+        const uint32_t ex = mine;
+        if (ex == 0xFFFFFFFFu) break;
+        done = ex + 1u;
+        if (rank % zn != zj) continue;
+        const Cls& c = cl[ex & 1u];
+        const uint32_t idx = ex >> 1;
+        if (n0 >= c.n) continue;   /* a narrower class: its columns past n are zero */
+        const auto W = make(c, idx, tab);
+        const uint32_t nkb = c.k / 128u;
+        const bool arow = ea == ex;
+        const int8_t* ap = arow ? R.A + (size_t)tok * R.a_ld : nullptr;
+        v8f part = (v8f)0.f;
+        for (uint32_t kb = 0; kb < nkb; ++kb) {
+            uint32_t w[16];
+            W.unit(n0, kb, lane, w);
+#pragma unroll
+            for (uint32_t q = 0; q < 16; ++q) *(uint32_t*)(tr + q * kPitch + 4u * lane) = w[q];
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");
+            __builtin_amdgcn_wave_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront", "local");
+            constexpr uint32_t SUBS = 128u / SUB;
+#pragma unroll
+            for (uint32_t sg = 0; sg < SUBS; ++sg) {
+                v8i tmp = (v8i)0;
+#pragma unroll
+                for (uint32_t u = 0; u < 8u / SUBS; ++u) {
+                    const uint32_t ks = sg * (128u / SUBS) + u * 16u;
+                    v4i af = (v4i)0, bf;
+                    if (arow) {
+                        const uint4 av = *(const uint4*)(ap + kb * 128u + ks);
+                        af[0] = (int)av.x; af[1] = (int)av.y; af[2] = (int)av.z; af[3] = (int)av.w;
+                    }
+                    const uint4 bv = *(const uint4*)(tr + slot * kPitch + ks);
+                    bf[0] = (int)bv.x; bf[1] = (int)bv.y; bf[2] = (int)bv.z; bf[3] = (int)bv.w;
+                    tmp = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, af, true, bf, tmp, false);
+                }
+                const uint32_t kabs = kb * 128u + sg * (128u / SUBS);
+                const float ws = W.fold(n0 + slot, kb * SUBS + sg);
+#pragma unroll
+                for (uint32_t e = 0; e < 8; ++e) {
+                    if (eo[e] != ex) continue;
+                    const uint32_t i = r0 + 2u * e + half;
+                    const int32_t f = R.sorted[i];
+                    const uint32_t at = R.a_sorted ? i : (uint32_t)f / R.top_k;
+                    part[e] = fmaf((float)tmp[e], R.As[(size_t)at * R.as_ld + kabs / R.a_group] * ws, part[e]);
+                }
+            }
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");
+            __builtin_amdgcn_wave_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront", "local");
+        }
+        const float rs = W.row(n0 + slot);
+#pragma unroll
+        for (uint32_t e = 0; e < 8; ++e) acc[e] += part[e] * rs;
+    }
+    /* A row's owner: the rank of its expert among the tile's, from the slots' experts (the
+     * sorted rows are grouped by expert, so a rank counts the distinct experts below it). */
+    uint32_t ea_s[16], first = 0u;
+#pragma unroll
+    for (uint32_t s = 0; s < 16; ++s) ea_s[s] = __shfl(ea, s, kWave);
+#pragma unroll
+    for (uint32_t s = 0; s < 16; ++s) {
+        bool f = ea_s[s] != 0xFFFFFFFFu;
+#pragma unroll
+        for (uint32_t s2 = 0; s2 < s; ++s2) f = f && ea_s[s2] != ea_s[s];
+        first |= f ? 1u << s : 0u;
+    }
+#pragma unroll
+    for (uint32_t e = 0; e < 8; ++e) {
+        const uint32_t i = r0 + 2u * e + half;
+        if (i >= R.T || n0 + slot >= R.N) continue;
+        bool own;
+        if (eo[e] == 0xFFFFFFFFu) {
+            own = zj == 0u;
+        } else {
+            uint32_t rk = 0u;
+#pragma unroll
+            for (uint32_t s = 0; s < 16; ++s)
+                rk += ((first >> s) & 1u) && ea_s[s] < eo[e] ? 1u : 0u;
+            own = rk % zn == zj;
+        }
+        if (own) R.Y[(size_t)i * R.y_ld + n0 + slot] = f32_to_bf16(acc[e]);
+    }
+}
+
+}  // namespace
+
+namespace {
+
+struct W4Make {
+    __device__ W4nl operator()(const Cls& c, uint32_t idx, int8_t*) const {
+        W4nl x;
+        x.w = tab_at(c.w, c.w_s0, idx);
+        x.s = tab_at(c.s, c.s_s0, idx);
+        x.w_ld = c.w_ld;
+        x.s_ld = c.s_ld;
+        return x;
+    }
+};
+template <class F>
+struct IqrMake {
+    __device__ Iqr<F> operator()(const Cls& c, uint32_t idx, int8_t* tab) const {
+        return make_iqr<F>(c, idx, tab);
+    }
+};
+
+__global__ __launch_bounds__(kWaves * kWave) void moe_w4nl_i8_kernel(Route R, Cls c0, Cls c1) {
+    __shared__ __attribute__((aligned(16))) uint8_t s_tr[kWaves][16 * kPitch];
+    const uint32_t wave = threadIdx.x / kWave;
+    const uint32_t nt = blockIdx.y * kWaves + wave;
+    if (nt * 16u >= R.N) return;
+    const Cls cl[2] = { c0, c1 };
+    tile<W4nl::kSub>(R, cl, blockIdx.x * 16u, nt * 16u, s_tr[wave], nullptr, W4Make{}, blockIdx.z,
+                     gridDim.z);
+}
+
+template <class F>
+__global__ __launch_bounds__(kWaves * kWave) void moe_iqr_i8_kernel(Route R, Cls c0, Cls c1) {
+    __shared__ __attribute__((aligned(16))) uint8_t s_tr[kWaves][16 * kPitch];
+    __shared__ __attribute__((aligned(16))) int8_t s_tab[Dec<F>::kTab];
+    const uint32_t wave = threadIdx.x / kWave;
+    const uint32_t nt = blockIdx.y * kWaves + wave;
+    if (nt * 16u >= R.N) return;
+    const Cls cl[2] = { c0, c1 };
+    tile<Iqr<F>::kSub>(R, cl, blockIdx.x * 16u, nt * 16u, s_tr[wave], s_tab, IqrMake<F>{}, blockIdx.z,
+                       gridDim.z);
+}
+
+/* The routing and output operands shared by both rows, checked as halo_moe_gemm_q.hip's launcher
+ * checks them. [0] a [1] a_scale [2] w [3] w_scale [4] sorted [5] off [6] w_odd [7] w_odd_scale
+ * [8] y. */
+struct Ops {
+    const RadTensor *A, *As, *sorted, *off, *Y, *Wc[2], *Wsc[2];
+    long long Nc[2], Kc[2], N, K, T, M, parts, n_expert, top_k, a_group, a_ld, as_ld, y_ld;
+    bool a_sorted;
+};
+
+int ops_of(const RadArgs* a, Ops* o) {
+    o->A = halo_opt(a, 0);
+    o->As = halo_opt(a, 1);
+    o->sorted = halo_opt(a, 4);
+    o->off = halo_opt(a, 5);
+    o->Y = halo_opt(a, 8);
+    o->Wc[0] = halo_opt(a, 2);
+    o->Wsc[0] = halo_opt(a, 3);
+    o->Wc[1] = halo_opt(a, 6);
+    o->Wsc[1] = halo_opt(a, 7);
+    if (!o->A || !o->As || !o->sorted || !o->off || !o->Y) return HALO_NO(RAD_E_INVAL);
+    for (int q = 0; q < 2; ++q)
+        if (!o->Wc[q] || !o->Wsc[q]) return HALO_NO(RAD_E_INVAL);
+    o->Nc[0] = halo_geti_or(a, "N", 0);
+    o->Kc[0] = halo_geti_or(a, "K", 0);
+    o->Nc[1] = halo_geti_or(a, "N_odd", o->Nc[0]);
+    o->Kc[1] = halo_geti_or(a, "K_odd", o->Kc[0]);
+    o->parts = halo_geti_or(a, "parts", 1);
+    o->n_expert = halo_geti_or(a, "n_expert", 0);
+    o->top_k = halo_geti_or(a, "top_k", 0);
+    o->a_group = halo_geti_or(a, "a_group", 128);
+    if (o->parts <= 0 || o->n_expert <= 0 || o->top_k <= 0) return HALO_NO(RAD_E_SHAPE);
+    if (halo_geti_or(a, "group", 128) != 128) return HALO_NO(RAD_E_SHAPE);
+    if (o->a_group != 128 && o->a_group != 256) return HALO_NO(RAD_E_UNSUPPORTED);
+    o->N = o->K = 0;
+    for (int q = 0; q < 2; ++q) {
+        if (o->Nc[q] <= 0 || o->Kc[q] <= 0) return HALO_NO(RAD_E_SHAPE);
+        if (o->Kc[q] % o->a_group || o->Nc[q] % (16 * o->parts)) return HALO_NO(RAD_E_SHAPE);
+        if (o->Nc[q] > o->N) o->N = o->Nc[q];
+        if (o->Kc[q] > o->K) o->K = o->Kc[q];
+    }
+    if (o->A->dtype != RAD_I8 || o->As->dtype != RAD_F32 || o->Y->dtype != RAD_BF16 ||
+        o->sorted->dtype != RAD_I32 || o->off->dtype != RAD_I32)
+        return HALO_NO(RAD_E_DTYPE);
+    o->y_ld = halo_rows_pitch(o->Y, o->N, &o->T);
+    if (o->y_ld < 0 || o->T <= 0) return HALO_NO(RAD_E_STRIDE);
+    o->a_ld = halo_rows_pitch(o->A, o->K, &o->M);
+    if (o->a_ld < 0 || o->M <= 0 || o->a_ld % 16) return HALO_NO(RAD_E_STRIDE);
+    long long Ms = 0;
+    o->as_ld = halo_rows_pitch(o->As, o->K / o->a_group, &Ms);
+    if (o->as_ld < 0 || Ms < o->M) return HALO_NO(RAD_E_STRIDE);
+    if (halo_numel(o->sorted) < o->T || halo_numel(o->off) < o->n_expert + 1) return HALO_NO(RAD_E_SHAPE);
+    const char* ord = halo_gets(a, "a_order");
+    o->a_sorted = ord && !std::strcmp(ord, "sorted");
+    if (ord && !o->a_sorted && std::strcmp(ord, "token")) return HALO_NO(RAD_E_UNSUPPORTED);
+    if (o->M < (o->a_sorted ? o->T : (o->T + o->top_k - 1) / o->top_k)) return HALO_NO(RAD_E_SHAPE);
+    if (!halo_aligned(o->A->data, 16)) return HALO_NO(RAD_E_ALIGN);
+    return RAD_OK;
+}
+
+Route route_of(const Ops& o) {
+    Route R{};
+    R.A = (const int8_t*)o.A->data;
+    R.As = (const float*)o.As->data;
+    R.sorted = (const int32_t*)o.sorted->data;
+    R.off = (const int32_t*)o.off->data;
+    R.Y = (uint16_t*)o.Y->data;
+    R.T = (uint32_t)o.T;
+    R.N = (uint32_t)o.N;
+    R.n_expert = (uint32_t)o.n_expert;
+    R.top_k = (uint32_t)o.top_k;
+    R.a_ld = (uint32_t)o.a_ld;
+    R.as_ld = (uint32_t)o.as_ld;
+    R.y_ld = (uint32_t)o.y_ld;
+    R.a_group = (uint32_t)o.a_group;
+    R.a_sorted = o.a_sorted ? 1u : 0u;
+    return R;
+}
+
+dim3 grid_of(const Ops& o) {
+    /* z splits a row tile's experts over waves: a decode tile's rows are each a different
+     * expert, a prefill tile's a run of one or two. Measured on gfx1151 (16 experts of layer 0,
+     * gate_up / down): T=10 z=8 86 / 110 us against z=1 166 / 203; T=40 z=2 164 / 187 against
+     * 210 / 270; T=160 z=2 245 / 246 against 243 / 274; T>=370 z=1. HALO_MOE_Z overrides. */
+    const char* ze = std::getenv("HALO_MOE_Z");
+    const unsigned z = ze && *ze ? (unsigned)std::atoi(ze)
+                     : o.T <= 16 ? 8u : o.T <= 256 ? 2u : 1u;
+    return dim3((unsigned)((o.T + 15) / 16), (unsigned)((o.N / 16 + kWaves - 1) / kWaves), z);
+}
+
+/* A weight-table operand: rank 3 [entries, rows, cols]; `bits` the element width, since a
+ * plugin-private dtype has none (halo_moe_gemm_q.hip's wtab_of). */
+int tab_of(const RadTensor* t, uint32_t dtype, int bits, long long cnt, long long rows,
+           long long cols, const void* const** tp, uint64_t* s0, long long* ld) {
+    if (!t || t->rank != 3) return HALO_NO(RAD_E_SHAPE);
+    if (cnt > 0 && !t->data) return HALO_NO(RAD_E_SHAPE);
+    if (t->dtype != dtype) return HALO_NO(RAD_E_DTYPE);
+    if (t->shape[0] < cnt || t->shape[1] < rows || t->shape[2] < cols) return HALO_NO(RAD_E_SHAPE);
+    if (t->stride[2] != 1) return HALO_NO(RAD_E_STRIDE);
+    *tp = (const void* const*)t->data;
+    *s0 = (uint64_t)((t->stride[0] * (int64_t)bits) / 8);
+    *ld = t->stride[1];
+    return RAD_OK;
+}
+
+int w4nl_run(const RadArgs* a, RadStream s) {
+    Ops o;
+    int rc = ops_of(a, &o);
+    if (rc != RAD_OK) return rc;
+    const char* wdt = halo_gets(a, "dtype");
+    if (!wdt || std::strcmp(wdt, "w4nl64a8i8h")) return HALO_NO(RAD_E_DTYPE);
+    Cls cl[2]{};
+    for (int q = 0; q < 2; ++q) {
+        const long long cnt = (o.n_expert + 1 - q) / 2;
+        long long wld = 0, sld = 0;
+        rc = tab_of(o.Wc[q], (uint32_t)HALO_DT_MOEW4, 4, cnt, o.Nc[q], o.Kc[q], &cl[q].w, &cl[q].w_s0, &wld);
+        if (rc != RAD_OK) return rc;
+        rc = tab_of(o.Wsc[q], RAD_F8E4M3, 8, cnt, o.Nc[q], o.Kc[q] / 64, &cl[q].s, &cl[q].s_s0, &sld);
+        if (rc != RAD_OK) return rc;
+        if (wld % 2 || o.Kc[q] % 128) return HALO_NO(RAD_E_STRIDE);
+        cl[q].w_ld = (uint32_t)(wld / 2);
+        cl[q].s_ld = (uint32_t)(o.Kc[q] / 64);
+        cl[q].n = (uint32_t)o.Nc[q];
+        cl[q].k = (uint32_t)o.Kc[q];
+    }
+    hipLaunchKernelGGL(moe_w4nl_i8_kernel, grid_of(o), dim3(kWaves * kWave), 0, (hipStream_t)s,
+                       route_of(o), cl[0], cl[1]);
+    return hipGetLastError() == hipSuccess ? RAD_OK : HALO_NO(RAD_E_DEVICE);
+}
+
+#define HALO_MOE_IQR_T(b, l) FormT<kTrellisMad, b, 0, l, 0, kRowF32>
+
+int iqr_run(const RadArgs* a, RadStream s) {
+    Ops o;
+    int rc = ops_of(a, &o);
+    if (rc != RAD_OK) return rc;
+    if (o.n_expert > 512) return HALO_NO(RAD_E_UNSUPPORTED);
+    const uint32_t wdt = o.Wc[0]->dtype;
+    if (!is_weight_dtype(wdt)) return HALO_NO(RAD_E_DTYPE);
+    const uint32_t wd = wdt & kWordMask;
+    const Form fm = form(wd);
+    if (fm.kind != kTrellisMad || fm.scale != kRowF32 || fm.lrb != 0 || fm.lrun < 4)
+        return HALO_NO(RAD_E_DTYPE);
+    const long long run = (long long)1 << fm.lrun;
+    Cls cl[2]{};
+    for (int q = 0; q < 2; ++q) {
+        const long long cnt = (o.n_expert + 1 - q) / 2;
+        const RadTensor *w = o.Wc[q], *ws = o.Wsc[q];
+        if (w->dtype != wdt || ws->dtype != (HALO_DT_IQR_S | wd)) return HALO_NO(RAD_E_DTYPE);
+        /* Pointer tables, one entry an expert, as libr4d's moe_gemm_iqr requires. */
+        if (w->rank != 3 || ws->rank != 3 || w->stride[0] != 0 || ws->stride[0] != 0 ||
+            w->shape[0] < cnt || ws->shape[0] < cnt || (cnt > 0 && (!w->data || !ws->data)))
+            return HALO_NO(RAD_E_SHAPE);
+        if (o.Kc[q] % 256 || (o.Nc[q] / o.parts) % run) return HALO_NO(RAD_E_SHAPE);
+        cl[q].w = (const void* const*)w->data;
+        cl[q].s = (const void* const*)ws->data;
+        cl[q].n = (uint32_t)o.Nc[q];
+        cl[q].k = (uint32_t)o.Kc[q];
+        cl[q].run_tiles = (uint32_t)(run / 16);
+    }
+    const uint32_t kw = kernel_word(wd);
+    hipStream_t st = (hipStream_t)s;
+#define HALO_MOE_IQR_GO(b, l)                                                                  \
+    if (kw == HALO_MOE_IQR_T(b, l)::word()) {                                                  \
+        hipLaunchKernelGGL(moe_iqr_i8_kernel<HALO_MOE_IQR_T(b, l)>, grid_of(o),                \
+                           dim3(kWaves * kWave), 0, st, route_of(o), cl[0], cl[1]);            \
+        return hipGetLastError() == hipSuccess ? RAD_OK : HALO_NO(RAD_E_DEVICE);               \
+    }
+    HALO_MOE_IQR_GO(2, 16) HALO_MOE_IQR_GO(3, 16) HALO_MOE_IQR_GO(4, 16) HALO_MOE_IQR_GO(5, 16)
+    HALO_MOE_IQR_GO(6, 16) HALO_MOE_IQR_GO(7, 16) HALO_MOE_IQR_GO(2, 15)
+#undef HALO_MOE_IQR_GO
+    return HALO_NO(RAD_E_DTYPE);
+}
+
+}  // namespace
+
+extern "C" int halo_rad_moe_gemm_w4a8i8(const RadArgs* a, RadStream s) { return w4nl_run(a, s); }
+extern "C" int halo_rad_moe_gemm_iqr(const RadArgs* a, RadStream s) { return iqr_run(a, s); }

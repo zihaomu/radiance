@@ -399,6 +399,7 @@ int halo_rad_gdn_recurrent_update(const RadArgs*, RadStream);
 /* gdn_conv_update folded into the recurrent update's prologue for the decode shape; q/k/v are
  * never written (halo_gdn_recurrent_update_k128_v128_bf16_fp32state.hip). */
 int halo_rad_gdn_conv_recurrent_update(const RadArgs*, RadStream);
+int halo_rad_gdn_conv_recurrent_update_had(const RadArgs*, RadStream);
 int halo_rad_gdn_gated_rmsnorm   (const RadArgs*, RadStream);
 int halo_rad_dflash_conv         (const RadArgs*, RadStream);
 int halo_rad_dflash_select       (const RadArgs*, RadStream);
@@ -569,6 +570,14 @@ int halo_rad_gemm_i8a8_m16  (const RadArgs*, RadStream);
 int64_t halo_rad_gemm_i8a8_m16_scratch(const RadArgs*);
 int halo_rad_logits_gemm_i8(const RadArgs*, RadStream);
 int halo_rad_gemm_i8a8_tiled(const RadArgs*, RadStream);
+int halo_rad_gemm_iqr_m64(const RadArgs*, RadStream);
+int64_t halo_rad_gemm_iqr_m64_scratch(const RadArgs*);
+int halo_rad_gemm_iqr_tiled(const RadArgs*, RadStream);
+int64_t halo_rad_gemm_iqr_tiled_scratch(const RadArgs*);
+int halo_rad_gemm_iqr_gated(const RadArgs*, RadStream);
+int64_t halo_rad_gemm_iqr_gated_scratch(const RadArgs*);
+int halo_rad_moe_gemm_w4a8i8(const RadArgs*, RadStream);
+int halo_rad_moe_gemm_iqr(const RadArgs*, RadStream);
 int halo_rad_quant_act_i8g(const RadArgs*, RadStream);
 int halo_rad_had_quant_act_i8g(const RadArgs*, RadStream);
 int halo_rad_quant_act_fp8   (const RadArgs*, RadStream);
@@ -636,6 +645,18 @@ int halo_rad_relayout_w8a16(const RadParam*, int, int, const RadEncoding*, const
                            const RadTensor*, int, void*, int64_t);
 int halo_rad_relayout_w8a8(const RadParam*, int, int, const RadEncoding*, const int*,
                           const RadTensor*, int, void*, int64_t);
+int halo_rad_layout_iqr(const RadParam*, int, int, const RadEncoding*, const int*,
+                        const RadTensor*, int, RadLayout*);
+int halo_rad_relayout_iqr(const RadParam*, int, int, const RadEncoding*, const int*,
+                          const RadTensor*, int, void*, int64_t);
+int halo_rad_unrelayout_iqr(const RadParam*, int, int, const RadEncoding*, const int*,
+                            const void*, int64_t, const RadTensor*, int);
+int halo_rad_layout_moe_iqr(const RadParam*, int, int, const RadEncoding*, const int*,
+                            const RadTensor*, int, RadLayout*);
+int halo_rad_relayout_moe_iqr(const RadParam*, int, int, const RadEncoding*, const int*,
+                              const RadTensor*, int, void*, int64_t);
+int halo_rad_unrelayout_moe_iqr(const RadParam*, int, int, const RadEncoding*, const int*,
+                                const void*, int64_t, const RadTensor*, int);
 int halo_rad_layout_w5(const RadParam*, int, int, const RadEncoding*, const int*,
                       const RadTensor*, int, RadLayout*);
 int halo_rad_relayout_w5(const RadParam*, int, int, const RadEncoding*, const int*,

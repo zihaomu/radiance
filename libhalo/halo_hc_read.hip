@@ -175,11 +175,14 @@ __global__ __launch_bounds__(128) void hc_mix_kernel(const uint16_t* __restrict_
             __syncthreads();
         }
         const float ramax = lds[0];
-        const float rsc = ramax > 0.0f ? ramax * (1.0f / 448.0f) : 1.0f;
+        /* The rotated pair takes the plain pair's dtype (libr4d's hc_rot_group<I8>): int8
+         * beside int8 codes, had_quant_act_i8g's rounding. */
+        const float rsc = ramax > 0.0f ? ramax * (1.0f / (i8 ? 127.0f : 448.0f)) : 1.0f;
         if (j == 0) rs[m * srow + blockIdx.x] = rsc;
         const float inv = 1.0f / rsc;
-        rq[m * qrow + base + j] = (uint8_t)halo_fp8::f32_to_e4m3(
-            fminf(fmaxf(rv * inv, -448.0f), 448.0f));
+        rq[m * qrow + base + j] =
+            i8 ? (uint8_t)(int8_t)(int)rintf(fminf(fmaxf(rv * inv, -127.0f), 127.0f))
+               : (uint8_t)halo_fp8::f32_to_e4m3(fminf(fmaxf(rv * inv, -448.0f), 448.0f));
     }
 }
 
@@ -1161,13 +1164,16 @@ __global__ __launch_bounds__(NW * 32) void hcf_upmix_kernel(
             float ra = fmaxf(fmaxf(fabsf(r[0]), fabsf(r[1])), fmaxf(fabsf(r[2]), fabsf(r[3])));
 #pragma unroll
             for (int mask = 16; mask; mask >>= 1) ra = fmaxf(ra, __shfl_xor(ra, mask));
-            const float rsc = ra > 0.0f ? ra * (1.0f / 448.0f) : 1.0f;
+            const float rsc = ra > 0.0f ? ra * (1.0f / (i8 ? 127.0f : 448.0f)) : 1.0f;
             if (lane == 0) rs[(long)m * rsrow + g] = rsc;
             const float rinv = 1.0f / rsc;
             uint32_t rw = 0u;
 #pragma unroll
             for (int e = 0; e < 4; ++e)
-                rw |= halo_fp8::f32_to_e4m3(fminf(fmaxf(r[e] * rinv, -448.0f), 448.0f)) << (8 * e);
+                rw |= (i8 ? (uint32_t)(uint8_t)(int8_t)(int)rintf(
+                                fminf(fmaxf(r[e] * rinv, -127.0f), 127.0f))
+                          : halo_fp8::f32_to_e4m3(fminf(fmaxf(r[e] * rinv, -448.0f), 448.0f)))
+                      << (8 * e);
             *(uint32_t*)(rq + (long)m * rqrow + gc) = rw;
         }
     }
@@ -1434,7 +1440,10 @@ extern "C" int halo_rad_hc_read(const RadArgs* a, RadStream s) {
     if (q && q->dtype != RAD_F8E4M3 && q->dtype != RAD_I8) return HALO_NO(RAD_E_DTYPE);
     if (q && qs->dtype != RAD_F32) return HALO_NO(RAD_E_DTYPE);
     if ((rq != nullptr) != (rs != nullptr) || (rq && !q)) return HALO_NO(RAD_E_INVAL);
-    if (rq && (rq->dtype != RAD_F8E4M3 || rs->dtype != RAD_F32)) return HALO_NO(RAD_E_DTYPE);
+    /* The rotated codes take the plain codes' dtype (libr4d's hc_read does the same). */
+    if (rq && (rq->dtype != (q->dtype == RAD_I8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3) ||
+               rs->dtype != RAD_F32))
+        return HALO_NO(RAD_E_DTYPE);
 
     HcPlan p;
     int rc = hc_plan(a, down, &p);
