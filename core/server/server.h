@@ -192,6 +192,10 @@ struct ServerOptions {
      * of an adapter requests still use drains it: RAD_OK with *in_flight > 0 (Engine::lora_unload). */
     std::function<int(const std::string&, const std::string&, std::string*)> lora_load;
     std::function<int(const std::string&, std::string*, int*)>              lora_unload;
+    /* --control-vector-variant: the name whose requests run with the control vector on, as the
+     * server sees it (the front strips `base:` from it as from an adapter's). Empty: no such
+     * name. */
+    std::string control_vector_variant;
     /* A generator's adapters (Engine::gen_lora_acquire): the images and videos endpoints' `loras`
      * and <lora:...> tags get a slot holding that combination, a hold on it and a note on what was
      * left out; `gen_lora_names` is GET /v1/loras. Unset without adapters. */
@@ -257,13 +261,8 @@ public:
     /* Renders each --reasoning-effort-map target as a request's effort. Empty when the template
      * takes all of them; otherwise the first refusal, naming the target. */
     std::string check_reasoning_effort_map() const;
-    /* The identity the keyless "loopback only" guards accept: the socket is loopback, the
-     * request carries no foreign Origin, and the Host names the loopback, one of
-     * ServerOptions::local_hosts, or the address --host names. Two ways forge the socket alone:
-     * a DNS-rebinding page is same-origin with the server and its victim's browser *is* the
-     * loopback peer — only the Host still tells which page asked for it — and a localhost TLS
-     * proxy puts every remote client behind the loopback socket, carrying the public Host. An
-     * attacker at the console of this machine is a local user either way, and stays admitted. */
+    /* The identity the keyless "loopback only" guards accept: loopback socket, no foreign
+     * Origin, and a Host that names this box (server::local_operator, http.cpp). */
     bool local_operator(const HttpRequest& req) const;
     void stop();
     /* stop() without the transport: for a server behind a Front (front.h), which owns the socket.

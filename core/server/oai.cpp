@@ -142,9 +142,10 @@ int64_t json_value_budget(int64_t max_ctx) {
  * copy recurse once per level, and a request's schema is serialised on the way to its grammar.
  * A few hundred KB of brackets, well inside the value budget, would overflow the worker's stack.
  * No legitimate request nests near it; the grammar compiler refuses schemas at half the bound. */
-/* The bounded read itself lives in util/json.cpp, where yyjson's transient allocation is
- * capped in bytes as the value count is capped here, so a body that is refused has also not
- * been allowed to grow memory on its way to the refusal. */
+/* The bounded read itself lives in util/json.cpp. Both of its bounds -- the value count here,
+ * the reader's byte cap -- are enforced as the document is discovered, so a body refused for
+ * size or nesting is refused while the conversion's scratch is still budget-sized; what stays
+ * proportional to the body is yyjson's own read arena, capped by the byte bound at its open. */
 json parse_json_bounded(const std::string& body, int64_t max_ctx, bool* over, bool* deep) {
     return Json::parse_bounded(body, json_value_budget(max_ctx), kJsonMaxDepth, over, deep);
 }

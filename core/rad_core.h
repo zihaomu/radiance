@@ -943,6 +943,12 @@ struct Config {
      * default on. The graph is declared once, so this flag is the deployment's only decision about
      * whether the op exists at all; the value names the startup switch. */
     std::string control_vector = "disabled";
+    /* --control-vector-variant NAME: a second name for this model, listed as MODEL:NAME the way an
+     * adapter is, whose requests run with the vector on whatever the default; the model's own name
+     * keeps the default. Empty -- the default -- lists nothing, so a deployment that does not pick
+     * the vector by name sees no extra entry. A client that can only choose a model sends nothing
+     * else, and a gateway can allow or refuse the name. Needs --control-vector off or on. */
+    std::string control_vector_variant;
     int64_t checkpoint_interval = 2048;   /* linear-state checkpoints (spec §7.3) */
     /* Checkpoint intervals one step may carry of a prefill alone in its step, from an interval
      * boundary past the first (--prefill-span; 1 splits at every interval). The step's rows stay

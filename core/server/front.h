@@ -163,6 +163,24 @@ public:
     /* A read the dashboard polls. It reports on a model and is no reason to bring one back, so it
      * is refused while that model is not open, where a request for work would wait for it. */
     static bool dashboard_read(const HttpRequest& q);
+    /* The per-model routes whose handlers answer the local operator keyless (the lora admin,
+     * /diagnostics, /reset_prefix_cache, DELETE /sessions, /admin/control-vector). A refused
+     * request that woke its model first churned the fleet for nothing -- wake, HF fetch,
+     * eviction of residents -- and churn priced by a stranger is a DoS. Kept in step with
+     * Server::register_routes. */
+    /* Whether the front's route for this request was registered guarded -- i.e. its handler
+     * answers the local operator only keyless -- so a stranger's call does not wake a parked
+     * model just to be refused. Derived from the router's own guarded marks (set at each route's
+     * registration in Server::register_routes), so the front and the handler cannot drift: the
+     * matcher that decides here is the one that reaches the handler. */
+    bool guarded_route(const HttpRequest& q) const;
+    /* Which requests speak for the machine's operator -- the fleet sets this to its admin
+     * guard's predicate. Set, the guarded routes above bring a cold or parked model back only
+     * for those callers; unset, they wake as any request does (no fleet, no guards to precede). */
+    void set_operator_rule(std::function<bool(const HttpRequest&)> f) { operator_rule_ = std::move(f); }
+    /* The caller-side view of the rule: a wired rule decides; no rule at all (the front used
+     * without fleet wiring, as in its own tests) trusts the caller. */
+    bool caller_is_operator(const HttpRequest& q) const { return !operator_rule_ || operator_rule_(q); }
 
 private:
     struct Entry {
@@ -199,8 +217,12 @@ private:
      * end is written back so later calls continue the same wait. Refused with *refusal set when
      * there is no such model, it failed, or the whole wait passed; Waiting when only `wait_ms`
      * passed. */
+    /* `operator_ok` is the caller's verdict of operator_rule_ on its request: a Failed model's
+     * refusal prose (the last load error, which names paths and fetch URLs) goes to operators
+     * only; a stranger gets the state without the story. */
     Got lease(const std::string& model, const std::string& path, int64_t wait_ms,
-              uint64_t* until_ns, Entry** out, std::shared_ptr<void>* held, HttpResponse* refusal);
+              uint64_t* until_ns, Entry** out, std::shared_ptr<void>* held, HttpResponse* refusal,
+              bool operator_ok);
     std::shared_ptr<void> lease_entry(Entry* e);
     std::shared_ptr<void> lease_quiet(Entry* e);
     HttpResponse forward(HttpRequest q);
@@ -219,6 +241,7 @@ private:
     HttpTransport         transport_;
     std::atomic<bool>     stopping_{false};
     std::function<void(const std::string&)>        demand_;
+    std::function<bool(const HttpRequest&)>        operator_rule_;
     std::function<std::string(const std::string&)> describe_;
     std::function<std::string()>                   fleet_metrics_;
 

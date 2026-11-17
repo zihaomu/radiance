@@ -202,10 +202,13 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
     if (object && !f.section_open.empty())
         return no("section-wrapped object arguments are not supported");
     /* Without a suffix the name ends at what follows it: the object's `{`, or a tagged call's
-     * first argument or close. */
-    if (!f.name_suffix.empty()) {
-        if (trim_ws(f.name_suffix).empty())
-            return no("name_suffix must end the function name with something besides whitespace");
+     * first argument or close. A suffix of nothing but whitespace is that same ending, written
+     * out: the name stops at the whitespace (Ling 3.0's `<tool_call>NAME\n<arg_key>`), so the
+     * reader treats it as a suffixless name, while the grammar still writes the template's
+     * newline. The object family has no such terminator -- its `{` ends the name -- and keeps
+     * the refusal. */
+    const bool name_by_ws = !object && !f.name_suffix.empty() && trim_ws(f.name_suffix).empty();
+    if (!f.name_suffix.empty() && !name_by_ws) {
         if (is_ws((unsigned char)f.name_suffix[0]))
             return no("name_suffix " + show(f.name_suffix) + " may not begin with whitespace");
     }
@@ -216,10 +219,11 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
         if (f.arg_name_suffix.empty() && f.arg_value_prefix.empty())
             return no("nothing ends an argument name: arg_name_suffix and arg_value_prefix are "
                       "empty");
-        if (f.name_suffix.empty()) {
-            /* The name runs to the first arg_prefix or call_end. A wrapped format also reads
-             * name_prefix alone as a call, told from prose only by its closed name tag, and
-             * without a suffix there is none. */
+        if (f.name_suffix.empty() || name_by_ws) {
+            /* The name runs to the first arg_prefix or call_end, written either with no suffix
+             * or with the whitespace that ends it. A wrapped format also reads name_prefix
+             * alone as a call, told from prose only by its closed name tag, and without a
+             * suffix there is none. */
             if (!f.call_open.empty())
                 return no("name_suffix is empty, which a tagged call allows only when name_prefix "
                           "opens it, and call_open is set");

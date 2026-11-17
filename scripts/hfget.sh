@@ -44,9 +44,11 @@ set -e
 if [ -n "$HFGET_CHILD" ]; then
     size=${1%%	*}; rest=${1#*	}; oid=${rest%%	*}; path=${rest#*	}
     # The parent has vetted every name; this holds anyway, because $out is written straight
-    # from it and an escape writes outside the directory the operator named.
+    # from it and an escape writes outside the directory the operator named. The `*/..` arm
+    # closes the trailing-segment gap (../.. is the prefix arm, a/../b the interior one), and
+    # the quoted `?` is literal, where a bare one would be the single-character wildcard.
     case "$path" in
-        ""|/*|*/|.|..|../*|*/../*)
+        ""|/*|*/|.|..|../*|*/../*|*/..|*'#'*|*'?'*)
             echo "hfget: refusing a file named '$path', which does not land inside the destination" >&2
             exit 1;;
     esac
@@ -137,17 +139,21 @@ done
 echo "hfget: $page page(s) of listing"
 # A file name that does not land inside the destination is not a listing oddity: an absolute
 # path, a `..` segment, a control character (a tab splices one entry into two fields of the
-# transfer list), or a name shadowing hfget's own manifest, which the next run would read back
-# as its record of verified content. Name the entry and stop; skipping silently would leave a
-# directory that reads as complete and is not.
+# transfer list), a `#` or `?` (curl ends the path there and requests the fragment- or query-
+# stripped object, which for a listing chosen to match is a real object with the listed size
+# and oid -- the bytes arrive, the name never asked for lands, and no check can tell), or a
+# name shadowing hfget's own manifest, which the next run would read back as its record of
+# verified content. Name the entry and stop; skipping silently would leave a directory that
+# reads as complete and is not.
 bad=$(printf '%s' "$listing" | jq -r '[.[] | select(.type == "file")
        | select((.path | test("(^/|(^|/)\\.\\.(/|$))"))
              or (.path | test("[[:cntrl:]]"))
+             or (.path | test("[#?]"))
              or (.path | test("(^|/)[.]hfget-manifest")))] | map(.path) | join(", ")')
 [ -n "$bad" ] && { echo "hfget: the listing names '$bad', which does not land inside the destination" >&2; exit 1; }
 have_st=$(printf '%s' "$listing" | jq '[.[] | select(.path | endswith(".safetensors"))] | length')
 sel='.[] | select(.type == "file")'
-[ "$have_st" -gt 0 ] && sel="$sel"' | select((.path | test("\\.(bin|msgpack|h5|onnx|onnx_data|gguf)$") or test("(^|/)(pytorch_model|consolidated)[^/]*\\.pth$")) | not)'
+[ "$have_st" -gt 0 ] && sel="$sel"' | select((.path | test("\\.(bin|msgpack|h5|onnx|onnx_data|gguf|rad)$") or test("(^|/)(pytorch_model|consolidated)[^/]*\\.pth$")) | not)'
 
 list=$(mktemp "${TMPDIR:-/tmp}/hfget.XXXXXX")
 trap 'rm -f "$list" "$dest/.hfget-manifest.tmp"' EXIT INT TERM

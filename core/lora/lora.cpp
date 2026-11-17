@@ -804,9 +804,18 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
     /* ---- the config */
     const std::string cfg_path = dir + "/adapter_config.json";
     std::string text;
-    if (!read_file(cfg_path, &text))
+    const int rst = read_text_file(cfg_path, text, kMaxContainerFile);
+    if (rst == RAD_E_FORMAT)
+        return fail(err, RAD_E_FORMAT,
+                    cfg_path + ": larger than the 256 MiB a container file may be");
+    if (rst != RAD_OK)
         return fail(err, RAD_E_IO, cfg_path + ": cannot read (a PEFT adapter directory has one)");
-    const ojson cfg = ojson::parse(text, nullptr, false);
+    /* Container-supplied like the generation config, so read with the container's bounds: a
+     * file past them is refused during the read, never grown into a tree to be walked. */
+    bool over = false, deep = false;
+    const ojson cfg = ojson::parse_container(text, &over, &deep);
+    if (over || deep)
+        return fail(err, RAD_E_FORMAT, cfg_path + ": " + ojson::bound_why(over, deep));
     if (cfg.is_discarded() || !cfg.is_object())
         return fail(err, RAD_E_FORMAT, cfg_path + ": not a JSON object");
     auto truthy = [&](const char* k) {

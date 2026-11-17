@@ -32,8 +32,9 @@
 #include "text/chatfmt.h"
 #include "text/chatparse.h"
 
-#include "../arch/museglimmer/chat.h"
+#include <arch/rad_museglimmer_chat.h>
 #include <arch/rad_deepseek41_chat.h>
+#include <arch/rad_gemma4_chat.h>
 
 #include "util/json.h"
 
@@ -1478,6 +1479,39 @@ TEST(the_chat_bridge_derives_the_whole_request_from_one_format) {
 }
 
 /* The declared format preserves HYV3's outer section and all of its argument markers. */
+/* A container that names the tool-call close end-of-generation cannot serve a second call, or
+ * a reply that quotes the tag: the turn ends the moment the call does. The bridge finds the ids
+ * this format writes as its own delimiters and the engine drops them from the stop set, leaving
+ * the real turn terminator alone. */
+TEST(a_call_delimiter_is_not_a_turn_terminator) {
+    VocabBuild vb;
+    vb.tokens = { "a", "<|im_end|>", "<tool_call>", "</tool_call>" };
+    vb.types  = { RAD_TT_NORMAL, RAD_TT_CONTROL, RAD_TT_CONTROL, RAD_TT_CONTROL };
+    vb.eos    = 1;
+    vb.eos_ids = { 3 };                   /* the close, declared terminal by the container */
+    vb.chat_template = fixture("glm53");
+    auto v = std::make_shared<Vocab>();
+    REQUIRE(v->load(std::move(vb)) >= 0);
+    REQUIRE(v->is_eog(3));
+
+    server::ChatTemplateBridge br;
+    REQUIRE(br.init(*v) >= 0);
+    CHECK(br.supports_tools());
+    REQUIRE(br.eog_call_markers().size() == 1);
+    CHECK_EQ(br.eog_call_markers()[0], 3);
+    /* The terminator the template writes stays one; the engine demotes only what the bridge
+     * reports (core/engine.cpp). */
+    CHECK(v->is_eog(1));
+
+    /* A template with no tool calls has no call delimiters to report. */
+    std::shared_ptr<Vocab> plain_v = vocab_with("");
+    REQUIRE(plain_v != nullptr);
+    server::ChatTemplateBridge plain;
+    REQUIRE(plain.init(*plain_v) >= 0);
+    CHECK(!plain.supports_tools());
+    CHECK(plain.eog_call_markers().empty());
+}
+
 TEST(hyv3_plugin_format_runs_through_the_chat_template_bridge) {
     std::shared_ptr<Vocab> v = vocab_with(fixture("hyv3"));
     REQUIRE(v != nullptr);
@@ -2380,6 +2414,78 @@ TEST(glm53_derives_a_name_the_opener_opens) {
     CHECK(why.find("name_suffix") != std::string::npos);
 }
 
+/* Ling 3.0's template ends the function name with a newline and only then writes the argument
+ * tags, so the analysis derives a name_suffix of whitespace alone. The reader treats that as the
+ * suffixless ending -- the name stops at the first argument tag, whitespace trimmed -- while the
+ * grammar keeps the newline the template writes. Before it was allowed, every request carrying
+ * tools was refused: "name_suffix must end the function name with something besides
+ * whitespace". */
+TEST(ling3_reads_a_name_that_ends_at_whitespace) {
+    ChatFormat f;
+    std::string why, refused;
+    CHECK_OK(chat_format_from_template(fixture("ling3"), "", "<|role_end|>", &f, &refused, &why));
+    CHECK(refused.empty());
+    /* The spellings of this shape are pinned by glm53_derives_a_name_the_opener_opens; Ling's
+     * difference is the newline between the name and the first argument tag. */
+    CHECK(f.call_open.empty() && f.call_close.empty());
+    CHECK(!f.name_prefix.empty() && f.name_prefix[0] == '<');
+    CHECK(!f.name_suffix.empty() &&
+          f.name_suffix.find_first_not_of(" \t\r\n") == std::string::npos);
+    CHECK(!f.call_end.empty());
+    CHECK(!f.arg_prefix.empty() && !f.arg_name_suffix.empty() && !f.arg_value_prefix.empty() &&
+          !f.arg_value_suffix.empty());
+    CHECK_OK(chat_format_check(f, &why));
+
+    ChatGrammarRequest gq;
+    gq.tools = &agent_tools();
+    ChatGrammar g;
+    CHECK_OK(chat_format_grammar(f, gq, &g, &why));
+    CHECK(g.lazy);
+    CHECK(!g.trigger_words.empty());
+
+    /* A reply built the way the template writes it reads back as the calls it renders, newline
+     * after the name and no whitespace between one argument's close and the next argument's
+     * tag. */
+    std::string reply = "Look.";
+    auto arg = [&](const std::string& k, const std::string& v) {
+        return f.arg_prefix + k + f.arg_name_suffix + f.arg_value_prefix + v + f.arg_value_suffix;
+    };
+    reply += f.name_prefix + "read" + f.name_suffix + arg("path", "/a") + arg("limit", "3") +
+             f.call_end;
+    reply += f.name_prefix + "ping" + f.name_suffix + f.call_end;
+
+    ReplyOptions ro;
+    ro.tools = &agent_tools();
+    ro.terminators = { "<|role_end|>" };
+    const std::shared_ptr<const ReplyParser> p = parser_of(f, ro);
+    REQUIRE(p != nullptr);
+    bool strict = false;
+    const ReplyMessage m = reply_parse(*p, reply, &strict);
+    CHECK_EQ(m.content, std::string("Look."));
+    REQUIRE(m.calls.size() == 2);
+    CHECK_EQ(m.calls[0].name, std::string("read"));
+    CHECK_EQ(m.calls[0].arguments, std::string("{\"path\":\"/a\",\"limit\":3}"));
+    CHECK(m.calls[0].closed);
+    CHECK_EQ(m.calls[1].name, std::string("ping"));
+    CHECK(m.calls[1].closed);
+    CHECK(strict);
+    const std::string stream_error = stream_all(*p, reply);
+    if (!stream_error.empty()) ::radtest::fail(__FILE__, __LINE__, stream_error);
+}
+
+/* The relaxation is for the tagged family only: an object family's name ends at its `{`, so a
+ * whitespace suffix there still describes a format nothing reads. */
+TEST(a_whitespace_name_suffix_is_refused_for_object_arguments) {
+    ChatFormat f;
+    std::string why;
+    CHECK_OK(chat_format_from_abi(rad::arch::gemma4_chat_format(), &f, &why));
+    CHECK(f.object_args());
+    CHECK_OK(chat_format_check(f, &why));
+    f.name_suffix = "\n";
+    CHECK(chat_format_check(f, &why) < 0);
+    CHECK(why.find("whitespace") != std::string::npos);
+}
+
 TEST(glm53_replies_read_back_as_the_messages_they_render) {
     const Glm* g = glm();
     REQUIRE(g != nullptr);
@@ -2673,7 +2779,7 @@ TEST(a_long_reply_holds_a_constant_number_of_bytes) {
  *
  * The model opens its own channel after `<|start|>assistant`: ` to=self<|message|>` reasoning
  * first, or ` to=user<|message|>` straight into the answer when it does not reason
- * (arch/museglimmer/chat.h). The header of an answer that follows reasoning is reasoning_close's;
+ * (arch/rad_museglimmer_chat.h). The header of an answer that follows reasoning is reasoning_close's;
  * the header of an answer that does not is content_open's. */
 
 static std::shared_ptr<const ReplyParser> muse_parser(bool tools, bool extract = true) {

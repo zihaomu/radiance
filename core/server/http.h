@@ -89,6 +89,12 @@ bool cidr_valid(const std::string& cidr);
  * happens to embed it. */
 bool ip_in_cidr(const std::string& addr, const std::string& cidr);
 
+/* The identity the keyless "loopback only" guards accept -- the three legs the engine's admin
+ * routes read (see the definition in http.cpp for why the socket alone forges). Every guard that
+ * answers loopback callers keyless reads this, the fleet's front included. */
+bool local_operator(const HttpRequest& req, const std::string& bind_host,
+                    const std::vector<std::string>& local_hosts);
+
 /* The caller a proxy chain vouches for. `raw_addr` is the socket peer (no port), `xff` the
  * request's X-Forwarded-For value ("" when there is none), `trusted` the vouched CIDRs.
  * Nothing is read from the header unless the socket itself belongs to a vouched CIDR -- an
@@ -156,9 +162,15 @@ using SocketHandler = std::function<void(const HttpRequest&, WsConn&)>;
  * entry's route ends in "*id"). No regex and no priority rules. */
 class Router {
 public:
-    void add(std::string method, std::string path, Handler h);
+    void add(std::string method, std::string path, Handler h, bool guarded = false);
     void get(std::string path, Handler h)  { add("GET",  std::move(path), std::move(h)); }
     void post(std::string path, Handler h) { add("POST", std::move(path), std::move(h)); }
+    /* Registering a route whose handler answers the local operator only (no api key configured):
+     * the guard itself lives in the handler; marking it here lets the front read the SAME fact
+     * (see guarded()) so a guarded route is declared once, at its registration, and cannot be
+     * listed by the front's wake-guard without also being registered guarded -- and vice versa. */
+    void get_guarded(std::string path, Handler h)  { add("GET",  std::move(path), std::move(h), true); }
+    void post_guarded(std::string path, Handler h) { add("POST", std::move(path), std::move(h), true); }
     /* A WebSocket route, exact path. An upgrade request to it becomes a connection the handler
      * is given; a plain GET to the same path is whatever add() registered there, if anything. */
     void socket(std::string path, SocketHandler h);
@@ -176,6 +188,10 @@ public:
 
     /* Whether a route takes `method` on `path`, as dispatch would match it. */
     bool allows(const std::string& method, const std::string& path) const;
+    /* Whether the route taking `method` on `path` was registered guarded (get_guarded /
+     * post_guarded / add(..., true)), as dispatch would match it -- so slash and `:label` forms
+     * decide the same way the handler is reached. False when no route matches. */
+    bool guarded(const std::string& method, const std::string& path) const;
 
     std::vector<std::string> routes() const;
 
@@ -184,6 +200,7 @@ private:
         std::string method;
         std::vector<std::string> segs;   /* ":name" is any one segment, a final "*name" the rest */
         Handler h;
+        bool guarded = false;            /* answered the local operator only (see add) */
     };
     /* The route taking `method` on the path `segs`, with its captures; null when none.
      * `*path_matched` says whether a route takes the path under any method. */

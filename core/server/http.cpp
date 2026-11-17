@@ -250,8 +250,8 @@ static std::vector<std::string> split_path(const std::string& p) {
     return out;
 }
 
-void Router::add(std::string method, std::string path, Handler h) {
-    routes_.push_back(Route{std::move(method), split_path(path), std::move(h)});
+void Router::add(std::string method, std::string path, Handler h, bool guarded) {
+    routes_.push_back(Route{std::move(method), split_path(path), std::move(h), guarded});
 }
 
 void Router::socket(std::string path, SocketHandler h) {
@@ -346,11 +346,22 @@ bool Router::allows(const std::string& method, const std::string& path) const {
     return match(method, split_path(path), nullptr, &path_matched) != nullptr;
 }
 
+bool Router::guarded(const std::string& method, const std::string& path) const {
+    bool path_matched = false;
+    const Route* r = match(method, split_path(path), nullptr, &path_matched);
+    return r && r->guarded;
+}
+
 HttpResponse Router::dispatch(HttpRequest req) const {
     bool path_matched = false;
     std::map<std::string, std::string> caps;
     if (const Route* r = match(req.method, split_path(req.path), &caps, &path_matched)) {
-        req.params.insert(caps.begin(), caps.end());
+        /* The captures of the route that matched replace any of the same name the request already
+         * carries. The front matches a request once and hands it to the model's router with the
+         * path rewritten -- `base:adapter` as `adapter`, an alias as the model's name -- and the
+         * model must read what its own route captured: kept, the front's `id` made
+         * /v1/models/base:adapter and /v1/models/ALIAS a 404. */
+        for (auto& [k, v] : caps) req.params[k] = std::move(v);
         return r->h(req);
     }
 
@@ -432,7 +443,10 @@ private:
         try {
             threads_.emplace_back([this] { work(); });
         } catch (const std::system_error& e) {
-            RAD_WARN("server: cannot start an HTTP worker (%s); the connection waits", e.what());
+            /* An OS message carries no socket bytes, but it is still text this log must not
+             * pass through unsanitized -- every other catch here reads it through log_sanitize. */
+            RAD_WARN("server: cannot start an HTTP worker (%s); the connection waits",
+                     log_sanitize(e.what()).c_str());
             return false;
         }
         ++free_;
@@ -577,6 +591,36 @@ bool HttpRequest::host_is_loopback() const {
     if (inet_pton(AF_INET, h.c_str(), &v4) == 1) return (ntohl(v4.s_addr) >> 24) == 127;
     in6_addr v6{};
     return inet_pton(AF_INET6, h.c_str(), &v6) == 1 && IN6_IS_ADDR_LOOPBACK(&v6);
+}
+
+/* The identity the keyless "loopback only" guards accept: the socket is loopback, the request
+ * carries no foreign Origin, and the Host names the loopback, one of `local_hosts` (--allow-host),
+ * or the address `bind_host` names. Two ways forge the socket alone: a DNS-rebinding page is
+ * same-origin with the server and its victim's browser *is* the loopback peer -- only the Host
+ * still tells which page asked for it -- and a localhost TLS proxy puts every remote client
+ * behind the loopback socket, carrying the public Host. An attacker at the console of this
+ * machine is a local user either way, and stays admitted. Server::local_operator is the member
+ * form; the fleet's front calls this one directly (fleet.cpp). */
+bool local_operator(const HttpRequest& req, const std::string& bind_host,
+                    const std::vector<std::string>& local_hosts) {
+    if (!req.peer_is_loopback() || req.is_cross_origin()) return false;
+    if (req.host_is_loopback()) return true;
+    const std::string host = req.host_authority();
+    if (host.empty()) return false;   /* a socket always carries a Host; the in-process case
+                                         passed host_is_loopback on its empty peer */
+    for (const std::string& a : local_hosts) {
+        std::string want = a;
+        for (char& ch : want) ch = (char)std::tolower((unsigned char)ch);
+        if (want == host) return true;
+    }
+    /* Bound to one concrete address, the box answers to that name on itself. */
+    std::string bind = bind_host;
+    for (char& ch : bind) ch = (char)std::tolower((unsigned char)ch);
+    if (!bind.empty() && bind.front() == '[' && bind.back() == ']')
+        bind = bind.substr(1, bind.size() - 2);
+    if (!bind.empty() && bind != "0.0.0.0" && bind != "::" && bind != "*")
+        return bind == host;
+    return false;
 }
 
 /* The API key a browser's socket carries. A browser cannot set a header on a WebSocket, so
@@ -730,6 +774,9 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
                 hres.status = 401;
                 hres.set_content(error_body(p, 401, "authentication_error", "invalid api key"),
                                  "application/json");
+                /* Close over it: a credential-guessing client should pay a fresh TLS/TCP setup
+                 * per try, not one keep-alive for a thousand. */
+                hres.set_header("Connection", "close");
                 return false;
             }
         }

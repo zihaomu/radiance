@@ -454,6 +454,13 @@ int64_t dev_stuck_ms();
  * reported hangs stood for hours, and a stall that clears does so within seconds. */
 extern std::atomic<int64_t> dev_stuck_exit_ms;
 
+/* Whether at least one engine has finished bringup. The stuck-exit watchdog reads it: a stall
+ * verdict standing DURING load is a slow load -- a cold start faulting a mapped tier from disk
+ * advances none of the counters the verdict watches, and that is legitimate work, not a hang.
+ * A watchdog that fires there turns one patient start into a supervisor's crash loop. Nothing
+ * disarms: the phase the flag exempts is only the engine's first. */
+extern std::atomic<bool> dev_engine_ready;
+
 /* Longest run of dispatches a played tape leaves unordered. Of any kTapeOverlapRun + 1
  * consecutive packets on a queue one carries the barrier bit, so a launched packet still proves
  * that everything more than that many packets earlier has completed. Argument slots and tape

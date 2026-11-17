@@ -3,6 +3,7 @@
 
 #include "diag/diag.h"
 
+#include "rad_internal.h"
 #include "rad_runtime.h"
 
 #include <algorithm>
@@ -943,15 +944,13 @@ std::vector<CorpusEntry> builtin_corpus() {
 }
 
 int load_corpus(const std::string& path, std::vector<CorpusEntry>* out, std::string* why) {
-    FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) {
-        *why = "cannot open " + path;
+    /* A corpus is a file someone forwarded: the capped read and bounded parse every supplied
+     * JSON file gets -- the size refusal lands before the bytes are read. */
+    std::string text;
+    if (read_text_file(path, text, kMaxContainerFile) != RAD_OK) {
+        *why = "cannot open " + path + ", or it carries more than the largest accepted JSON file";
         return RAD_E_IO;
     }
-    std::string text;
-    char b[65536];
-    for (size_t n; (n = std::fread(b, 1, sizeof b, f)) > 0;) text.append(b, n);
-    std::fclose(f);
     std::vector<CorpusEntry> got;
     size_t line_no = 0;
     for (size_t pos = 0; pos <= text.size();) {
@@ -962,11 +961,14 @@ int load_corpus(const std::string& path, std::vector<CorpusEntry>* out, std::str
         ++line_no;
         const size_t a = line.find_first_not_of(" \t\r");
         if (a == std::string::npos || line[a] == '#') continue;
-        const json j = json::parse(line, nullptr, /*allow_exceptions=*/false);
+        bool over = false, deep = false;
+        const json j = json::parse_container(line, &over, &deep);
         auto bad = [&](const char* what) {
             *why = path + ":" + std::to_string(line_no) + ": " + what;
             return RAD_E_INVAL;
         };
+        if (over) return bad("carries far too many values for one prompt line");
+        if (deep) return bad("nests far too deep for one prompt line");
         if (j.is_discarded() || !j.is_object()) return bad("not a JSON object");
         if (!j.contains("category") || !j["category"].is_string() || j["category"].get<std::string>().empty())
             return bad("needs a non-empty string \"category\"");

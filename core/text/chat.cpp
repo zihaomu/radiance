@@ -355,6 +355,14 @@ static bool alias_reasoning(const ojson& messages, ojson* out) {
  * "messages[i].tool_calls[j].function.arguments is not JSON: <why>", or empty when every call's
  * arguments parse. The template refuses such a conversation with the parser's words alone, which reads as
  * the template's fault; this names the call. */
+/* What one `arguments` string may be: the same value floor a request body gets and the depth the
+ * server's edge already caps these strings at (oai.h's kJsonMaxDepth; core/text cannot include
+ * the server header, so the number is mirrored -- a request that passed the edge must pass here
+ * too). The edge caps depth only, so without these bounds a client could hand the parse below a
+ * few hundred MB of flat JSON and watch it grow a DOM the request itself never needed. */
+constexpr int64_t kArgumentsValueBudget = 1LL << 20;
+constexpr int     kArgumentsMaxDepth    = 1024;
+
 static std::string bad_arguments(const ojson& messages) {
     if (!messages.is_array()) return "";
     for (size_t i = 0; i < messages.size(); ++i) {
@@ -367,11 +375,16 @@ static std::string bad_arguments(const ojson& messages) {
             if (!tc.is_object() || fn == tc.end() || !fn->is_object()) continue;
             const auto args = fn->find("arguments");
             if (args == fn->end() || !args->is_string()) continue;
-            try {
-                (void)ojson::parse(args->get_ref<const std::string&>());
-            } catch (const std::exception& e) {
+            bool over = false, deep = false;
+            const ojson probe = ojson::parse_bounded(args->get_ref<const std::string&>(),
+                                                     kArgumentsValueBudget, kArgumentsMaxDepth,
+                                                     &over, &deep);
+            if (probe.is_discarded() || over || deep) {
+                const char* why = over ? " carries far more values than a tool call takes"
+                                  : deep ? " nests far deeper than a tool call nests"
+                                         : " is not JSON";
                 return "messages[" + std::to_string(i) + "].tool_calls[" + std::to_string(j) +
-                       "].function.arguments is not JSON: " + e.what();
+                       "].function.arguments" + why;
             }
         }
     }

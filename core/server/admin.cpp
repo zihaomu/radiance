@@ -262,7 +262,7 @@ HttpResponse Server::handle_detokenize(const HttpRequest& req) {
  * Only what this server can fill honestly, under llama-server's names: no GGUF metadata, no
  * per-slot state. n_ctx is the context one request may use (llama-server's per-slot n_ctx);
  * omitted when the context length is unknown. */
-HttpResponse Server::handle_props(const HttpRequest&) {
+HttpResponse Server::handle_props(const HttpRequest& req) {
     const SamplingParams& sp = opt_.default_sampling;
     /* Every field llama-server's `params` carries, so no client finds one missing. Samplers this
      * server does not run are reported at their off values, which is what it serves. */
@@ -333,12 +333,21 @@ HttpResponse Server::handle_props(const HttpRequest&) {
     o["default_generation_settings"] = std::move(gen);
     o["total_slots"] = opt_.max_seqs;
     o["model_alias"] = opt_.model_id;
-    o["model_path"]  = opt_.model_path;
+    /* A path on this machine: it travels the way /v1/models' `root` does -- keyless it belongs
+     * to the operator alone, with a key it rides with the key. The compatibility shape keeps
+     * the field; a stranger sees it empty, which is also what a --model stdin read is. */
+    o["model_path"] = (!opt_.api_key.empty() || local_operator(req)) ? opt_.model_path
+                                                                     : std::string();
     o["modalities"]  = std::move(modal);
     o["endpoint_slots"]   = false;
     o["endpoint_props"]   = false;
     o["endpoint_metrics"] = true;
-    o["chat_template"]      = deps_.chat ? deps_.chat->source() : std::string();
+    /* The template's source text is the container's own bytes, gated like model_path above;
+     * a keyless stranger has no reader for it anyway. The capability flags stay -- a client
+     * needs them to build a request, and they name no path and quote no source. */
+    o["chat_template"]      = (deps_.chat && (!opt_.api_key.empty() || local_operator(req)))
+                                  ? deps_.chat->source()
+                                  : std::string();
     o["chat_template_caps"] = json::parse(deps_.chat ? deps_.chat->caps() : std::string("{}"),
                                           nullptr, false);
     std::string bos, eos;
@@ -432,7 +441,7 @@ json Server::capabilities() const {
  * state, plus the engine's, pre-rendered because the server knows nothing about devices,
  * containers or placement (ServerOptions::engine_info). `endpoints` is the router's own table, so
  * it cannot go stale. */
-HttpResponse Server::handle_server_info(const HttpRequest&) {
+HttpResponse Server::handle_server_info(const HttpRequest& req) {
     json srv;
     srv["model"]              = opt_.model_id;
     srv["version"]            = opt_.version;
@@ -499,8 +508,16 @@ HttpResponse Server::handle_server_info(const HttpRequest&) {
         json e = json::parse(opt_.engine_info, nullptr, false);
         if (e.is_discarded() || !e.is_object())
             RAD_WARN("server: engine_info is not a JSON object; /server_info omits it");
-        else
+        else {
+            /* One member names a file on this machine -- expert_stats.file, the xstats output,
+             * the same path the model card strips for strangers (server.cpp). /server_info
+             * answers keyless by the dashboard-data posture, but a filesystem path is not
+             * dashboard data: a stranger gets the interval, never the path. */
+            if (opt_.api_key.empty() && !local_operator(req) && e.contains("expert_stats") &&
+                e["expert_stats"].is_object())
+                e["expert_stats"].erase("file");
             o["engine"] = std::move(e);
+        }
     }
     metrics_.observe_http(200);
     return HttpResponse::json_body(200, json_dump(o));

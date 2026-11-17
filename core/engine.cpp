@@ -1993,6 +1993,26 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so,
         score_ids_.erase(std::unique(score_ids_.begin(), score_ids_.end()), score_ids_.end());
     }
     bool host_failed = false;
+    /* Step-wide sibling of the scheduler's kMaxScoredCandidates: that cap bounds one request's
+     * candidate list; nothing bounded the step's UNION, which grows toward the whole vocabulary.
+     * The pinned readback's size used to be discovered by ATTEMPTING it -- the cancel path below
+     * fired only when a gigabyte-scale page-locked allocation failed, so on a box that survives
+     * the attempt the bytes stay pinned forever (the buffer is grow-only). The cap is sixteen
+     * maximally-loaded requests -- d1's questions name a few dozen ids each, so every real
+     * scored step lands far under it. A step past it is refused the way an allocation failure
+     * refuses: the scored requests cancel, the engine does not, and the box is never asked to
+     * pin anything to find out. */
+    static const size_t kMaxScoredStepIds = 1u << 16;
+    if (score_only_ && score_ids_.size() > kMaxScoredStepIds) {
+        RAD_ERR("scored rows: the step names %zu candidate rows, over the step budget of %zu; "
+                "cancelling the scored requests, not the engine",
+                score_ids_.size(), kMaxScoredStepIds);
+        cancel.insert(cancel.end(), scored.begin(), scored.end());
+        score_rows_.clear();
+        score_only_ = false;
+        score_ids_.clear();
+        return RAD_OK;
+    }
     int64_t failed_rows = 0;
     for (auto& rk : ranks_) {
         const int64_t width = rk->sampler.config().n_vocab_local;
@@ -2193,11 +2213,11 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
              * drive the KV rollback, the conv cursor and the emitted text) say how far the step
              * really got. */
             acc = accept_cut_at_eog(out, acc,
-                                    [&](int32_t t) { return vocab_ && vocab_->is_eog(t); });
+                                    [&](int32_t t) { return is_eog(t); });
 
             so.accepted[i] = acc;
             so.token[i]    = out[acc];
-            so.eos[i]      = vocab_ && vocab_->is_eog(so.token[i]) ? 1 : 0;
+            so.eos[i]      = is_eog(so.token[i]) ? 1 : 0;
             if (tree) {
                 if (so.path.empty()) so.path.assign(plan.e.size() * RAD_SCHED_MAX_SPEC, 0);
                 for (int32_t t = 0; t < acc; ++t) so.path[i * RAD_SCHED_MAX_SPEC + t] = path[t];
@@ -2234,7 +2254,7 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             continue;
         }
         so.token[i] = so.rows[(size_t)so.first_row[i]];
-        so.eos[i]   = vocab_ && vocab_->is_eog(so.token[i]) ? 1 : 0;
+        so.eos[i]   = is_eog(so.token[i]) ? 1 : 0;
         if (e.req && e.req->sp.n_probs >= 0)
             RAD_TRY(row_logprobs(so, so.first_row[i], so.token[i]));
         /* Advance the grammar on every rank: each builds the mask for its own vocabulary shard from
@@ -3372,6 +3392,15 @@ int Engine::run_server() {
     const bool have_tpl = !gen_ && vocab_ && !vocab_->chat_template().empty() &&
                           chat_bridge.init(*vocab_, declared_format, plugins_.arch_plugin) >= 0 &&
                           chat_bridge.ready();
+    /* A token this format writes as one of its own call delimiters is a call boundary, not a
+     * turn's: a reply that closes a call with it must be able to write the next one, and text
+     * after it. A container that also declares it end-of-generation would cut every tool-calling
+     * turn there, so the id leaves the decoder's stop set. */
+    eog_demoted_ = chat_bridge.eog_call_markers();
+    for (int32_t id : eog_demoted_)
+        RAD_WARN("vocab: token %d \"%s\" is end-of-generation and one of this model's "
+                 "tool-call delimiters; a turn no longer ends on it", id,
+                 vocab_->text(id).c_str());
     if (embedding_) {
         /* No chat endpoint: the model's template, when it has one, renders a `messages` input. */
         if (have_tpl) embed_info.tpl = &chat_bridge;
@@ -3427,6 +3456,13 @@ int Engine::run_server() {
     o.plugin_words = ranks_.empty() ? 0 : ranks_[0]->program.plugin_words;
     o.model_id = !cfg_.served_model_name.empty() ? cfg_.served_model_name
                : meta_.name && *meta_.name       ? meta_.name : "radiance";
+    o.control_vector_variant = cfg_.control_vector_variant;
+    if (!o.control_vector_variant.empty() && o.control_vector_variant == o.model_id) {
+        RAD_ERR("--control-vector-variant '%s' is the served model's own name, so a request "
+                "naming it would run the default; rename it or give --served-model-name",
+                o.model_id.c_str());
+        return RAD_E_INVAL;
+    }
     o.host     = cfg_.host;
     o.port     = cfg_.port;
     o.api_key  = cfg_.api_key;

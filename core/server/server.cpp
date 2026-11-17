@@ -62,24 +62,9 @@ Server::Server(const Deps& d, const ServerOptions& o)
 }
 
 bool Server::local_operator(const HttpRequest& req) const {
-    if (!req.peer_is_loopback() || req.is_cross_origin()) return false;
-    if (req.host_is_loopback()) return true;
-    const std::string host = req.host_authority();
-    if (host.empty()) return false;   /* a socket always carries a Host; the in-process case
-                                         passed host_is_loopback on its empty peer */
-    for (const std::string& a : opt_.local_hosts) {
-        std::string want = a;
-        for (char& ch : want) ch = (char)std::tolower((unsigned char)ch);
-        if (want == host) return true;
-    }
-    /* Bound to one concrete address, the box answers to that name on itself. */
-    std::string bind = opt_.host;
-    for (char& ch : bind) ch = (char)std::tolower((unsigned char)ch);
-    if (!bind.empty() && bind.front() == '[' && bind.back() == ']')
-        bind = bind.substr(1, bind.size() - 2);
-    if (!bind.empty() && bind != "0.0.0.0" && bind != "::" && bind != "*")
-        return bind == host;
-    return false;
+    /* The three-leg rule itself lives beside the request it reads (server::local_operator,
+     * http.cpp) so the fleet's front applies the very same one. */
+    return server::local_operator(req, opt_.host, opt_.local_hosts);
 }
 
 Server::~Server() { stop(); }
@@ -171,8 +156,8 @@ void Server::register_routes() {
     router_.get ("/v1/models",           [this](const HttpRequest& q) { return handle_models(q); });
     router_.get ("/v1/loras",            [this](const HttpRequest& q) { return handle_loras(q); });
     router_.get ("/v1/models/*id",       [this](const HttpRequest& q) { return handle_models(q); });
-    router_.post("/v1/load_lora_adapter",   [this](const HttpRequest& q) { return handle_lora_admin(q, true); });
-    router_.post("/v1/unload_lora_adapter", [this](const HttpRequest& q) { return handle_lora_admin(q, false); });
+    router_.post_guarded("/v1/load_lora_adapter",   [this](const HttpRequest& q) { return handle_lora_admin(q, true); });
+    router_.post_guarded("/v1/unload_lora_adapter", [this](const HttpRequest& q) { return handle_lora_admin(q, false); });
     /* The same routes without /v1, as llama-server answers them, for clients whose base URL is
      * the bare host. */
     router_.post("/chat/completions",    [this](const HttpRequest& q) { return handle_chat(q); });
@@ -227,13 +212,13 @@ void Server::register_routes() {
     router_.get ("/version",             [this](const HttpRequest& q) { return handle_version(q); });
     router_.get ("/server_info",         [this](const HttpRequest& q) { return handle_server_info(q); });
     router_.get ("/props",               [this](const HttpRequest& q) { return handle_props(q); });
-    router_.get ("/diagnostics",         [this](const HttpRequest& q) { return handle_diagnostics(q); });
+    router_.get_guarded ("/diagnostics",         [this](const HttpRequest& q) { return handle_diagnostics(q); });
 
     router_.post("/tokenize",            [this](const HttpRequest& q) { return handle_tokenize(q); });
     router_.post("/detokenize",          [this](const HttpRequest& q) { return handle_detokenize(q); });
     router_.get ("/get_tokenizer_info",  [this](const HttpRequest& q) { return handle_tokenizer_info(q); });
 
-    router_.post("/reset_prefix_cache",  [this](const HttpRequest& q) { return handle_reset_prefix_cache(q); });
+    router_.post_guarded("/reset_prefix_cache",  [this](const HttpRequest& q) { return handle_reset_prefix_cache(q); });
 
     /* The dashboard, also at `/`, since that is what a person with the host and port types. */
     router_.get ("/",                    [this](const HttpRequest& q) { return handle_dashboard(q); });
@@ -242,17 +227,20 @@ void Server::register_routes() {
     router_.get ("/graph",               [this](const HttpRequest& q) { return handle_graph(q); });
     router_.get ("/sessions",            [this](const HttpRequest& q) { return handle_sessions(q); });
     /* The control vector's switch, for the dashboard's Model view and for automation: a
-     * deployment with no vector found answers 404 here. */
-    router_.get ("/admin/control-vector",
+     * deployment with no vector found answers 404 here. Both verbs answer the local operator
+     * only keyless (handle_control_vector enforces it); registered guarded so the front reads
+     * that fact here too and will not wake a parked model for a stranger's GET. */
+    router_.get_guarded ("/admin/control-vector",
                  [this](const HttpRequest& q) { return handle_control_vector(q); });
-    router_.post("/admin/control-vector",
+    router_.post_guarded("/admin/control-vector",
                  [this](const HttpRequest& q) { return handle_control_vector(q); });
     /* Forget one stored conversation: by its client label in the path (or `?label=`, for a
-     * label the path cannot carry), or by engine id with `?id=`. */
+     * label the path cannot carry), or by engine id with `?id=`. Guarded like the other admin
+     * writes -- and both shapes, so the front does not wake a model to be refused. */
     router_.add ("DELETE", "/sessions/:label",
-                 [this](const HttpRequest& q) { return handle_session_release(q); });
+                 [this](const HttpRequest& q) { return handle_session_release(q); }, true);
     router_.add ("DELETE", "/sessions",
-                 [this](const HttpRequest& q) { return handle_session_release(q); });
+                 [this](const HttpRequest& q) { return handle_session_release(q); }, true);
 }
 
 /* Workers beyond the admission ceiling. A generation holds its connection's worker for its whole
@@ -473,15 +461,15 @@ void Server::log_admitted(const OaiRequest& r) const {
     if (r.endpoint == Endpoint::Chat)
         RAD_INFO("req %s %s%s%s model=%s msgs=%d tools=%d prompt=%lld tok n=%d max_tokens=%lld",
                  r.id.c_str(), kind, r.stream ? " stream" : "", from_peer(r.peer).c_str(),
-                 r.model.c_str(), r.n_messages, r.n_tools, (long long)n_prompt, r.n,
+                 log_sanitize(r.model).c_str(), r.n_messages, r.n_tools, (long long)n_prompt, r.n,
                  (long long)r.max_tokens);
     else
         RAD_INFO("req %s %s%s%s model=%s prompts=%zu prompt=%lld tok n=%d max_tokens=%lld",
                  r.id.c_str(), kind, r.stream ? " stream" : "", from_peer(r.peer).c_str(),
-                 r.model.c_str(), r.prompts.size(), (long long)n_prompt, r.n,
+                 log_sanitize(r.model).c_str(), r.prompts.size(), (long long)n_prompt, r.n,
                  (long long)r.max_tokens);
     if (!r.last_user.empty())
-        RAD_DEBUG("req %s last user: %s", r.id.c_str(), r.last_user.c_str());
+        RAD_DEBUG("req %s last user: %s", r.id.c_str(), log_sanitize(r.last_user).c_str());
 }
 
 /* ------------------------------------------------------------------ submission */
@@ -502,13 +490,18 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
         }
     }
 
+    /* The control-vector variant is a name of the served model, not an adapter: it takes no
+     * slot. */
+    const bool variant =
+        !opt_.control_vector_variant.empty() && r.model == opt_.control_vector_variant;
+
     /* Runtime LoRA: `model` picks the adapter. The served model's own name, or no name, is the
      * base; with adapters enabled anything else must be a loaded adapter, since a typo served by
      * the base would answer as the wrong model without a word. */
     int32_t  lora_slot = -1;
     uint64_t lora_uid = 0;
     std::shared_ptr<void> lora_hold;
-    if (opt_.lora_acquire && !r.model.empty() && r.model != opt_.model_id) {
+    if (opt_.lora_acquire && !r.model.empty() && r.model != opt_.model_id && !variant) {
         if (opt_.lora_acquire(r.model, &lora_slot, &lora_uid, &lora_hold) != RAD_OK) {
             std::string names = opt_.model_id;
             if (opt_.lora_names)
@@ -523,14 +516,22 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
         }
     }
 
-    /* The control vector: the request's own choice, else the deployment's runtime default. A
-     * deployment with no vector refuses the on state by name rather than serve the stock model. */
+    /* The control vector: the variant's name turns it on, else the request's own choice, else the
+     * deployment's runtime default. The variant's name with an explicit `false` is refused rather
+     * than served either way, since the request asks for both. A deployment with no vector refuses
+     * the on state by name rather than serve the stock model. */
     bool projection_on = false;
     {
         const bool named = r.control_vector >= 0;
-        projection_on = named
-            ? (r.control_vector == 1)
-            : (deps_.control_vector.get_default && deps_.control_vector.get_default());
+        if (variant && named && r.control_vector == 0) {
+            *err = err_bad("control_vector",
+                           "is false, but model '" + r.model + "' is the control-vector variant, "
+                           "which runs with the vector on; send one or the other");
+            return RAD_E_INVAL;
+        }
+        const bool by_default =
+            deps_.control_vector.get_default && deps_.control_vector.get_default();
+        projection_on = variant || (named ? r.control_vector == 1 : by_default);
         if (projection_on &&
             !(deps_.control_vector.available && deps_.control_vector.available())) {
             *err = err_bad("control_vector",
@@ -2314,7 +2315,8 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
     std::vector<std::string> adapters;
     if (opt_.lora_names) adapters = opt_.lora_names();
     const bool is_adapter = !id.empty() && std::find(adapters.begin(), adapters.end(), id) != adapters.end();
-    if (!id.empty() && id != opt_.model_id && !is_adapter) {
+    const bool is_variant = !id.empty() && id == opt_.control_vector_variant;
+    if (!id.empty() && id != opt_.model_id && !is_adapter && !is_variant) {
         ApiError e;
         e.status = 404;
         e.type = "not_found_error";
@@ -2331,9 +2333,21 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
      * belongs to the operator alone, the rule /diagnostics and the LoRA admin follow; with a
      * key, everyone who can pay the key already owns this model's card. */
     if (!opt_.api_key.empty() || local_operator(req)) c.root = opt_.model_path;
+    /* No capabilities member to strip here: capabilities() carries no expert_stats. The engine
+     * reports that path in its own info blob, and the splice at /server_info screens it for
+     * keyless strangers (admin.cpp, handle_server_info) -- the live guard, this is the map. */
     c.capabilities = capabilities().dump();
     metrics_.observe_http(200);
     std::vector<ModelCard> cards{ c };
+    /* The control-vector variant is listed as a child of the model, as an adapter is, so the front
+     * names it `base:name` and a client that only picks a model can find it. */
+    if (!opt_.control_vector_variant.empty()) {
+        ModelCard vc = c;
+        vc.id = opt_.control_vector_variant;
+        vc.parent = opt_.model_id;
+        cards.push_back(vc);
+        if (is_variant) return HttpResponse::json_body(200, model_body(vc));
+    }
     for (const std::string& a : adapters) {
         ModelCard ac = c;
         ac.id = a;
@@ -2392,6 +2406,10 @@ HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
     const std::string name = j["lora_name"].get<std::string>();
     if (name.empty() || name == opt_.model_id)
         return fail(400, "invalid_request_error", "lora_name must be non-empty and not the served model's name");
+    if (load && !opt_.control_vector_variant.empty() && name == opt_.control_vector_variant)
+        return fail(400, "invalid_request_error",
+                    "lora_name '" + name + "' is this model's control-vector variant "
+                    "(--control-vector-variant), so a request naming it could mean either");
     std::string err;
     int s;
     int in_flight = 0;

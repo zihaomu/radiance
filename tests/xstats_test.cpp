@@ -275,4 +275,62 @@ TEST(the_file_is_json_written_at_boot_and_replaced_through_a_rename) {
     CHECK(bad.init(radtest::tmp_path("no/such/dir/x.json"), m, XsSnapshot{}) < 0);
 }
 
+/* The profile file is local data with a contract, and its tmp name is predictable. These pin
+ * the loader's refusals -- a negative count (which used to wrap into a ~100% share), an
+ * n_trunk_layers that truncates through int32 into exactly the "another model" match -- and
+ * that the tmp name is created exclusively: a symlink planted there must survive untouched. */
+TEST(the_profile_file_and_its_tmp_name_keep_their_contracts) {
+    auto profile = [](const std::string& body) {
+        const std::string p = radtest::tmp_path("xs_profile.json");
+        if (FILE* f = std::fopen(p.c_str(), "wb")) {
+            std::fwrite(body.data(), 1, body.size(), f);
+            std::fclose(f);
+        }
+        return p;
+    };
+
+    const std::string ok = "{\"format\":\"radiance-expert-stats/1\",\"n_trunk_layers\":2,"
+                           "\"counts\":{\"decode\":[[1,2],[0,0],[3,0]]}}";
+    {
+        std::vector<RadFileProfile> out;
+        int32_t nt = -1;
+        CHECK_EQ(xs_profile_load(profile(ok), &out, &nt), RAD_OK);
+        CHECK_EQ(nt, 2);
+        CHECK_EQ(out.size(), 3u);   /* the zero-sum row contributes nothing */
+    }
+    {   /* 2^32 + 2: read through int32 this lands on 2, and 2 layers is what the refusal
+         * against would compare. */
+        std::vector<RadFileProfile> out;
+        int32_t nt = -1;
+        CHECK(xs_profile_load(profile("{\"format\":\"radiance-expert-stats/1\","
+                                      "\"n_trunk_layers\":4294967298,"
+                                      "\"counts\":{\"decode\":[[1,2]]}}"),
+                              &out, &nt) < 0);
+    }
+    {   std::vector<RadFileProfile> out;
+        CHECK(xs_profile_load(profile("{\"format\":\"radiance-expert-stats/1\","
+                                      "\"counts\":{\"decode\":[[-1,2]]}}"),
+                              &out, nullptr) < 0);
+    }
+
+    /* The tmp name is the destination's plus this process's PID -- public. Planted as a
+     * symlink, it must be cleared and re-created, never written through. */
+    const std::string victim = radtest::tmp_path("xs_victim.txt");
+    if (FILE* v = std::fopen(victim.c_str(), "w")) { std::fputs("keep", v); std::fclose(v); }
+    const std::string dest = radtest::tmp_path("xs_stats.json");
+    const std::string tmp = dest + ".tmp." + std::to_string((long long)getpid());
+    ::unlink(tmp.c_str());
+    if (::symlink(victim.c_str(), tmp.c_str()) != 0) SKIP("cannot plant a symlink here");
+    CHECK_EQ(xs_write_atomic(dest, "{\"format\":\"radiance-expert-stats/1\"}\n"), RAD_OK);
+    std::string kept;
+    if (FILE* v = std::fopen(victim.c_str(), "r")) {
+        char buf[16];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, v)) > 0) kept.append(buf, n);
+        std::fclose(v);
+    }
+    CHECK_EQ(kept, std::string("keep"));
+    CHECK(::access(tmp.c_str(), F_OK) != 0);   /* renamed away, not left behind */
+}
+
 RAD_TEST_MAIN()

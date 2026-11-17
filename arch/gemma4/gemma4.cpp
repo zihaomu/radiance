@@ -569,24 +569,45 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* ---- the KV groups, one per geometry: the sliding layers' (256-wide heads) and the full
      * layers' (512).
      *
-     * The sliding layers' group is RAD_KV_FULL, not RAD_KV_WINDOW; the window lives on the
-     * attention op (`window` 1024), which reads only keys inside it. A window group is not
-     * prefix-cached (core/mem/prefix.cpp), so a prefix hit on a model with one reuses nothing and
-     * re-prefills (core/sched). As FULL the group is cached with the others and the drafter's KV
-     * has no hole. The only loss is recycling below the window, which gains nothing here: the
-     * planner gives every paged group the same block count, so the full group bounds the tokens a
-     * card holds anyway. */
+     * The sliding layers' group is RAD_KV_WINDOW, sized to the attention window, which is what
+     * the kernel reads anyway: attn_paged takes `window` 1024 on those layers and never looks at
+     * a key older than it. As a window group the pool is capped at the window plus one block per
+     * sequence (core/mem/kv.cpp), so 25 sliding layers cost ~1k tokens of cache each instead of
+     * the whole context -- at 32k and fp8 KV, 0.4 GiB a sequence where FULL costs 3.5. The full
+     * layers' group stays RAD_KV_FULL: it is the only one whose keys outlive a window.
+     *
+
+     * A windowed group is not prefix-cached (core/mem/prefix.cpp): its rows below the window are
+     * recycled, and adopt() would overfill a table capped at window_blocks. What that costs on
+     * a prefix hit is only the windowed rows; the full layers' rows still come back from the
+     * store. The window itself resumes from the deepest retained checkpoint at or below the
+     * matched end — that checkpoint's slot carries the window behind it — and only the gap between
+     * that checkpoint and the match end is recomputed. Only where no retained checkpoint sits at
+     * or below the match do the windowed layers start their cache where the hit ended
+     * (the re-prefill case); that is the regime gemma3 runs with a DFlash drafter on the
+     * same core, and it declares its sliding group exactly this way.
+     *
+
+     * The drafter does not read the trunk's cache. DFlash keeps its own windowed draft KV (2048),
+     * rebuilt each context pass from the trunk's residual taps; its rows live inside that window
+     * like every other draft query's, and it has no stake in the trunk's windowed rows outliving
+     * the window. A windowed trunk group therefore costs the drafter nothing. */
+
     {
+        const uint32_t kvdt = rad_kv_cache_dtype(ctx, RAD_BF16);
         RadKVGroupDecl d{};
-        d.kind = RAD_KV_FULL;
-        d.dtype = rad_kv_cache_dtype(ctx, RAD_BF16);
+        d.kind = RAD_KV_WINDOW;
+        d.window = m.ks.window;   /* the same 1024 the attention op reads */
+        d.dtype = kvdt;
         d.n_head_kv = m.ks.nkv;
         d.head_dim = m.ks.hd;
         m.ks.kv = rad_decl_kv_group(b, nm.f("kv_swa"), &d);
+        d.kind = RAD_KV_FULL;
+        d.window = 0;
         d.n_head_kv = m.kf.nkv;
         d.head_dim = m.kf.hd;
         m.kf.kv = rad_decl_kv_group(b, nm.f("kv_full"), &d);
-        g.kv_dtype = rad_dtype_name(d.dtype);
+        g.kv_dtype = rad_dtype_name(kvdt);
     }
 
     /* Gemma4ForConditionalGeneration keeps the text model under model.language_model;

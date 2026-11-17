@@ -2694,6 +2694,20 @@ TEST(the_adaptive_draft_window_is_exposed_only_while_it_is_on) {
     CHECK_NEAR(value("radiance:draft_verify_depth_total" + L + ",depth=\"6\"}"), -1.0, 1e-9);
 }
 
+/* The front matches /v1/models/ID itself and hands the request on with the path rewritten: an
+ * alias becomes the model's name, `base:adapter` the adapter's. The model's router reads the id its
+ * own route captured, not the front's, so the request still carries the front's capture here. */
+TEST(a_request_handed_on_reads_the_capture_of_the_route_that_matched_it) {
+    Fixture f;
+    HttpRequest q;
+    q.method = "GET";
+    q.path = "/v1/models/test-model";
+    q.params["id"] = "an-alias";
+    const HttpResponse r = f.srv->router().dispatch(q);
+    CHECK_EQ(r.status, 200);
+    CHECK_EQ(json::parse(r.body).value("id", std::string()), std::string("test-model"));
+}
+
 TEST(models_and_health_answer) {
     Fixture f;
     HttpResponse r = f.get("/v1/models");
@@ -2894,6 +2908,36 @@ TEST(the_models_root_path_follows_the_key) {
     CHECK_EQ(json::parse(k.srv->router().dispatch(remote).body)["data"][0]
                  .value("root", std::string()),
              std::string("/models/m.rad"));
+}
+
+/* The predicate every keyless "loopback only" guard reads -- hoisted so the fleet's front applies
+ * the very rule the engine's routes do (fleet.cpp: the admin/fleet guard). The three legs:
+ * loopback socket, no foreign Origin, a Host that names this box. */
+TEST(local_operator_reads_all_three_legs) {
+    const std::vector<std::string> pinned = {"box.example"};
+    auto ask = [&](const char* peer, const char* host, const char* origin,
+                  const char* bind) {
+        HttpRequest q;
+        q.peer = q.raw_peer = peer;
+        if (host) q.headers["Host"] = host;
+        if (origin) q.headers["Origin"] = origin;
+        return local_operator(q, bind, pinned);
+    };
+    /* The machine dialling itself: loopback socket, loopback Host. */
+    CHECK(ask("127.0.0.1:50122", "localhost:8000", nullptr, "0.0.0.0"));
+    /* A pinned --allow-host name and a concrete --host bind answer for the box. */
+    CHECK(ask("127.0.0.1:50122", "box.example:8000", nullptr, "0.0.0.0"));
+    CHECK(ask("127.0.0.1:50122", "10.3.1.5", nullptr, "10.3.1.5"));
+    /* The rebinding page: same-origin with itself, so no Origin leg fires -- the Host leg is
+     * what refuses it. */
+    CHECK(!ask("127.0.0.1:50122", "evil.test:8000", "http://evil.test:8000", "0.0.0.0"));
+    /* The localhost proxy: every remote client arrives on a loopback socket carrying the
+     * public Host, and no leg names that name. */
+    CHECK(!ask("127.0.0.1:50122", "public.example:8000", nullptr, "0.0.0.0"));
+    /* A foreign Origin never rides a loopback socket into a guard, whatever the Host says. */
+    CHECK(!ask("127.0.0.1:50122", "localhost:8000", "http://evil.test", "0.0.0.0"));
+    /* A remote socket is no operator, however it names itself. */
+    CHECK(!ask("192.168.1.20:50122", "localhost:8000", nullptr, "0.0.0.0"));
 }
 
 TEST(the_model_entry_and_server_info_report_the_same_capabilities) {
@@ -5012,6 +5056,106 @@ int status_with(Fixture& f, const std::string& ep, const std::string& key, const
 }
 
 }  /* namespace */
+
+/* --control-vector-variant: the variant's name runs the vector whatever the default, the model's
+ * own name keeps the default, an explicit false beside the variant's name is refused as the
+ * contradiction it is, and the name is listed as a child of the model the way an adapter is. */
+TEST(the_control_vector_variant_runs_with_the_vector_and_is_listed) {
+    Fixture f(Fixture::Tweak{ [](ServerOptions& o, Deps& d) {
+        o.control_vector_variant = "uncensored";
+        d.control_vector.available   = [] { return true; };
+        d.control_vector.get_default = [] { return false; };
+    } });
+    HttpResponse r = f.post("/v1/chat/completions",
+                            R"({"model":"uncensored","messages":[{"role":"user","content":"hi"}],
+                                "max_tokens":4})");
+    if (r.streaming()) drain(r);
+    f.sched.join_all();
+    CHECK_EQ(r.status, 200);
+    CHECK(f.sched.last_sp.use_control_vector);
+
+    /* The model's own name runs the default, off here. */
+    HttpResponse r2 = f.post("/v1/chat/completions",
+                             R"({"model":"test-model","messages":[{"role":"user","content":"hi"}],
+                                 "max_tokens":4})");
+    if (r2.streaming()) drain(r2);
+    f.sched.join_all();
+    CHECK_EQ(r2.status, 200);
+    CHECK(!f.sched.last_sp.use_control_vector);
+
+    /* The variant's name with an explicit true is the same request; with false it asks for both. */
+    HttpResponse r3 = f.post("/v1/chat/completions",
+                             R"({"model":"uncensored","messages":[{"role":"user","content":"hi"}],
+                                 "max_tokens":4,"control_vector":true})");
+    if (r3.streaming()) drain(r3);
+    f.sched.join_all();
+    CHECK_EQ(r3.status, 200);
+    CHECK(f.sched.last_sp.use_control_vector);
+    HttpResponse r4 = f.post("/v1/chat/completions",
+                             R"({"model":"uncensored","messages":[{"role":"user","content":"hi"}],
+                                 "max_tokens":4,"control_vector":false})");
+    if (r4.streaming()) drain(r4);
+    f.sched.join_all();
+    CHECK_EQ(r4.status, 400);
+    CHECK(r4.body.find("control_vector") != std::string::npos);
+    CHECK(r4.body.find("uncensored") != std::string::npos);
+
+    /* Listed as a child of the model, and readable on its own. */
+    const json all = json::parse(f.get("/v1/models").body);
+    bool listed = false;
+    for (const json& m : all["data"])
+        if (m.value("id", std::string()) == "uncensored") {
+            listed = true;
+            CHECK_EQ(m.value("parent", std::string()), std::string("test-model"));
+        }
+    CHECK(listed);
+    const HttpResponse one = f.get("/v1/models/uncensored");
+    CHECK_EQ(one.status, 200);
+    CHECK_EQ(json::parse(one.body).value("id", std::string()), std::string("uncensored"));
+}
+
+/* With adapters enabled, every name but the model's own must be a loaded adapter. The variant is a
+ * name of the model, so it reaches the base without an adapter lookup, and no adapter may be
+ * loaded under it: `base:name` would then mean two things. */
+TEST(the_control_vector_variant_is_not_an_adapter) {
+    int lookups = 0;
+    Fixture f(Fixture::Tweak{ [&](ServerOptions& o, Deps& d) {
+        o.control_vector_variant = "uncensored";
+        o.lora_acquire = [&](const std::string&, int32_t*, uint64_t*, std::shared_ptr<void>*) {
+            ++lookups;
+            return (int)RAD_E_NOTFOUND;
+        };
+        o.lora_names = [] { return std::vector<std::string>{}; };
+        o.lora_load = [](const std::string&, const std::string&, std::string*) {
+            return (int)RAD_OK;
+        };
+        o.lora_unload = [](const std::string&, std::string*, int*) { return (int)RAD_OK; };
+        d.control_vector.available   = [] { return true; };
+        d.control_vector.get_default = [] { return false; };
+    } });
+    HttpResponse r = f.post("/v1/chat/completions",
+                            R"({"model":"uncensored","messages":[{"role":"user","content":"hi"}],
+                                "max_tokens":4})");
+    if (r.streaming()) drain(r);
+    f.sched.join_all();
+    CHECK_EQ(r.status, 200);
+    CHECK_EQ(lookups, 0);
+    CHECK(f.sched.last_sp.use_control_vector);
+
+    /* Any other name still goes to the adapters, which do not know it. */
+    HttpResponse r2 = f.post("/v1/chat/completions",
+                             R"({"model":"other","messages":[{"role":"user","content":"hi"}],
+                                 "max_tokens":4})");
+    if (r2.streaming()) drain(r2);
+    f.sched.join_all();
+    CHECK_EQ(r2.status, 404);
+    CHECK_EQ(lookups, 1);
+
+    const HttpResponse l = f.post("/v1/load_lora_adapter",
+                                  R"({"lora_name":"uncensored","lora_path":"/adapters/u"})");
+    CHECK_EQ(l.status, 400);
+    CHECK(l.body.find("control-vector variant") != std::string::npos);
+}
 
 /* The control vector: absent, the deployment's default applies; an explicit `true` on a
  * deployment with no vector is refused by name (serving the stock model while the client believes

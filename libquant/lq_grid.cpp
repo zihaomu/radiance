@@ -337,10 +337,15 @@ int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
         }
         char line[4096];
         double unit = 0.0;
+        int64_t rows = 0;
         while (std::fgets(line, sizeof line, f)) {
             if (line[0] == '#') {
                 double u = 0.0;
-                if (std::sscanf(line, "# unit %lf", &u) == 1) unit = u;
+                /* %lf parses "inf", and the fallback guard below is `!(unit > 0.0)`, which an
+                 * infinite unit passes: an infinite scale unit would flow into quantisation
+                 * where a NaN already falls back. Only a finite positive names the unit. */
+                if (std::sscanf(line, "# unit %lf", &u) == 1 && std::isfinite(u) && u > 0.0)
+                    unit = u;
                 continue;
             }
             std::vector<float> row;
@@ -353,6 +358,16 @@ int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
                 p = end;
             }
             if (row.empty()) continue;
+            /* Capped while appending, as table= is: the widest code is u12, so more than 4096
+             * codewords could not be indexed even with the memory read, and the file must be
+             * refused without first growing a vector over every line of it. */
+            if (++rows > 4096) {
+                std::fclose(f);
+                if (why)
+                    *why = fmt("vq=%s holds more than 4096 codewords; a codebook holds at most 4096",
+                               vf);
+                return RAD_E_INVAL;
+            }
             if (g->vdim == 0) g->vdim = (int64_t)row.size();
             bool ok = (int64_t)row.size() == g->vdim;
             for (float v : row) ok = ok && v >= -127.0f && v <= 127.0f;
@@ -453,7 +468,9 @@ int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
                     char rest[256] = {};
                     if (!std::fgets(rest, sizeof rest, f)) break;
                     double u = 0.0;
-                    if (std::sscanf(rest, " unit %lf", &u) == 1) lut_unit = u;
+                    if (std::sscanf(rest, " unit %lf", &u) == 1)
+                        lut_unit = (std::isfinite(u) && u > 0.0) ? u : 0.0;  // like vq=: only a
+                        // finite positive names a unit; "inf"/"nan" fall back to the entries' rms
                     continue;
                 }
                 v = std::strtol(tok, nullptr, 10);
@@ -470,8 +487,16 @@ int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
         }
         double ss = 0.0;
         for (float v2 : g->tcq_lut) ss += (double)v2 * v2;
-        g->vq_unit = (lut_unit > 0.0 ? lut_unit : std::sqrt(ss / (double)S)) /
-                     rad_param_getf(o, n_o, "tcq_gain", 1.0);
+        const double gain = rad_param_getf(o, n_o, "tcq_gain", 1.0);
+        if (!(gain > 0.0) || !std::isfinite(gain)) {
+            if (why) *why = "tcq_gain must be a positive finite number";
+            return RAD_E_INVAL;
+        }
+        g->vq_unit = (lut_unit > 0.0 ? lut_unit : std::sqrt(ss / (double)S)) / gain;
+        if (!std::isfinite(g->vq_unit)) {
+            if (why) *why = "the tcq unit is not finite; check tcq_lut's values";
+            return RAD_E_INVAL;
+        }
         if (rad_param_geti(o, n_o, "tcq_peak", 0))
             for (float v2 : g->tcq_lut) g->tcq_peak = std::max(g->tcq_peak, std::fabs(v2));
         g->tcq_rb = rad_param_geti(o, n_o, "tcq_rb", 0);

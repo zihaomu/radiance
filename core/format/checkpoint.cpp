@@ -2,10 +2,12 @@
 #include "checkpoint.h"
 #include "ggml_planes.h"
 #include "rad_plugin.h"
+#include "../rad_internal.h"
 
 #include "util/json.h"
 
 #include <algorithm>
+#include <climits>
 #include <filesystem>
 #include <cctype>
 #include <cmath>
@@ -450,8 +452,14 @@ int meta_from_gguf(GgufFile& g, MetaOwn* out) {
          * config.json names, so the reader re-spells them here and one plugin serves both
          * formats. eps and rope_theta take the generic paths above. Four of the family's
          * design choices the GGUF does not carry are Ling 3.0's, stated as constants. */
-        if (gi("kda.head_dim", 0) <= 0 || gi("rope.dimension_count", 0) <= 0 ||
-            gi("attention.key_length_mla", 0) <= gi("rope.dimension_count", 0))
+        /* Bounds on the family gates too (see bailingmoe3_layouts): the layout rebuild's
+         * products -- heads * (nope + rope) rows, the fused kv's heads * 256 * latent -- are
+         * int64 products of these values handed to sized allocations, so the widths they are
+         * built from may not roam free. 128/64 is the shipped geometry. */
+        if (gi("kda.head_dim", 0) <= 0 || gi("kda.head_dim", 0) > 512 ||
+            gi("rope.dimension_count", 0) <= 0 || gi("rope.dimension_count", 0) > 256 ||
+            gi("attention.key_length_mla", 0) <= gi("rope.dimension_count", 0) ||
+            gi("attention.key_length_mla", 0) > 65536)
             return RAD_E_FORMAT;
         out->kv("num_attention_heads", fmt("%lld", (long long)m.n_head));
         /* The typed head_dim the generic pass fell back to (the MLA query width) is not the
@@ -554,6 +562,19 @@ int Checkpoint::open_gguf(const std::string& path) {
     return RAD_OK;
 }
 
+/* Whether the file `p` really is -- symlinks resolved -- lives inside `dir`. Screening the NAME
+ * is not enough: a model dir can carry a symlink whose honest-looking name resolves outside
+ * it, and the index can name exactly that file. (A legit symlink that stays inside the dir
+ * still passes: the resolution is inside too. Both sides resolve, so a dir path that itself
+ * runs through a symlink compares against its own real location.) */
+static bool resolves_under(const std::string& dir, const std::string& p) {
+    char rd[PATH_MAX], rp[PATH_MAX];
+    if (::realpath(dir.c_str(), rd) == nullptr) return false;
+    if (::realpath(p.c_str(), rp) == nullptr) return false;
+    const size_t n = std::strlen(rd);
+    return rp[n] == '/' && std::strncmp(rp, rd, n) == 0;
+}
+
 int Checkpoint::add_shard(const std::string& p, const std::string& prefix,
                           const std::unordered_map<std::string, std::string>* owner) {
     shards_.push_back(std::make_unique<SafeTensorsFile>());
@@ -592,20 +613,64 @@ int Checkpoint::add_shard(const std::string& p, const std::string& prefix,
 
 namespace {
 
+/* The index's shard names are checkpoint-supplied data. They must stay under `dir`: hfget
+ * screens the LISTING's names, but the index is one of the listed files, and a weight_map of
+ * "../../etc/passwd" passes that screen as easily as it escapes the model dir -- the engine
+ * would open the named file, outside the dir, as the serving user. Relative subdirs are legal
+ * in real repos; an empty component, "." or ".." is not. */
+bool shard_name_ok(const std::string& f) {
+    if (f.empty() || f.front() == '/') return false;
+    size_t i = 0;
+    while (i < f.size()) {
+        size_t j = f.find('/', i);
+        if (j == std::string::npos) j = f.size();
+        if (j == i) return false;                                  /* empty component, "//" */
+        if (j - i == 2 && f.compare(i, 2, "..") == 0) return false;
+        if (j - i == 1 && f[i] == '.') return false;
+        i = j + 1;
+    }
+    return true;
+}
+
 /* Every shard an index names, once each and in name order, or the one model.safetensors; `map`
  * is the index's weight_map, empty without one. */
+static bool path_exists(const std::string& p) { std::ifstream f(p); return (bool)f; }
+
 int shard_list(const std::string& dir, const std::string& index, bool index_given,
                std::vector<std::string>* out, std::unordered_map<std::string, std::string>* map) {
     const int s = st_load_index(index, map);
     if (s == RAD_OK) {
         for (auto& [t, f] : *map)
             if (std::find(out->begin(), out->end(), f) == out->end()) out->push_back(f);
+        for (const std::string& f : *out)
+            if (!shard_name_ok(f)) {
+                RAD_ERR("%s: the index names the shard '%s'; shards must live under the model "
+                        "directory",
+                        index.c_str(), log_sanitize(f).c_str());
+                return RAD_E_FORMAT;
+            }
         std::sort(out->begin(), out->end());
         for (auto& f : *out) f = dir + "/" + f;
+        /* The join is honest; the FILE may not be: an honest name can be a symlink planted in
+         * the dir that resolves outside it. Refuse before any open of it. (Containment reads
+         * relative to the dir actually being loaded, which is why it lives here and not in
+         * add_shard: a drafter's shards legitimately join under the DRAFT's dir.) */
+        for (const std::string& f : *out)
+            if (path_exists(f) && !resolves_under(dir, f)) {
+                RAD_ERR("%s: the shard '%s' resolves outside the model directory; refusing it",
+                        index.c_str(), log_sanitize(f).c_str());
+                return RAD_E_FORMAT;
+            }
         return RAD_OK;
     }
     if (s != RAD_E_NOTFOUND || index_given) return s;
     out->push_back(dir + "/model.safetensors");
+    if (!resolves_under(dir, out->back())) {
+        RAD_ERR("%s: %s resolves outside the model directory; refusing it",
+                index.c_str(), log_sanitize(out->back()).c_str());
+        out->pop_back();
+        return RAD_E_FORMAT;
+    }
     return RAD_OK;
 }
 
@@ -631,8 +696,6 @@ static int meta_merge_json_file(const std::string& path, const std::string& pref
     flatten_json(j, prefix, out);
     return RAD_OK;
 }
-
-static bool path_exists(const std::string& p) { std::ifstream f(p); return (bool)f; }
 
 /* Whether an FP8 piece of `rows` rows has one scale for the whole tensor: a rank-0 scale
  * (ModelOpt's) or a one-element [1] (compressed-tensors' tensor strategy). A [1, 1] scale is a
@@ -2002,7 +2065,8 @@ int Checkpoint::add_lora(const std::string& path, double strength,
     }
     std::vector<std::string> files;
     std::error_code ec;
-    if (std::filesystem::is_directory(path, ec)) {
+    const bool scanned = std::filesystem::is_directory(path, ec);
+    if (scanned) {
         for (const auto& e : std::filesystem::directory_iterator(path, ec))
             if (e.path().extension() == ".safetensors") files.push_back(e.path().string());
         std::sort(files.begin(), files.end());
@@ -2025,6 +2089,14 @@ int Checkpoint::add_lora(const std::string& path, double strength,
 
     int n_merged = 0;
     for (const std::string& f : files) {
+        /* A scanned name can be a symlink planted in the adapter dir resolving outside it --
+         * same rule as the model dir's shards. A file the operator named outright needs no
+         * screen: following its symlink is where they pointed it. */
+        if (scanned && !resolves_under(path, f)) {
+            RAD_ERR("lora: %s resolves outside the adapter directory; refusing it",
+                    log_sanitize(f).c_str());
+            return RAD_E_FORMAT;
+        }
         SafeTensorsFile st;
         if (st.open(f) != RAD_OK) return RAD_E_FORMAT;
         std::vector<Pair> pairs;
@@ -3556,7 +3628,20 @@ int Checkpoint::bailingmoe3_layouts() {
     const int64_t emb = meta_.m.n_embd;
     const char* nexp_s = meta_.get("num_experts");
     const int64_t n_expert = nexp_s ? std::stoll(nexp_s) : 0;
-    if (n_layer < 1 || group < 2 || heads < 1 || latent < 1 || ff < 1 || emb < 1)
+    /* Every loop below walks to n_layer on the open path, so the counts must be bounded HERE:
+     * a GGUF claiming 2^62 layers would spend centuries in name probes, never answering, never
+     * refusing -- a hostile container's hang, not a slow load. No real model of this family is
+     * near 4096 layers. And the MoE suffix loop starts at the dense prefix, so the prefix must
+     * lie inside the stack: negative opens a walk of twice the range, beyond the end is a
+     * container that means nothing by it. The head and rank caps are the same discipline one
+     * order down: the rebuild's products (heads * (nope + rope) rows, heads * 256 * latent
+     * bytes of fused kv) are computed in int64 and handed to vectors sized through size_t --
+     * on the 32-bit tier an overflowed product truncates to a small allocation the copy then
+     * overruns. No family model is near 4096 heads or ranks; 256 rope dimensions is already
+     * far past what the rope kernel addresses. */
+    if (n_layer < 1 || n_layer > 4096 || dense < 0 || dense > n_layer ||
+        group < 2 || group > n_layer || heads < 1 || heads > 4096 ||
+        latent < 1 || latent > 4096 || ff < 1 || emb < 1)
         return RAD_E_FORMAT;
 
     /* Decode a whole source tensor to f32: a block type row by row, a plain one a copy. */
@@ -3627,9 +3712,14 @@ int Checkpoint::bailingmoe3_layouts() {
         const char* nps = meta_.get("qk_nope_head_dim"), *rps = meta_.get("qk_rope_head_dim");
         const int64_t qn = nps ? std::stoll(nps) : 0, qr = rps ? std::stoll(rps) : 0;
         const SrcTensor* qb = find(fmt("blk.%lld.attn_q_b.weight", (long long)l));
+        /* The row product is checked, not trusted: heads and the two rope widths arrive from
+         * the container, and a wrapped product that happened to equal the tensor's rows would
+         * run the split at the wrong per-head boundary. */
+        int64_t w = 0, qb_rows = 0;
         if (qb && qb->shape.size() == 2 && qb->shape[1] > 0 && qn > 0 && qr > 0 &&
-            qb->shape[0] == heads * (qn + qr)) {
-            const int64_t ql = qb->shape[1], w = qn + qr;
+            !__builtin_add_overflow(qn, qr, &w) && !__builtin_mul_overflow(heads, w, &qb_rows) &&
+            qb->shape[0] == qb_rows) {
+            const int64_t ql = qb->shape[1];
             std::vector<float> q3, nblk, rblk;
             RAD_TRY(whole(qb, q3));
             nblk.assign((size_t)(heads * qn) * ql, 0.0f);

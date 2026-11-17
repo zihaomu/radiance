@@ -103,7 +103,27 @@ int grammar_from_json_schema(const std::string& schema_json, const std::string& 
     }
     if (schema_cache().find(schema_json, out_gbnf)) return RAD_OK;
     try {
-        const auto schema = Json::parse(schema_json);
+        /* Read bounded, then read deep: today every caller hands over a dump of an
+         * already-bounded body tree, but this entry point does not know that -- an
+         * unbounded read here would hand a hostile producer exactly the crash shape the
+         * depth check below was written against. The depth bound now fires during the
+         * read, before any nested tree exists to be dumped or destroyed. */
+        bool over = false, deep = false;
+        const auto schema = Json::parse_bounded(schema_json, 1 << 20, (int)kMaxSchemaDepth,
+                                                &over, &deep);
+        if (deep) {
+            if (err) *err = "the schema nests more than " + std::to_string(kMaxSchemaDepth) +
+                            " levels deep";
+            return RAD_E_INVAL;
+        }
+        if (over) {
+            if (err) *err = "the schema carries more than 2^20 values";
+            return RAD_E_INVAL;
+        }
+        if (schema.is_discarded()) {
+            if (err) *err = "the schema is not valid JSON";
+            return RAD_E_INVAL;
+        }
         if (json_depth(schema) > kMaxSchemaDepth) {
             if (err) *err = "the schema nests more than " + std::to_string(kMaxSchemaDepth) +
                             " levels deep";

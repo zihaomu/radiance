@@ -496,6 +496,17 @@ const func_builtins & global_builtins() {
             if (step == 0) {
                 throw raised_exception("range() step argument must not be zero");
             }
+            // RADIANCE: a container template is server-side attacker data, and range() emitted
+            // one element per step with no bound: {{ range(4000000000) }} OOMed the process per
+            // render. No real chat template counts past a handful; 65536 is far past plausible
+            // and small enough that even the join of the whole range is transient, not fatal.
+            {
+                const __int128 span = step > 0 ? (__int128)stop - start : (__int128)start - stop;
+                const __int128 abs_step = step > 0 ? step : -(__int128)step;
+                if (span > 0 && (span + abs_step - 1) / abs_step > 65536) {
+                    throw raised_exception("range() would produce more than 65536 values");
+                }
+            }
             if (step > 0) {
                 for (int64_t i = start; i < stop; i += step) {
                     out->push_back(mk_val<value_int>(i));

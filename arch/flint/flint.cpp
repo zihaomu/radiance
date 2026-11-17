@@ -53,8 +53,8 @@ struct Model {
     Geom  g{};
     int64_t n_ff_expert = 0, n_ff_shared = 0;
     rad_kvgroup kv_full = 0, kv_win = 0;
-    /* The trunk is rotated int8 (rad_fp8.h's linear_is_w8h or linear_is_wnh), its activation codes
-     * one scale a `trunk_g8` columns: 256 for IQ8R, 128 for the other rotated forms. */
+    /* Whether layer 0's probe found a rotated-int8 trunk, and its activation scale group: see
+     * rad_fp8.h's trunk_rotation. */
     bool    trunk_rot = false;
     int64_t trunk_g8 = RAD_FP8_BLOCK;
 
@@ -183,17 +183,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     const int64_t T = g.max_tok, qd = g.q_dim(), kvd = g.kv_dim();
 
-    /* ---- the trunk's stored form, read from layer 0's q projection through that layer's own
-     * LinearFP8, which then does not map it again; the activations below carry rotated int8
-     * codes only for a rotated trunk. */
+    /* The trunk's stored form, probed from layer 0's q projection: rad_fp8.h's trunk_rotation
+     * answers whether it is rotated int8 and how wide the activation codes' scale group is. */
     m.layers.resize((size_t)g.n_layer);
     RAD_ARCH_TRY(m.layers[0].attn.q.probe(b, nm, g, nm.f("blk.0.attn_q"),
                                           { nm.ckpt("model.layers.0.self_attn.q_proj.weight") }));
     {
         RadEncoding enc{};
         m.trunk_rot = weight_enc(b, nm.f("blk.0.attn_q.weight"), &enc) &&
-                      (linear_is_w8h(enc) || linear_is_wnh(enc));
-        if (m.trunk_rot) m.trunk_g8 = linear_w8h_group(enc);
+                      trunk_rotation(enc, &m.trunk_g8);
     }
 
     MoeFP8::Config mc{};

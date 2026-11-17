@@ -277,6 +277,13 @@ value binary_expression::execute_impl(context & ctx) {
         if (repeat <= 0) {
             return res;
         }
+        // RADIANCE: sibling of the range() cap in value.cpp -- repetition is the same
+        // attacker-template OOM, one append per step. "x" * 4000000000, and chained
+        // repetitions that pass a 64 MiB product at any step, are refused the way range()
+        // is: the same exception class, so errors-as-values carries it across the seam.
+        if (str.length() != 0 && repeat > (64ll << 20) / (int64_t)str.length()) {
+            throw raised_exception("string repetition would produce more than 67108864 bytes");
+        }
         for (int64_t i = 0; i < repeat; ++i) {
             res->val_str.append(str);
         }

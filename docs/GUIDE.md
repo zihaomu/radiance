@@ -2257,6 +2257,13 @@ The shipped file is Cudecnik's published vector
   (`POST /admin/control-vector {"enabled": bool}`, behind `server.api-key`; without a key, from a
   loopback client only). A running request keeps the choice it was admitted with, and nothing is
   reloaded: the directions are uploaded once and each step carries a row mask.
+- **By name.** `control-vector-variant: NAME` lists `MODEL:NAME` in `/v1/models` as a child of the
+  model, the way an adapter is (§4.9.1), while the model is loaded. A request naming it runs with
+  the vector on whatever the default and needs no field: for a client that can only choose a model,
+  and for a gateway that allows or refuses a model by its name. The model's own name keeps the
+  default, and the response's `model` is the variant's name, as an adapter's is. The variant's name
+  with `"control_vector": false` is refused, since the request asks for both. Under `defaults:` one
+  name gives every model a variant of its own. Unset, nothing is listed.
 - **Cost.** A step in which no row takes the vector issues no projection, so `off` runs the same
   launches as the key unset. Measured on Flash-Next (`w4nl64-i8lm.rad`, TP2, the production settings,
   speculation off, three 1,536-token greedy answers): median decode of 89.7 tok/s with the key unset,
@@ -2278,7 +2285,8 @@ The shipped file is Cudecnik's published vector
 - `kld-record` / `kld-ref` score every document at the deployment's default.
 - For the shipped vector, `on` removes a safety behaviour: the model stops refusing policy prompts
   and reveals its system prompt when asked. A deployment that exposes the API beyond one user should
-  keep the default off and decide who may set the field.
+  keep the default off and decide who may set the field. A variant gives a gateway a name it can
+  allow or refuse; the field stays open to every client that reaches the API.
 
 **What the switch does where it is aimed** (the PR's measurement: same boot, only `control_vector`
 changes; the stock column is a separate boot of 1.9.0). First generated token, 20-way distribution:
@@ -2318,6 +2326,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `server.download-dir: DIR` | where a repo id is fetched to. Default `$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf` |
 | `model-revision: REV` | the hub revision a repo id is fetched at: a branch, tag, full commit sha or `refs/pr/N`. Default the repo's moving `main` branch; a deployment that must not restart onto weights nobody reviewed should name a tag or a sha (§3.1) |
 | `control-vector: off\|on\|disabled` | `disabled` (and the key unset) loads nothing, declares no projection op and refuses a request that asks; `off` loads the vector found for this model and starts requests off; `on` starts them on. Refused at startup when the model's plugin does not apply control vectors or no compatible file is found (§4.10) |
+| `control-vector-variant: NAME` | unset (the default) lists nothing; a NAME lists `MODEL:NAME`, a name of this model whose requests run with the control vector on, while the model's own name keeps the `control-vector` default. Refused without `control-vector: off\|on`, for a NAME that holds `:` or whitespace, and for the name of a `lora` adapter or of the model itself (§4.10) |
 | `server.radiance-home: DIRS` | where `kernels/`, `architectures/` and `quantizers/` live; homes separated by `:` are searched in order, the first winning (§1.5) |
 | `server.kernels: LIST` | the kernel libraries to use, separated by `,` or `:`, first wins; a library not named is not loaded. Default: every library found |
 
@@ -2534,7 +2543,7 @@ keys are refused on it, and so are the pixel bands.
 | `GET /health`, `/v1/health`, `/ping`, `POST /ping` | liveness; 503 with `"status": "stuck"` once the device has advanced nothing for a minute. A device stuck for `scheduler.stuck-exit` (60s; `0` never) ends the process (exit status 70, the queues it is stuck on in the log), so a restart policy brings the server back |
 | `GET /load` | current load |
 | `GET /version` | server version |
-| `GET /props` | llama-server's props: `n_ctx`, `total_slots`, `modalities`, `model_path`, the chat template and its capabilities, `bos_token`/`eos_token`, and the request defaults under llama-server's names |
+| `GET /props` | llama-server's props: `n_ctx`, `total_slots`, `modalities`, `model_path`, the chat template and its capabilities, `bos_token`/`eos_token`, and the request defaults under llama-server's names. Keyless, `model_path` and the template source answer the local operator only (§6.6); the capability flags stay open — clients build requests from them |
 | `POST /apply-template` | the prompt a chat request renders to, as llama-server returns it |
 | `POST /v1/chat/completions/input_tokens` | how many tokens that prompt is |
 | `GET /server_info` | the whole configuration of the running engine |
@@ -2961,7 +2970,7 @@ passes but not launches (the UNet runs once per image and branch), so two take t
 
 | field | notes |
 |---|---|
-| `model` | the model, by name or alias, or `base:adapter` for an adapter; without it the model named or aliased `default`, or the only one. An unknown model is 404 |
+| `model` | the model, by name or alias, `base:adapter` for an adapter, or `base:NAME` for the model's control-vector variant (§4.10); without it the model named or aliased `default`, or the only one. An unknown model is 404 |
 | `messages` / `prompt` / `input` | chat / completion / embedding |
 | `images_config` | image models only: the processor mode the request wants, by name (`gundam`, `base`) or as an object restating the served sizes; a geometry the model does not serve is refused (Unlimited-OCR, §5.18) |
 | `max_tokens`, `max_completion_tokens`, `max_output_tokens`, `max_new_tokens`, `n_predict` | default: what the context leaves after the prompt (`default-max-tokens`); -1 is llama-server's "no limit", the same without the default. Clamped to what the context leaves, and to `max-tokens-cap`, rather than refused (§5.8) |

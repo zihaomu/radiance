@@ -875,6 +875,7 @@ std::string dev_pci_address(int device) {
     return dev_string(64, [&](char* b, int n) { return dev()->pci_address(device, b, n); });
 }
 std::atomic<int64_t> dev_stuck_exit_ms{60000};
+std::atomic<bool> dev_engine_ready{false};
 int64_t dev_stuck_ms() {
     const auto f = dev()->stuck_ms;
     return f ? f() : 0;

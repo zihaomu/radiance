@@ -465,6 +465,14 @@ TEST(corpus_file_refuses_a_bad_line_and_names_it) {
     std::vector<CorpusEntry> c;
     std::string why;
     {
+        /* A line nesting past what a prompt line nests: the raw parser recursed for this, and
+         * the corpus -- a forwarded file -- is exactly the supplied input that stays bounded. */
+        TmpFile f(std::string("{\"category\": \"c\", \"prompt\": \"x\", \"tail\": ") +
+                  std::string(1200, '[') + std::string(1200, ']') + "}\n");
+        CHECK_EQ(load_corpus(f.path, &c, &why), RAD_E_INVAL);
+        CHECK(why.find("nests far too deep") != std::string::npos);
+    }
+    {
         TmpFile f("{\"category\": \"code\", \"prompt\": \"a\"}\n{\"prompt\": \"no category\"}\n");
         CHECK_EQ(load_corpus(f.path, &c, &why), RAD_E_INVAL);
         CHECK(why.find(":2:") != std::string::npos);
