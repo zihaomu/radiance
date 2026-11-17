@@ -1,5 +1,9 @@
 # radiance
 
+> **Personal fork.** This GitHub repository is maintained by zihaomu for R9700 and tensor-parallel
+> experiments. The official upstream project is [StillDeadcode/radiance on Codeberg](https://codeberg.org/StillDeadcode/radiance).
+> Original authorship and license terms remain in [NOTICE](NOTICE) and [LICENSE](LICENSE).
+
 An inference server for AMD GPUs, in C++ and HIP: language models, and image, video, speech and
 music generation. Its HTTP API speaks OpenAI's chat, completions, Responses, images, audio and video
 APIs, Anthropic's Messages API and llama-server's native one, so their clients and SDKs work
