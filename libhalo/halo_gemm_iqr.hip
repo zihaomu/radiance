@@ -120,7 +120,9 @@ __global__ __launch_bounds__(4 * kWave) void iqr_i8_gemm_kernel(
  * decode-then-GEMM pair: each group's exact int32 sum folded in f32 by fold_f32, row_scale last. */
 constexpr uint32_t kFusedWaves = 4, kPitch = 136;
 
-template <class F, uint32_t MT>
+/* ONE (M == 1): the activation row and its scales are wave-uniform, read as scalar loads, so
+ * the next unit's codes and fold scale, issued a unit ahead, are not waited on with them. */
+template <class F, uint32_t MT, bool ONE = false>
 __global__ __launch_bounds__(kFusedWaves * kWave) void iqr_fused_kernel(
         Ctx c, const int8_t* __restrict__ A, const float* __restrict__ As,
         __hip_bfloat16* __restrict__ Y, uint32_t M, uint32_t N, uint32_t a_ld, uint32_t sa_ld) {
@@ -144,9 +146,22 @@ __global__ __launch_bounds__(kFusedWaves * kWave) void iqr_fused_kernel(
     v8f acc[MT];
 #pragma unroll
     for (uint32_t mt = 0; mt < MT; ++mt) acc[mt] = (v8f)0.f;
+    typename D::Raw cur{};
+    float ws_cur = 0.f;
+    if constexpr (ONE) {
+        cur = D::fetch(c, rt, 0, lane, true);
+        ws_cur = fold_f32<F>(c, n, 0);
+    }
     for (uint32_t kb = 0; kb < c.nkb; ++kb) {
+        typename D::Raw nxt{};
+        float ws_nxt = 0.f;
+        if constexpr (ONE) {
+            const uint32_t kn = kb + 1u < c.nkb ? kb + 1u : kb;
+            nxt = D::fetch(c, rt, kn, lane, true);
+            ws_nxt = fold_f32<F>(c, n, kn);
+        }
         {
-            const typename D::Raw raw = D::fetch(c, rt, kb, lane, true);
+            const typename D::Raw raw = ONE ? cur : D::fetch(c, rt, kb, lane, true);
             uint32_t w[16];
             D::rows(raw, c, rb_ratio<F>(c, rt * 16u + slot, kb), w);
             D::unzero(c, rt, kb, w);
@@ -162,13 +177,14 @@ __global__ __launch_bounds__(kFusedWaves * kWave) void iqr_fused_kernel(
             const uint4 bv = *(const uint4*)(tr + slot * kPitch + u * 16u);
             bf[u][0] = (int)bv.x; bf[u][1] = (int)bv.y; bf[u][2] = (int)bv.z; bf[u][3] = (int)bv.w;
         }
-        const float ws = fold_f32<F>(c, n, kb);
+        const float ws = ONE ? ws_cur : fold_f32<F>(c, n, kb);
 #pragma unroll
         for (uint32_t mt = 0; mt < MT; ++mt) {
             v8i tmp = (v8i)0;
 #pragma unroll
             for (uint32_t u = 0; u < 8; ++u) {
-                const uint4 av = *(const uint4*)(ap[mt] + kb * 128u + u * 16u);
+                const uint4 av = ONE ? *(const uint4*)(A + kb * 128u + u * 16u)
+                                     : *(const uint4*)(ap[mt] + kb * 128u + u * 16u);
                 v4i af;
                 af[0] = (int)av.x; af[1] = (int)av.y; af[2] = (int)av.z; af[3] = (int)av.w;
                 tmp = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, af, true, bf[u], tmp, false);
@@ -177,12 +193,17 @@ __global__ __launch_bounds__(kFusedWaves * kWave) void iqr_fused_kernel(
             for (uint32_t e = 0; e < 8; ++e) {
                 uint32_t mr = mt * 16u + 2u * e + half;
                 mr = mr < M ? mr : M - 1u;
-                acc[mt][e] = fmaf((float)tmp[e], As[(size_t)mr * sa_ld + kb] * ws, acc[mt][e]);
+                const float as = ONE ? As[kb] : As[(size_t)mr * sa_ld + kb];
+                acc[mt][e] = fmaf((float)tmp[e], as * ws, acc[mt][e]);
             }
         }
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");
         __builtin_amdgcn_wave_barrier();
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront", "local");
+        if constexpr (ONE) {
+            cur = nxt;
+            ws_cur = ws_nxt;
+        }
     }
     const float rs = row_scale<F>(c, n);
 #pragma unroll
@@ -357,6 +378,14 @@ Ctx ctx_of(const Operands& g) {
 template <class F, uint32_t MT>
 int launch_fused(const Operands& g, hipStream_t st) {
     const uint32_t ntile = (uint32_t)(g.N / 16);
+    const char* one = std::getenv("HALO_IQR_ONE");
+    if (MT == 1 && g.M == 1 && !(one && *one == '0')) {
+        hipLaunchKernelGGL((iqr_fused_kernel<F, 1, true>), dim3((ntile + kFusedWaves - 1) / kFusedWaves),
+                           dim3(kFusedWaves * kWave), 0, st, ctx_of(g), (const int8_t*)g.a->data,
+                           (const float*)g.as->data, (__hip_bfloat16*)g.y->data, (uint32_t)g.M,
+                           (uint32_t)g.N, (uint32_t)g.a_ld, (uint32_t)g.sa_ld);
+        return hipGetLastError() == hipSuccess ? RAD_OK : HALO_NO(RAD_E_DEVICE);
+    }
     hipLaunchKernelGGL((iqr_fused_kernel<F, MT>), dim3((ntile + kFusedWaves - 1) / kFusedWaves),
                        dim3(kFusedWaves * kWave), 0, st, ctx_of(g), (const int8_t*)g.a->data,
                        (const float*)g.as->data, (__hip_bfloat16*)g.y->data, (uint32_t)g.M,
