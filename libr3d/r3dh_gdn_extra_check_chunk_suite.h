@@ -12,8 +12,11 @@ void chunk_suite() {
     chunk_case({0, 63, 0, 64, 0, 65, 0, 1}, true, false);
     chunk_case({63, 64, 65, 1}, true, true);
     chunk_case({1, 63, 64, 65, 127, 128, 129, 1}, true, true);
+    chunk_case({585}, true, false);
+    chunk_case({129, 199, 257}, true, false);
+    chunk_case({0, 200, 385}, true, true);
     chunk_case({65, 66}, false, false, true);
-    std::printf("PASS chunk_dispatch path=%s graph_capture=21 changed_input_pairs=21\n", chunk_registry ? "actual_registry_chunk_launch" : "direct_strict_API");
+    std::printf("PASS chunk_dispatch path=%s graph_capture=24 changed_input_pairs=24\n", chunk_registry ? "actual_registry_chunk_launch" : "direct_strict_API");
     std::printf("PASS GDN_CHUNK cases=%llu runs=%llu rejects=%llu inverse_BF16_elements=%llu output_BF16_elements=%llu pool_F32_elements=%llu result_bytes=%llu immutable_bytes=%llu guard_bytes=%llu tolerance=0 synthetic_only heads24 keys8 K128 V128 chunk64 seq1_2_4_8 total_M1_to2048_tested_points_not_exhaustive\n",
         static_cast<unsigned long long>(chunk_checks.cases), static_cast<unsigned long long>(chunk_checks.runs),
         static_cast<unsigned long long>(chunk_checks.rejects), static_cast<unsigned long long>(chunk_checks.inverse_bf16),

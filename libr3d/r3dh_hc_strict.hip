@@ -38,55 +38,158 @@ __device__ float sigmoid_exact(float value) {
     const float exponential = float(::exp(double(-value)));
     return __fdiv_rn(1.0f, 1.0f + exponential);
 }
-__device__ float matrix_value(const uint8_t* matrix, int row, int column,
-                              int columns, int group, int pitch) {
-    const uint8_t* codes = matrix + size_t(row) * pitch;
-    const float* scales = reinterpret_cast<const float*>(codes + columns);
-    return e4m3(codes[column]) * scales[column / group];
-}
 
-__global__ void strict_norm(const uint16_t* hidden, const float* weights, uint16_t* normalized,
-                             int rows, float eps, float wadd) {
-    const int row = blockIdx.x, channel_stream = threadIdx.x;
-    if (row >= rows || channel_stream >= streams) return;
-    const size_t base = size_t(row) * wide + channel_stream * width;
-    double squares = 0;
-    for (int channel = 0; channel < width; ++channel) {
-        const double value = double(widen_bf16(hidden[base + channel]));
-        squares += value * value;
+// One block per row: the row is staged once, each stream's double sum stays a single sequential chain.
+__global__ __launch_bounds__(256) void strict_norm(const uint16_t* hidden, const float* weights,
+                                                   uint16_t* normalized, int rows, float eps, float wadd) {
+    __shared__ __attribute__((aligned(16))) uint16_t staged[wide];
+    __shared__ float stream_scale[streams];
+    const int row = blockIdx.x, lane = threadIdx.x;
+    if (row >= rows) return;
+    const uint16_t* source = hidden + size_t(row) * wide;
+    for (int index = lane; index < wide; index += 256) staged[index] = source[index];
+    __syncthreads();
+    if ((lane & 31) == 0 && lane < 32 * streams) {
+        const int channel_stream = lane >> 5;
+        const uint4* words = reinterpret_cast<const uint4*>(staged) + channel_stream * (width / 8);
+        double squares = 0;
+        for (int block = 0; block < width / 8; ++block) {
+            const uint4 packed = words[block];
+            const uint32_t pair[4] = {packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+            for (int half = 0; half < 4; ++half) {
+                const double low = double(__uint_as_float(pair[half] << 16));
+                squares += low * low;
+                const double high = double(__uint_as_float(pair[half] & 0xffff0000U));
+                squares += high * high;
+            }
+        }
+        stream_scale[channel_stream] = __fdiv_rn(1.0f, sqrtf(float(squares / double(width)) + eps));
     }
-    const float scale = __fdiv_rn(1.0f, sqrtf(float(squares / double(width)) + eps));
-    for (int channel = 0; channel < width; ++channel)
-        normalized[base + channel] = narrow_bf16((widen_bf16(hidden[base + channel]) * scale) *
-            (weights[channel_stream * width + channel] + wadd));
+    __syncthreads();
+    uint16_t* target = normalized + size_t(row) * wide;
+    for (int index = lane; index < wide; index += 256)
+        target[index] = narrow_bf16((widen_bf16(staged[index]) * stream_scale[index / width]) *
+                                    (weights[index] + wadd));
 }
 
-__global__ void strict_down(const uint16_t* normalized, const uint8_t* weights,
-                             uint16_t* intermediate, int rows, uint16_t* trace) {
-    const int column = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
-    if (column >= rank || row >= rows) return;
-    float sum = 0;
-    for (int channel = 0; channel < wide; ++channel)
-        sum += widen_bf16(normalized[size_t(row) * wide + channel]) *
-               matrix_value(weights, column, channel, wide, 128, down_pitch);
-    const float divided = sum / float(streams);
-    const uint16_t value = narrow_bf16(divided * sigmoid_exact(divided));
-    intermediate[size_t(row) * rank + column] = value;
-    if (trace) trace[size_t(row) * rank + column] = value;
+// MODE 0 is down (K=10240), MODE 1 is up (K=320). A block owns a tile of rows x outputs; each E4M3 weight
+// is decoded once per tile into LDS. Every output keeps one register accumulator fed in ascending k order.
+template <int MODE, int KC, int NTN, int NTM, int RN, int RM>
+__global__ __launch_bounds__(NTN * NTM) void strict_tiled(const uint16_t* activations, const uint8_t* matrix,
+                                                         int rows, uint16_t* result, uint16_t* trace_values,
+                                                         float* trace_logits) {
+    constexpr bool down = MODE == 0;
+    constexpr int depth = down ? wide : rank, outputs = down ? rank : wide;
+    constexpr int group = down ? 128 : 80, pitch = down ? down_pitch : up_pitch;
+    constexpr int threads = NTN * NTM, tile_n = NTN * RN, tile_m = NTM * RM;
+    constexpr int w_total = tile_n * KC / 4, x_total = tile_m * KC / 2;
+    constexpr int w_items = (w_total + threads - 1) / threads, x_items = (x_total + threads - 1) / threads;
+    static_assert(depth % KC == 0 && outputs % tile_n == 0 && KC % 4 == 0 && group % 4 == 0);
+    __shared__ float lut[256];
+    __shared__ float wtile[KC][tile_n + 1];
+    __shared__ __attribute__((aligned(16))) float xtile[tile_m][KC + 4];
+    const int lane = threadIdx.x, tn = lane % NTN, tm = lane / NTN;
+    const int n0 = blockIdx.x * tile_n, m0 = blockIdx.y * tile_m;
+    for (int code = lane; code < 256; code += threads) lut[code] = e4m3(uint8_t(code));
+    uint32_t codes[w_items], pairs[x_items];
+    float scales[w_items];
+    auto fetch = [&](int k0) {
+#pragma unroll
+        for (int slot = 0; slot < w_items; ++slot) {
+            const int item = lane + threads * slot;
+            if (w_total % threads == 0 || item < w_total) {
+                const int k = k0 + 4 * (item % (KC / 4));
+                const uint8_t* line = matrix + size_t(n0 + item / (KC / 4)) * pitch;
+                codes[slot] = *reinterpret_cast<const uint32_t*>(line + k);
+                scales[slot] = reinterpret_cast<const float*>(line + depth)[k / group];
+            }
+        }
+#pragma unroll
+        for (int slot = 0; slot < x_items; ++slot) {
+            const int item = lane + threads * slot, m = m0 + item / (KC / 2);
+            if (x_total % threads == 0 || item < x_total)
+                pairs[slot] = m < rows ? *reinterpret_cast<const uint32_t*>(
+                    activations + size_t(m) * depth + k0 + 2 * (item % (KC / 2))) : 0U;
+        }
+    };
+    auto store = [&]() {
+#pragma unroll
+        for (int slot = 0; slot < w_items; ++slot) {
+            const int item = lane + threads * slot;
+            if (w_total % threads == 0 || item < w_total) {
+                const int n = item / (KC / 4), k = 4 * (item % (KC / 4));
+#pragma unroll
+                for (int byte = 0; byte < 4; ++byte)
+                    wtile[k + byte][n] = lut[(codes[slot] >> (8 * byte)) & 255U] * scales[slot];
+            }
+        }
+#pragma unroll
+        for (int slot = 0; slot < x_items; ++slot) {
+            const int item = lane + threads * slot;
+            if (x_total % threads == 0 || item < x_total) {
+                const int m = item / (KC / 2), k = 2 * (item % (KC / 2));
+                xtile[m][k] = __uint_as_float(pairs[slot] << 16);
+                xtile[m][k + 1] = __uint_as_float(pairs[slot] & 0xffff0000U);
+            }
+        }
+    };
+    float sums[RN][RM];
+#pragma unroll
+    for (int i = 0; i < RN; ++i)
+#pragma unroll
+        for (int j = 0; j < RM; ++j) sums[i][j] = 0;
+    fetch(0);
+    for (int k0 = 0; k0 < depth; k0 += KC) {
+        __syncthreads();
+        store();
+        __syncthreads();
+        if (k0 + KC < depth) fetch(k0 + KC);
+#pragma unroll 4
+        for (int k = 0; k < KC; k += 4) {
+            float xs[RM][4];
+#pragma unroll
+            for (int j = 0; j < RM; ++j) {
+                const float4 packed = *reinterpret_cast<const float4*>(&xtile[tm + NTM * j][k]);
+                xs[j][0] = packed.x; xs[j][1] = packed.y; xs[j][2] = packed.z; xs[j][3] = packed.w;
+            }
+#pragma unroll
+            for (int step = 0; step < 4; ++step)
+#pragma unroll
+                for (int i = 0; i < RN; ++i) {
+                    const float weight = wtile[k + step][tn + NTN * i];
+#pragma unroll
+                    for (int j = 0; j < RM; ++j) sums[i][j] += xs[j][step] * weight;
+                }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < RN; ++i)
+#pragma unroll
+        for (int j = 0; j < RM; ++j) {
+            const int m = m0 + tm + NTM * j, n = n0 + tn + NTN * i;
+            if (m >= rows) continue;
+            const float sum = sums[i][j];
+            if constexpr (down) {
+                const float divided = sum / float(streams);
+                const uint16_t value = narrow_bf16(divided * sigmoid_exact(divided));
+                result[size_t(m) * rank + n] = value;
+                if (trace_values) trace_values[size_t(m) * rank + n] = value;
+            } else {
+                const size_t index = size_t(m) * wide + n;
+                const uint16_t gate = narrow_bf16(sigmoid_exact(sum));
+                result[index] = gate;
+                if (trace_logits) trace_logits[index] = sum;
+                if (trace_values) trace_values[index] = gate;
+            }
+        }
 }
-
-__global__ void strict_up(const uint16_t* intermediate, const uint8_t* weights,
-                           uint16_t* gates, int rows, float* trace_logits, uint16_t* trace_gates) {
-    const int channel = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
-    if (channel >= wide || row >= rows) return;
-    float sum = 0;
-    for (int column = 0; column < rank; ++column)
-        sum += widen_bf16(intermediate[size_t(row) * rank + column]) *
-               matrix_value(weights, channel, column, rank, 80, up_pitch);
-    const size_t index = size_t(row) * wide + channel;
-    gates[index] = narrow_bf16(sigmoid_exact(sum));
-    if (trace_logits) trace_logits[index] = sum;
-    if (trace_gates) trace_gates[index] = gates[index];
+template <int MODE, int KC, int NTN, int NTM, int RN, int RM>
+void launch_tiled(hipStream_t stream, int rows, const uint16_t* activations, const uint8_t* matrix,
+                  uint16_t* result, uint16_t* trace_values, float* trace_logits) {
+    constexpr int outputs = MODE == 0 ? rank : wide, tile_m = NTM * RM;
+    strict_tiled<MODE, KC, NTN, NTM, RN, RM><<<dim3(outputs / (NTN * RN), (rows + tile_m - 1) / tile_m),
+        NTN * NTM, 0, stream>>>(activations, matrix, rows, result, trace_values, trace_logits);
 }
 
 __global__ void strict_mix(const uint16_t* normalized, const uint16_t* gates,
@@ -101,8 +204,8 @@ __global__ void strict_mix(const uint16_t* normalized, const uint16_t* gates,
     output[size_t(row) * width + channel] = narrow_bf16(sum / float(streams));
 }
 
-__global__ void strict_inject(const uint16_t* normalized, const uint16_t* weights,
-                               uint16_t* output, int rows) {
+__global__ void strict_inject_serial(const uint16_t* normalized, const uint16_t* weights,
+                                     uint16_t* output, int rows) {
     const int row = blockIdx.x, channel_stream = threadIdx.x;
     if (row >= rows || channel_stream >= streams) return;
     float sum = 0;
@@ -111,6 +214,77 @@ __global__ void strict_inject(const uint16_t* normalized, const uint16_t* weight
                widen_bf16(weights[channel_stream * wide + channel]);
     output[size_t(row) * streams + channel_stream] =
         narrow_bf16(2.0f * sigmoid_exact(sum / float(streams)));
+}
+// Same per-(row, stream) sequential sum as the serial form, with operands staged through LDS in chunks.
+template <int KC, int TM, int THREADS>
+__global__ __launch_bounds__(THREADS) void strict_inject(const uint16_t* normalized, const uint16_t* weights,
+                                                         uint16_t* output, int rows) {
+    constexpr int w_total = streams * KC / 2, x_total = TM * KC / 2;
+    constexpr int w_items = (w_total + THREADS - 1) / THREADS, x_items = (x_total + THREADS - 1) / THREADS;
+    static_assert(wide % KC == 0 && KC % 4 == 0 && streams * TM <= THREADS);
+    __shared__ __attribute__((aligned(16))) float wtile[streams][KC + 4];
+    __shared__ __attribute__((aligned(16))) float xtile[TM][KC + 4];
+    const int lane = threadIdx.x, m0 = blockIdx.x * TM;
+    const int channel_stream = lane % streams, local = lane / streams;
+    uint32_t wpairs[w_items], xpairs[x_items];
+    auto fetch = [&](int k0) {
+#pragma unroll
+        for (int slot = 0; slot < w_items; ++slot) {
+            const int item = lane + THREADS * slot;
+            if (w_total % THREADS == 0 || item < w_total)
+                wpairs[slot] = *reinterpret_cast<const uint32_t*>(
+                    weights + size_t(item / (KC / 2)) * wide + k0 + 2 * (item % (KC / 2)));
+        }
+#pragma unroll
+        for (int slot = 0; slot < x_items; ++slot) {
+            const int item = lane + THREADS * slot, m = m0 + item / (KC / 2);
+            if (x_total % THREADS == 0 || item < x_total)
+                xpairs[slot] = m < rows ? *reinterpret_cast<const uint32_t*>(
+                    normalized + size_t(m) * wide + k0 + 2 * (item % (KC / 2))) : 0U;
+        }
+    };
+    auto store = [&]() {
+#pragma unroll
+        for (int slot = 0; slot < w_items; ++slot) {
+            const int item = lane + THREADS * slot;
+            if (w_total % THREADS == 0 || item < w_total) {
+                const int s = item / (KC / 2), k = 2 * (item % (KC / 2));
+                wtile[s][k] = __uint_as_float(wpairs[slot] << 16);
+                wtile[s][k + 1] = __uint_as_float(wpairs[slot] & 0xffff0000U);
+            }
+        }
+#pragma unroll
+        for (int slot = 0; slot < x_items; ++slot) {
+            const int item = lane + THREADS * slot;
+            if (x_total % THREADS == 0 || item < x_total) {
+                const int m = item / (KC / 2), k = 2 * (item % (KC / 2));
+                xtile[m][k] = __uint_as_float(xpairs[slot] << 16);
+                xtile[m][k + 1] = __uint_as_float(xpairs[slot] & 0xffff0000U);
+            }
+        }
+    };
+    float sum = 0;
+    fetch(0);
+    for (int k0 = 0; k0 < wide; k0 += KC) {
+        __syncthreads();
+        store();
+        __syncthreads();
+        if (k0 + KC < wide) fetch(k0 + KC);
+        if (local < TM) {
+#pragma unroll 8
+            for (int k = 0; k < KC; k += 4) {
+                const float4 x = *reinterpret_cast<const float4*>(&xtile[local][k]);
+                const float4 w = *reinterpret_cast<const float4*>(&wtile[channel_stream][k]);
+                sum += x.x * w.x;
+                sum += x.y * w.y;
+                sum += x.z * w.z;
+                sum += x.w * w.w;
+            }
+        }
+    }
+    if (local < TM && m0 + local < rows)
+        output[size_t(m0 + local) * streams + channel_stream] =
+            narrow_bf16(2.0f * sigmoid_exact(sum / float(streams)));
 }
 __device__ uint8_t encode_e4m3(float value) {
     const unsigned sign = (__float_as_uint(value) >> 24) & 128;
@@ -213,18 +387,41 @@ int strict_launch(const RadArgs* args, RadStream stream, const R3dhHcTrace* trac
     auto* intermediate = reinterpret_cast<uint16_t*>(static_cast<uint8_t*>(args->scratch) + aligned(band * wide * 2));
     auto* gates = reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(intermediate) + aligned(band * rank * 2));
     const auto device_stream = reinterpret_cast<hipStream_t>(stream);
-    strict_norm<<<dim3(rows), 4, 0, device_stream>>>(static_cast<const uint16_t*>(hidden->data),
-        static_cast<const float*>(weights->data), normalized, int(rows), eps, wadd);
-    strict_down<<<dim3((rank + 63) / 64, rows), 64, 0, device_stream>>>(normalized,
-        static_cast<const uint8_t*>(down->data), intermediate, int(rows), trace ? trace->down : nullptr);
-    strict_up<<<dim3((wide + 63) / 64, rows), 64, 0, device_stream>>>(intermediate,
-        static_cast<const uint8_t*>(up->data), gates, int(rows), trace ? trace->logits : nullptr,
-        trace ? trace->gates : nullptr);
+    const int count = int(rows);
+    const auto* down_data = static_cast<const uint8_t*>(down->data);
+    const auto* up_data = static_cast<const uint8_t*>(up->data);
+    uint16_t* down_trace = trace ? trace->down : nullptr;
+    float* up_logits = trace ? trace->logits : nullptr;
+    uint16_t* up_gates = trace ? trace->gates : nullptr;
+    strict_norm<<<dim3(rows), 256, 0, device_stream>>>(static_cast<const uint16_t*>(hidden->data),
+        static_cast<const float*>(weights->data), normalized, count, eps, wadd);
+    if (rows <= 4) {
+        launch_tiled<0, 128, 16, 4, 1, 1>(device_stream, count, normalized, down_data, intermediate, down_trace, nullptr);
+        launch_tiled<1, 64, 64, 4, 1, 1>(device_stream, count, intermediate, up_data, gates, up_gates, up_logits);
+    } else if (rows <= 8) {
+        launch_tiled<0, 128, 16, 8, 1, 1>(device_stream, count, normalized, down_data, intermediate, down_trace, nullptr);
+        launch_tiled<1, 64, 32, 8, 1, 1>(device_stream, count, intermediate, up_data, gates, up_gates, up_logits);
+    } else if (rows <= 16) {
+        launch_tiled<0, 128, 16, 16, 1, 1>(device_stream, count, normalized, down_data, intermediate, down_trace, nullptr);
+        launch_tiled<1, 64, 16, 16, 1, 1>(device_stream, count, intermediate, up_data, gates, up_gates, up_logits);
+    } else if (rows <= 32) {
+        launch_tiled<0, 128, 16, 16, 1, 2>(device_stream, count, normalized, down_data, intermediate, down_trace, nullptr);
+        launch_tiled<1, 64, 16, 16, 1, 2>(device_stream, count, intermediate, up_data, gates, up_gates, up_logits);
+    } else {
+        launch_tiled<0, 64, 16, 16, 4, 2>(device_stream, count, normalized, down_data, intermediate, down_trace, nullptr);
+        launch_tiled<1, 64, 16, 16, 4, 2>(device_stream, count, intermediate, up_data, gates, up_gates, up_logits);
+    }
     strict_mix<<<dim3((width + 127) / 128, rows), 128, 0, device_stream>>>(normalized, gates,
-        static_cast<uint16_t*>(output->data), int(rows));
-    if (inject_weights)
-        strict_inject<<<dim3(rows), 4, 0, device_stream>>>(normalized,
-            static_cast<const uint16_t*>(inject_weights->data), static_cast<uint16_t*>(inject->data), int(rows));
+        static_cast<uint16_t*>(output->data), count);
+    if (inject_weights) {
+        const auto* inject_data = static_cast<const uint16_t*>(inject_weights->data);
+        auto* inject_out = static_cast<uint16_t*>(inject->data);
+        if (uintptr_t(inject_data) & 3)
+            strict_inject_serial<<<dim3(rows), 4, 0, device_stream>>>(normalized, inject_data, inject_out, count);
+        else
+            strict_inject<256, 16, 128><<<dim3((rows + 15) / 16), 128, 0, device_stream>>>(normalized,
+                inject_data, inject_out, count);
+    }
     for (int pair = 0; pair < 2; ++pair)
         if (code_outputs[pair])
             strict_quant<<<dim3(width / 128, rows), 128, 0, device_stream>>>(

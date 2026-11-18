@@ -99,36 +99,73 @@ __device__ float factor(float value) { return static_cast<float>(exp(static_cast
 __device__ float scalar(const ChunkTensor& tensor, int token, int head) {
     return static_cast<const float*>(tensor.data)[token * tensor.stride[0] + head];
 }
-__global__ void solve_kernel(ChunkCall call) {
-    if (threadIdx.x != 0) return;
-    const int sequence = blockIdx.x, head = blockIdx.y;
+__device__ float widen(uint16_t bits) { return __uint_as_float(static_cast<unsigned>(bits) << 16); }
+__device__ uint16_t raw(const ChunkTensor& tensor, int row, int head, int column) {
+    return static_cast<const uint16_t*>(tensor.data)[offset(tensor, row, head, column)];
+}
+// Largest row with row * (row + 1) / 2 <= element: walks a packed lower triangle.
+__device__ int triangle_row(int element) {
+    int row = static_cast<int>((sqrtf(8.0f * element + 1.0f) - 1.0f) * 0.5f);
+    while (row * (row + 1) / 2 > element) --row;
+    while ((row + 1) * (row + 2) / 2 <= element) ++row;
+    return row;
+}
+// The sequential dot of one staged BF16 row (16-byte aligned) with a register-resident state row.
+__device__ __forceinline__ float row_dot(const uint16_t* row, const float (&state)[128]) {
+    const uint4* packed = reinterpret_cast<const uint4*>(row);
+    float dot = 0;
+#pragma unroll
+    for (int group = 0; group < 16; ++group) {
+        const uint4 bits = packed[group];
+        const unsigned word[4] = {bits.x, bits.y, bits.z, bits.w};
+#pragma unroll
+        for (int half = 0; half < 8; ++half) {
+            const unsigned value = half & 1 ? word[half >> 1] & 0xffff0000u : word[half >> 1] << 16;
+            dot = dot + __uint_as_float(value) * state[group * 8 + half];
+        }
+    }
+    return dot;
+}
+__global__ __launch_bounds__(128) void solve_kernel(ChunkCall call) {
+    const int lane = threadIdx.x, sequence = blockIdx.y, head = blockIdx.z;
     const auto* tensor = call.tensor; const auto* cumulative = static_cast<const int*>(tensor[3].data);
     const int begin = cumulative[sequence], end = cumulative[sequence + 1];
     if (begin < 0 || end < begin || end > call.rows) return;
-    __shared__ float inverse[4096];
-    float row[64], result[64];
-    for (int chunk = begin; chunk < end; chunk += 64) {
-        const int length = end - chunk < 64 ? end - chunk : 64;
+    const int chunk = begin + static_cast<int>(blockIdx.x) * 64;
+    if (chunk >= end) return;
+    const int length = end - chunk < 64 ? end - chunk : 64;
+    // The keys are dead once the products are formed; the inverse reuses their storage.
+    __shared__ float keys[64 * 129], matrix[64 * 64], gates[64], betas[64];
+    float* const inverse = keys;
+    for (int element = lane; element < length * 128; element += 128)
+        keys[(element >> 7) * 129 + (element & 127)] = load(tensor[0], chunk + (element >> 7), head / 3, element & 127);
+    if (lane < length) {
+        gates[lane] = scalar(tensor[2], chunk + lane, head);
+        betas[lane] = scalar(tensor[1], chunk + lane, head);
+    }
+    __syncthreads();
+    for (int pair = lane; pair < 64 * 63 / 2; pair += 128) {
+        const int token = triangle_row(pair) + 1, previous = pair - token * (token - 1) / 2;
+        if (token >= length) continue;
+        float dot = 0;
+        for (int column = 0; column < 128; ++column)
+            dot = dot + keys[token * 129 + column] * keys[previous * 129 + column];
+        matrix[token * 64 + previous] = betas[token] * dot * factor(gates[token] - gates[previous]);
+    }
+    __syncthreads();
+    // Each inverse column is an independent forward substitution, summed in the serial order.
+    if (lane < 64) {
+        const int previous = lane;
         for (int token = 0; token < length; ++token) {
-            for (int previous = 0; previous < token; ++previous) {
-                float dot = 0;
-                for (int column = 0; column < 128; ++column)
-                    dot = dot + load(tensor[0], chunk + token, head / 3, column)
-                        * load(tensor[0], chunk + previous, head / 3, column);
-                row[previous] = scalar(tensor[1], chunk + token, head) * dot
-                    * factor(scalar(tensor[2], chunk + token, head) - scalar(tensor[2], chunk + previous, head));
-            }
-            for (int previous = 0; previous <= token; ++previous) result[previous] = previous == token ? 1 : 0;
-            for (int intermediate = 0; intermediate < token; ++intermediate)
-                for (int previous = 0; previous <= intermediate; ++previous)
-                    result[previous] = result[previous] - row[intermediate] * inverse[intermediate * 64 + previous];
-            for (int previous = 0; previous < 64; ++previous) {
-                const float value = previous <= token ? result[previous] : 0;
-                inverse[token * 64 + previous] = value;
-                store(tensor[4], chunk + token, head, previous, value);
-            }
+            float value = previous == token ? 1 : 0;
+            for (int intermediate = previous; intermediate < token; ++intermediate)
+                value = value - matrix[token * 64 + intermediate] * inverse[intermediate * 64 + previous];
+            inverse[token * 64 + previous] = previous <= token ? value : 0;
         }
     }
+    __syncthreads();
+    for (int element = lane; element < length * 64; element += 128)
+        store(tensor[4], chunk + (element >> 6), head, element & 63, inverse[element]);
 }
 __global__ __launch_bounds__(128) void scan_kernel(ChunkCall call) {
     const int sequence = blockIdx.x, head = blockIdx.y, value_row = threadIdx.x;
@@ -137,67 +174,96 @@ __global__ __launch_bounds__(128) void scan_kernel(ChunkCall call) {
     if (begin < 0 || end < begin || end > call.rows) return;
     const int slot = static_cast<const int*>(tensor[10].data)[sequence * tensor[10].stride[0]];
     if (slot < 0 || slot >= call.cache_slots) return;
-    float state_row[128], work[64], transformed[64];
+    float state_row[128];
     const int64_t initial_base = slot * tensor[6].stride[0] + head * tensor[6].stride[1] + value_row * 128;
+#pragma unroll
     for (int column = 0; column < 128; ++column)
         state_row[column] = tensor[6].data ? static_cast<const float*>(tensor[6].data)[initial_base + column] : 0;
-    __shared__ float products[4096], gates[64], decays[64];
+    // Packed lower triangles; the staged queries are dead after the products and their storage
+    // then holds each value row's work, transformed in place.
+    __shared__ float products[64 * 65 / 2], gates[64], decays[64], growth[64], rows[64 * 128];
+    __shared__ __align__(16) uint16_t keys[64 * 136];
+    __shared__ uint16_t inverse[64 * 65 / 2];
+    uint16_t* const queries = reinterpret_cast<uint16_t*>(rows);
     for (int chunk = begin; chunk < end; chunk += 64) {
-        const int length = end - chunk < 64 ? end - chunk : 64;
+        const int length = end - chunk < 64 ? end - chunk : 64, triangle = length * (length + 1) / 2;
+        for (int element = value_row; element < length * 128; element += 128) {
+            const int token = element >> 7, column = element & 127;
+            keys[token * 136 + column] = raw(tensor[1], chunk + token, head / 3, column);
+            queries[token * 136 + column] = raw(tensor[0], chunk + token, head / 3, column);
+        }
+        for (int element = value_row; element < triangle; element += 128) {
+            const int token = triangle_row(element);
+            inverse[element] = raw(tensor[3], chunk + token, head, element - token * (token + 1) / 2);
+        }
         if (value_row < length) {
             gates[value_row] = scalar(tensor[4], chunk + value_row, head);
             decays[value_row] = factor(scalar(tensor[4], chunk + length - 1, head) - gates[value_row]);
-            for (int previous = 0; previous <= value_row; ++previous) {
-                float dot = 0;
-                for (int column = 0; column < 128; ++column)
-                    dot = dot + load(tensor[0], chunk + value_row, head / 3, column)
-                        * load(tensor[1], chunk + previous, head / 3, column);
-                products[value_row * 64 + previous] = call.scale
-                    * factor(gates[value_row] - scalar(tensor[4], chunk + previous, head)) * dot;
-            }
+            growth[value_row] = factor(gates[value_row]);
+        }
+        __syncthreads();
+        for (int element = value_row; element < triangle; element += 128) {
+            const int token = triangle_row(element), previous = element - token * (token + 1) / 2;
+            float dot = 0;
+            for (int column = 0; column < 128; ++column)
+                dot = dot + widen(queries[token * 136 + column]) * widen(keys[previous * 136 + column]);
+            products[element] = call.scale * factor(gates[token] - gates[previous]) * dot;
         }
         __syncthreads();
         for (int token = 0; token < length; ++token) {
-            float dot = 0;
-            for (int column = 0; column < 128; ++column)
-                dot = dot + load(tensor[1], chunk + token, head / 3, column) * state_row[column];
-            work[token] = scalar(tensor[5], chunk + token, head)
-                * (load(tensor[2], chunk + token, head, value_row) - factor(gates[token]) * dot);
+            const float dot = row_dot(keys + token * 136, state_row);
+            rows[token * 128 + value_row] = scalar(tensor[5], chunk + token, head)
+                * (load(tensor[2], chunk + token, head, value_row) - growth[token] * dot);
         }
-        for (int token = 0; token < length; ++token) {
+        for (int token = length - 1; token >= 0; --token) {
             float value = 0;
             for (int previous = 0; previous <= token; ++previous)
-                value = value + load(tensor[3], chunk + token, head, previous) * work[previous];
-            transformed[token] = value;
+                value = value + widen(inverse[token * (token + 1) / 2 + previous]) * rows[previous * 128 + value_row];
+            rows[token * 128 + value_row] = value;
         }
         for (int token = 0; token < length; ++token) {
+            const uint16_t* query = static_cast<const uint16_t*>(tensor[0].data) + offset(tensor[0], chunk + token, head / 3, 0);
             float dot = 0;
-            for (int column = 0; column < 128; ++column)
-                dot = dot + load(tensor[0], chunk + token, head / 3, column) * state_row[column];
-            const float coefficient = call.scale * factor(gates[token]);
+            if ((reinterpret_cast<uintptr_t>(query) & 15) == 0) dot = row_dot(query, state_row);
+            else {
+#pragma unroll
+                for (int column = 0; column < 128; ++column) dot = dot + widen(query[column]) * state_row[column];
+            }
+            const float coefficient = call.scale * growth[token];
             float value = coefficient * dot;
             for (int previous = 0; previous <= token; ++previous)
-                value = value + products[token * 64 + previous] * transformed[previous];
+                value = value + products[token * (token + 1) / 2 + previous] * rows[previous * 128 + value_row];
             store(tensor[8], chunk + token, head, value_row, value);
         }
-        const float last_decay = factor(gates[length - 1]);
-        for (int column = 0; column < 128; ++column) {
-            state_row[column] = last_decay * state_row[column];
-            for (int token = 0; token < length; ++token) {
-                const float scaled_key = decays[token] * load(tensor[1], chunk + token, head / 3, column);
-                state_row[column] = state_row[column] + transformed[token] * scaled_key;
+        const float last_decay = growth[length - 1];
+#pragma unroll
+        for (int column = 0; column < 128; ++column) state_row[column] = last_decay * state_row[column];
+        for (int token = 0; token < length; ++token) {
+            const float transformed = rows[token * 128 + value_row], decay = decays[token];
+            const uint4* packed = reinterpret_cast<const uint4*>(keys + token * 136);
+#pragma unroll
+            for (int group = 0; group < 16; ++group) {
+                const uint4 bits = packed[group];
+                const unsigned word[4] = {bits.x, bits.y, bits.z, bits.w};
+#pragma unroll
+                for (int half = 0; half < 8; ++half) {
+                    const unsigned key = half & 1 ? word[half >> 1] & 0xffff0000u : word[half >> 1] << 16;
+                    const float scaled_key = decay * __uint_as_float(key);
+                    state_row[group * 8 + half] = state_row[group * 8 + half] + transformed * scaled_key;
+                }
             }
         }
         __syncthreads();
     }
     const int64_t final_base = slot * tensor[9].stride[0] + head * tensor[9].stride[1] + value_row * 128;
+#pragma unroll
     for (int column = 0; column < 128; ++column)
         static_cast<float*>(tensor[9].data)[final_base + column] = state_row[column];
 }
 }
 extern "C" int r3dh_gdn_extra_kkt_strict(const RadArgs* args, RadStream stream) {
     ChunkCall call{}; const int status = prepare(args, true, &call); if (status != RAD_OK) return status;
-    hipLaunchKernelGGL(solve_kernel, dim3(call.sequences, call.heads), dim3(32), 0,
+    hipLaunchKernelGGL(solve_kernel, dim3((call.rows + 63) / 64, call.sequences, call.heads), dim3(128), 0,
         reinterpret_cast<hipStream_t>(stream), call);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }

@@ -21,7 +21,9 @@ uint64_t chunk_hash(const Buffer& buffer) {
     return hash;
 }
 void chunk_identity() {
-    expect(std::getenv("ROCR_VISIBLE_DEVICES") && !std::strcmp(std::getenv("ROCR_VISIBLE_DEVICES"), "7"), "chunk physical GPU7 required");
+    const char* physical = std::getenv("ROCR_VISIBLE_DEVICES");
+    expect(physical && (!std::strcmp(physical, "7") || !std::strcmp(physical, "4")), "chunk physical GPU7 or GPU4 required");
+    const bool gpu4 = !std::strcmp(physical, "4");
     expect(std::getenv("HIP_VISIBLE_DEVICES") && !std::strcmp(std::getenv("HIP_VISIBLE_DEVICES"), "0"), "chunk logical GPU0 required");
     int count = 0;
     hip_ok(hipGetDeviceCount(&count)); expect(count == 1, "chunk one visible GPU");
@@ -29,8 +31,8 @@ void chunk_identity() {
     hip_ok(hipGetDeviceProperties(&property, 0));
     expect(!std::strncmp(property.gcnArchName, "gfx1100", 7), "chunk native gfx1100 required");
     char pci[64]{}; hip_ok(hipDeviceGetPCIBusId(pci, sizeof(pci), 0));
-    expect(std::strstr(pci, "e3:00.0"), "chunk GPU7 PCI identity");
-    std::printf("GDN_CHUNK gpu=7 logical=0 arch=%s pci=%s contract=off tolerance=0\n", property.gcnArchName, pci);
+    expect(std::strstr(pci, gpu4 ? "83:00.0" : "e3:00.0"), "chunk GPU7/GPU4 PCI identity");
+    std::printf("GDN_CHUNK gpu=%s logical=0 arch=%s pci=%s contract=off tolerance=0\n", physical, property.gcnArchName, pci);
 }
 #include "r3dh_gdn_extra_check_chunk_contract.h"
 void chunk_case(const std::vector<int>& lengths, bool warm, bool padded, bool flat_index = false) {

@@ -456,6 +456,61 @@ void gpu_check(Matrix& down, Matrix& up, int rows, const std::vector<float>* mod
         traced_down.guards(); traced_logits.guards(); traced_gates.guards();
     }
 }
+void bench(Matrix& down, Matrix& up, int rows) {
+    constexpr int width = 2560, streams = 4, channels = width * streams, launches = 31, warmup = 5;
+    auto params = parameters(rows);
+    Stream stream;
+    DeviceBuffer hidden(size_t(rows) * channels * 2), gain(channels * 4), weights(streams * channels * 2),
+        packed_down(down.packed.size()), packed_up(up.packed.size()), output(size_t(rows) * width * 2),
+        gates(size_t(rows) * streams * 2), quantized(size_t(rows) * width),
+        scales(size_t(rows) * (width / 128) * 4), rotated(size_t(rows) * width),
+        rotated_scales(size_t(rows) * (width / 128) * 4);
+    std::vector<float> host_gain(channels);
+    std::vector<uint16_t> host_weights(streams * channels), host_hidden(size_t(rows) * channels);
+    for (int index = 0; index < channels; ++index) host_gain[index] = 0.75f + float(index % 17) / 32;
+    for (size_t index = 0; index < host_weights.size(); ++index)
+        host_weights[index] = narrow(float(int(index * 19 % 101) - 50) / 4096);
+    for (size_t index = 0; index < host_hidden.size(); ++index)
+        host_hidden[index] = narrow(float(int((index * 37) % 257) - 128) / 64);
+    hidden.upload(host_hidden.data()); gain.upload(host_gain.data()); weights.upload(host_weights.data());
+    packed_down.upload(down.packed.data()); packed_up.upload(up.packed.data());
+    RadTensor operands[] = {tensor(hidden.data(), RAD_BF16, rows, channels),
+        tensor(gain.data(), RAD_F32, 1, channels), tensor(packed_down.data(), RAD_F8E4M3, 320, channels),
+        tensor(packed_up.data(), RAD_F8E4M3, channels, 320), tensor(weights.data(), RAD_BF16, streams, channels),
+        tensor(output.data(), RAD_BF16, rows, width), tensor(gates.data(), RAD_BF16, rows, streams),
+        tensor(quantized.data(), RAD_F8E4M3, rows, width), tensor(scales.data(), RAD_F32, rows, width / 128),
+        tensor(rotated.data(), RAD_F8E4M3, rows, width), tensor(rotated_scales.data(), RAD_F32, rows, width / 128)};
+    RadArgs args{}; args.t = operands; args.n_t = 11;
+    args.p = params.data(); args.n_p = int(params.size());
+    const int64_t scratch_bytes = r3dh_hc_rad_hc_read_scratch(&args);
+    require(scratch_bytes > 0, "HC bench scratch size invalid");
+    DeviceBuffer scratch{size_t(scratch_bytes)};
+    args.scratch = scratch.data(); args.scratch_bytes = scratch_bytes;
+    const auto device_stream = reinterpret_cast<RadStream>(stream.value);
+    for (int index = 0; index < warmup; ++index) require(r3dh_hc_rad_hc_read(&args, device_stream) == RAD_OK, "HC bench warmup");
+    check_hip(hipStreamSynchronize(stream.value));
+    std::vector<uint16_t> first(size_t(rows) * width), last(first.size());
+    output.download(first.data());
+    hipEvent_t start, stop;
+    check_hip(hipEventCreate(&start)); check_hip(hipEventCreate(&stop));
+    std::vector<float> samples;
+    for (int index = 0; index < launches; ++index) {
+        check_hip(hipEventRecord(start, stream.value));
+        require(r3dh_hc_rad_hc_read(&args, device_stream) == RAD_OK, "HC bench launch");
+        check_hip(hipEventRecord(stop, stream.value));
+        check_hip(hipEventSynchronize(stop));
+        float milliseconds = 0; check_hip(hipEventElapsedTime(&milliseconds, start, stop));
+        samples.push_back(milliseconds * 1000.0f);
+    }
+    check_hip(hipEventDestroy(start)); check_hip(hipEventDestroy(stop));
+    output.download(last.data());
+    require(first == last, "HC bench output changed across launches");
+    for (const DeviceBuffer* buffer : {&hidden, &gain, &weights, &packed_down, &packed_up, &output, &gates,
+         &quantized, &scales, &rotated, &rotated_scales, &scratch}) buffer->guards();
+    std::sort(samples.begin(), samples.end());
+    std::printf("hc_bench,M=%d,inject=1,quant_pairs=2,warmup=%d,launches=%d,median_us=%.1f,min_us=%.1f,max_us=%.1f\n",
+                rows, warmup, launches, samples[launches / 2], samples.front(), samples.back());
+}
 }
 
 int main(int argc, char** argv) {
@@ -481,6 +536,13 @@ int main(int argc, char** argv) {
             std::puts("hc_model_host,manifest_planes_group80_group128_roundtrip=PASS");
             return 0;
         }
+        if (argc == 2 && !std::strcmp(argv[1], "--bench")) {
+            hipDeviceProp_t properties{}; check_hip(hipGetDeviceProperties(&properties, 0));
+            require(!std::strncmp(properties.gcnArchName, "gfx1100", 7), "bench requires gfx1100");
+            std::printf("device=%s,arch=%s\n", properties.name, properties.gcnArchName);
+            for (int rows : {4, 585}) bench(down, up, rows);
+            return 0;
+        }
         require((argc == 3 || argc == 5) && !std::strcmp(argv[1], "--suite"), "HC suite requires existing libref");
         void* library = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
         if (!library) throw std::runtime_error(dlerror());
@@ -490,7 +552,7 @@ int main(int argc, char** argv) {
         hipDeviceProp_t properties{}; check_hip(hipGetDeviceProperties(&properties, 0));
         require(!std::strncmp(properties.gcnArchName, "gfx1100", 7), "checker requires gfx1100");
         std::printf("device=%s,arch=%s\n", properties.name, properties.gcnArchName);
-        for (int rows : {1, 3, 8, 16, 32, 64}) gpu_check(down, up, rows);
+        for (int rows : {1, 3, 4, 5, 8, 12, 16, 24, 32, 33, 64, 65, 585}) gpu_check(down, up, rows);
         if (argc == 5) {
             ModelManifest model(argv[3], argv[4]);
             for (const char* prefix : {"blk.0.attn_hc", "blk.0.ffn_hc", "output_hc"}) {
@@ -505,7 +567,7 @@ int main(int argc, char** argv) {
                 const bool inject = base != "output_hc";
                 std::vector<uint16_t> model_weights(40960);
                 if (inject) model_weights = model.bf16(base + "_inject.weight", "4x10240", 40960);
-                for (int rows : {1, 3, 8, 16, 32, 64})
+                for (int rows : {1, 3, 4, 8, 16, 32, 64, 585})
                     gpu_check(down, up, rows, &model_gain, &model_weights, inject);
             }
         }

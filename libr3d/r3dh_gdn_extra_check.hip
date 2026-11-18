@@ -287,7 +287,9 @@ void decode(int heads, bool anchor, int bound, int sequences, int group, const c
     device_args.scratch = scratch.device().data; device_args.scratch_bytes = scratch_bytes;
     fixture.upload();
     const int saved_depth = device[3].shape[2]; device[3].shape[2] = bound + 1;
-    expect(r3dh_gdn_extra_validate(&device_args, 3) != RAD_OK, "reject shallow state depth"); device[3].shape[2] = saved_depth;
+    const int64_t shallow_bound = std::min<int64_t>(std::min<int64_t>(bound, rows), bound - 1);
+    expect((r3dh_gdn_extra_validate(&device_args, 3) == RAD_OK) == (rows <= shallow_bound * sequences),
+        "shallow state depth clamps the per-sequence bound"); device[3].shape[2] = saved_depth;
     device_args.scratch_bytes = scratch_bytes - 1;
     expect(r3dh_gdn_extra_conv_recurrent_update_had_strict(&device_args, reinterpret_cast<RadStream>(fixture.stream)) != RAD_OK, "reject short scratch");
     device_args.scratch_bytes = scratch_bytes;
@@ -381,15 +383,25 @@ void prefill(int heads, int rows, bool warm) {
 }
 #include "r3dh_gdn_extra_check_chunk.h"
 #include "r3dh_gdn_extra_check_chunk_suite.h"
+#include "r3dh_gdn_extra_check_chunk_bench.h"
 }
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && (!std::strcmp(argv[1], "--chunk-smoke") || !std::strcmp(argv[1], "--chunk")
-                || !std::strcmp(argv[1], "--chunk-registry"))) {
+                || !std::strcmp(argv[1], "--chunk-registry") || !std::strcmp(argv[1], "--chunk-bench"))) {
             chunk_registry = !std::strcmp(argv[1], "--chunk-registry");
             chunk_identity();
-            if (!std::strcmp(argv[1], "--chunk-smoke")) chunk_case({65, 66}, true, false);
+            if (!std::strcmp(argv[1], "--chunk-bench")) chunk_bench();
+            else if (!std::strcmp(argv[1], "--chunk-smoke")) chunk_case({65, 66}, true, false);
             else chunk_suite();
+            return 0;
+        }
+        if (argc == 2 && !std::strcmp(argv[1], "--prefill")) {
+            identity();
+            for (int rows : {1, 63, 64, 65}) prefill(24, rows, rows != 63);
+            prefill(48, 1, false);
+            for (int rows : {585, 2048}) { prefill(24, rows, true); prefill(24, rows, false); prefill(48, rows, rows == 585); }
+            std::puts("PASS GDN_EXTRA_PREFILL strict libref bit-exact conv/kkt/scan prefill pipelines incl M585/M2048");
             return 0;
         }
         expect(argc == 1 || (argc == 2 && !std::strcmp(argv[1], "--host")), "usage: r3dh_gdn_extra_check [--host]");
