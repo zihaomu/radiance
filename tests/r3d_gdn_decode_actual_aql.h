@@ -58,7 +58,8 @@ TEST(r3d_gdn_decode_actual_aql_persistent_fused) {
     uint64_t device_guards = 0;
     const std::vector<std::vector<int>> batches{{1}, {1, 1}, {1, 1, 1},
         {1, 1, 1, 1, 1, 1, 1, 1}, {0, 1}, {0, 1, 0, 1, 0, 1, 0, 1},
-        {2, 1}, {0, 2, 1, 0, 3, 1, 2, 1}};
+        {2, 1}, {0, 2, 1, 0, 3, 1, 2, 1},
+        {4, 4, 4, 4, 4, 4, 4, 4}, {4, 1, 4, 2}};
     for (const auto& lengths : batches)
         for (int rank_two : {0, 1}) {
             const int sequences = int(lengths.size());

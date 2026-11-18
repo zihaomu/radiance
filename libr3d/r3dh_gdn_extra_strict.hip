@@ -188,7 +188,7 @@ int prepare(const RadArgs* args, int operation, Call* call) {
             || !matrix(args->t[17], RAD_F32, call->rows, call->heads * 128 / call->group))
             return RAD_E_SHAPE;
     }
-    if (operation == 3 && call->cache_width < call->bound + 2) return RAD_E_SHAPE;
+    if (operation == 3 && call->bound > call->cache_width - 2) call->bound = call->cache_width - 2;
     return call->rows <= call->bound * call->sequences ? RAD_OK : RAD_E_SHAPE;
 }
 __device__ float widen(uint16_t value) { return __uint_as_float(static_cast<uint32_t>(value) << 16); }

@@ -79,7 +79,7 @@ __device__ float dot(const AttnCall& call, int64_t query, int64_t cache) {
         value += bf_load(call.query, query + lane) * cache_value(call, cache, lane, 0);
     return value * call.scale;
 }
-__global__ void attention_kernel(AttnCall call) {
+__global__ __launch_bounds__(256) void attention_kernel(AttnCall call) {
     const int token = blockIdx.x, head = blockIdx.y;
     const int lane = threadIdx.x;
     if (lane >= call.dim) return;
@@ -94,27 +94,42 @@ __global__ void attention_kernel(AttnCall call) {
     const int visible = min(context - (last - first) + token - first + 1, int(call.table.shape[1]) * 4);
     const int64_t query_offset = token * call.query.stride[0] + head * call.dim;
     const int64_t out_offset = token * call.output.stride[0] + head * call.dim + lane;
-    __shared__ float weight, denominator, maximum;
-    if (lane == 0) {
-        maximum = -INFINITY;
-        for (int key = 0; key < visible; ++key) {
-            const int64_t row = cache_row(call, sequence, key, head);
-            if (row >= 0) { const float score = dot(call, query_offset, row); if (score > maximum) maximum = score; }
-        }
-        denominator = 0;
-    }
-    __syncthreads();
-    float accumulator = 0;
-    for (int key = 0; key < visible; ++key) {
+    __shared__ float probability[256], reduce[256];
+    __shared__ int64_t rows[256];
+    // Parallel over keys/columns only; every per-output sum keeps the sequential key order.
+    float maximum = -INFINITY;
+    for (int key = lane; key < visible; key += call.dim) {
         const int64_t row = cache_row(call, sequence, key, head);
-        if (lane == 0) {
-            weight = row >= 0 && maximum != -INFINITY ? float(exp(double(dot(call, query_offset, row) - maximum))) : 0;
-            if (row >= 0) denominator += weight;
-        }
-        __syncthreads();
-        if (row >= 0) accumulator += weight * cache_value(call, row, lane, 1);
+        if (row >= 0) { const float score = dot(call, query_offset, row); if (score > maximum) maximum = score; }
+    }
+    reduce[lane] = maximum;
+    __syncthreads();
+    for (int span = call.dim / 2; span > 0; span >>= 1) {
+        if (lane < span && reduce[lane + span] > reduce[lane]) reduce[lane] = reduce[lane + span];
         __syncthreads();
     }
+    maximum = reduce[0];
+    __syncthreads();
+    float accumulator = 0, denominator = 0;
+    for (int base = 0; base < visible; base += call.dim) {
+        if (base + lane < visible) {
+            const int64_t row = cache_row(call, sequence, base + lane, head);
+            rows[lane] = row;
+            probability[lane] = row >= 0 && maximum != -INFINITY
+                ? float(exp(double(dot(call, query_offset, row) - maximum))) : 0;
+        }
+        __syncthreads();
+        const int count = min(call.dim, visible - base);
+        for (int index = 0; index < count; ++index) {
+            if (rows[index] < 0) continue;
+            if (lane == 0) denominator += probability[index];
+            accumulator += probability[index] * cache_value(call, rows[index], lane, 1);
+        }
+        __syncthreads();
+    }
+    if (lane == 0) reduce[0] = denominator;
+    __syncthreads();
+    denominator = reduce[0];
     const float inverse = denominator > 0 ? 1.0f / denominator : 0;
     static_cast<uint16_t*>(call.output.data)[out_offset] = bf_round(accumulator * inverse);
 }

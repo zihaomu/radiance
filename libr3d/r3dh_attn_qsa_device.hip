@@ -142,7 +142,7 @@ __device__ float cached(const Attention& call, int seq, int token, int half, int
     const int8_t* row = call.kv + (long(page) * 4 + token % 4) * 516;
     return float(row[half * 256 + column]) * __half2float(reinterpret_cast<const __half*>(row + 512)[half]);
 }
-template<bool PAGED> __global__ void attention(Attention call) {
+template<bool PAGED> __global__ __launch_bounds__(256) void attention(Attention call) {
     const int row = blockIdx.x, head = blockIdx.y;
     int sequence = -1, begin = 0, end = 0;
     for (int candidate = 0; candidate < call.seqs; ++candidate) {
@@ -156,40 +156,48 @@ template<bool PAGED> __global__ void attention(Attention call) {
     if (PAGED && sequence >= 0) keys = call.used[sequence] - (end - begin) + row - begin + 1;
     if (sequence < 0 || keys < 0 || (PAGED && (call.used[sequence] > call.table_width * 4
         || call.used[sequence] < end - begin))) keys = 0;
-    float query[256], accumulator[256];
-    for (int column = 0; column < 256; ++column) {
-        query[column] = load(call.query, row * call.qpitch + head * 256 + column);
-        accumulator[column] = 0;
-    }
+    __shared__ float query[256], probability[256], reduce[256];
+    const int lane = threadIdx.x;
+    query[lane] = load(call.query, row * call.qpitch + head * 256 + lane);
+    __syncthreads();
+    // Parallel over keys/columns only; every per-output sum keeps the sequential order.
+    auto score = [&](int token) {
+        float dot = 0;
+        for (int column = 0; column < 256; ++column) {
+            const float key = PAGED ? cached(call, sequence, token, 0, column)
+                : load(call.key, (begin + token) * call.kpitch + column);
+            dot = dot + query[column] * key;
+        }
+        return dot;
+    };
     float maximum = -INFINITY;
-    for (int token = 0; token < keys; ++token) {
-        float dot = 0;
-        for (int column = 0; column < 256; ++column) {
-            const float key = PAGED ? cached(call, sequence, token, 0, column)
-                : load(call.key, (begin + token) * call.kpitch + column);
-            dot = dot + query[column] * key;
-        }
-        maximum = fmaxf(maximum, dot * call.scale);
+    for (int token = lane; token < keys; token += 256) maximum = fmaxf(maximum, score(token) * call.scale);
+    reduce[lane] = maximum;
+    __syncthreads();
+    for (int span = 128; span > 0; span >>= 1) {
+        if (lane < span) reduce[lane] = fmaxf(reduce[lane], reduce[lane + span]);
+        __syncthreads();
     }
-    float denominator = 0;
-    for (int token = 0; token < keys; ++token) {
-        float dot = 0;
-        for (int column = 0; column < 256; ++column) {
-            const float key = PAGED ? cached(call, sequence, token, 0, column)
-                : load(call.key, (begin + token) * call.kpitch + column);
-            dot = dot + query[column] * key;
+    maximum = reduce[0];
+    float denominator = 0, accumulator = 0;
+    for (int base = 0; base < keys; base += 256) {
+        if (base + lane < keys)
+            probability[lane] = float(exp(double(score(base + lane) * call.scale - maximum)));
+        __syncthreads();
+        const int count = min(256, keys - base);
+        if (lane == 0) for (int index = 0; index < count; ++index) denominator = denominator + probability[index];
+        for (int index = 0; index < count; ++index) {
+            const float value = PAGED ? cached(call, sequence, base + index, 1, lane)
+                : load(call.value, (begin + base + index) * call.vpitch + lane);
+            accumulator = accumulator + probability[index] * value;
         }
-        const float probability = float(exp(double(dot * call.scale - maximum)));
-        denominator = denominator + probability;
-        for (int column = 0; column < 256; ++column) {
-            const float value = PAGED ? cached(call, sequence, token, 1, column)
-                : load(call.value, (begin + token) * call.vpitch + column);
-            accumulator[column] = accumulator[column] + probability * value;
-        }
+        __syncthreads();
     }
+    if (lane == 0) reduce[0] = denominator;
+    __syncthreads();
+    denominator = reduce[0];
     const float inverse = denominator > 0 ? 1.0f / denominator : 0;
-    for (int column = 0; column < 256; ++column)
-        call.output[row * call.opitch + head * 256 + column] = rounded(accumulator[column] * inverse);
+    call.output[row * call.opitch + head * 256 + lane] = rounded(accumulator * inverse);
 }
 int launched() { return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE; }
 }
@@ -311,7 +319,7 @@ template<bool PAGED> int launch_attention(const RadArgs* args, RadStream stream)
         call.value = static_cast<const uint16_t*>(tensors[2].data);
         call.kpitch = tensors[1].stride[0]; call.vpitch = tensors[2].stride[0];
     }
-    hipLaunchKernelGGL(attention<PAGED>, dim3(rows, 12), dim3(1), 0, reinterpret_cast<hipStream_t>(stream), call);
+    hipLaunchKernelGGL(attention<PAGED>, dim3(rows, 12), dim3(256), 0, reinterpret_cast<hipStream_t>(stream), call);
     return launched();
 }
 extern "C" int r3dh_attn_qsa_dense(const RadArgs* args, RadStream stream) { return launch_attention<false>(args, stream); }

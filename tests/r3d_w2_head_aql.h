@@ -170,7 +170,9 @@ void execute(Api& api, Fixture& fixture, int rows, int rank, bool full, int band
             std::copy(fixture.joined.begin(), fixture.joined.end(), joined.expected.begin() + 64);
             codes.push(stream); joined.push(stream);
             for (int blob = 0; blob < 2; ++blob) {
-                fixture.params[4].ival = band == 8 && rows == 1 && !blob ? 2 : band;
+                int issued = 2;
+                while (issued < rows) issued *= 2;
+                fixture.params[4].ival = band == 8 && rows == 1 && !blob ? 2 : band == 32 && !blob ? issued : band;
                 output.push(stream); REQUIRE_EQ(rad_stream_sync(stream), RAD_OK);
                 RadTensor tensors[]{activation.device, scale.device, matrix(codes.device(), RAD_U2, columns, reduction),
                     blob ? matrix(joined.device(), r3d_w2::dtype, fixture.joined.size(), 1)

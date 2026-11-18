@@ -423,7 +423,7 @@ int w2_strict_run(const RadArgs* args, RadStream stream) {
         output.rank != 2 || output.shape[0] != rows || output.shape[1] != columns ||
         scale.rank != 2 || scale.shape[0] != rows || scale.shape[1] != 1 ||
         sums.rank != 2 || sums.shape[0] != reduction / 128 ||
-        sums.shape[1] < sum_rows || sums.shape[1] > ((band + 15) / 16) * 16 ||
+        sums.shape[1] < sum_rows ||
         (sums.shape[1] != 16 && sums.shape[1] != 32))
         return RAD_E_SHAPE;
     if (sums.shape[1] == 32 && sums.stride[0] != 32) return RAD_E_STRIDE;
