@@ -132,6 +132,7 @@ extern "C" int r3dh_moe_mixed_iqr_launch(const RadArgs* arguments, RadStream str
     Call call{};
     int status = r3dh_moe_mixed::config(arguments->p, arguments->n_p, &call.geometry);
     if (status != RAD_OK) return status;
+    if (arguments->scratch) return r3dh_moe_iqr_launch(arguments, stream);
     const RadTensor* tensors = arguments->t;
     if (tensors[8].rank != 2 || tensors[8].shape[0] < 10
         || tensors[8].shape[0] % 10 || tensors[8].shape[0] / 10 > call.geometry.tokens)

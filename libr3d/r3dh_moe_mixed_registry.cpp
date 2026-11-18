@@ -41,6 +41,7 @@ RadKernelInfo row(const char* name, const RadConstraint (&constraints)[count], i
     result.n_constraints = count;
     result.launch = kind == 2 ? r3dh_moe_mixed_bf16_launch
         : kind == 1 ? r3dh_moe_w4nl_launch : r3dh_moe_mixed_iqr_launch;
+    if (kind == 0) result.scratch = r3dh_moe_iqr_scratch;
     result.opd_shape = kind == 2 ? r3dh_moe_mixed_bf16_shape
         : kind == 1 ? r3dh_moe_w4nl_shape : r3dh_moe_mixed_iqr_shape;
     if (kind != 2) {

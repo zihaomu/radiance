@@ -5,6 +5,7 @@
 #include "rad_plugin.h"
 
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 
 namespace {
@@ -48,6 +49,7 @@ __global__ void iqr_scalar(const int8_t* activation, const float* activation_sca
 using Int4 = int __attribute__((ext_vector_type(4)));
 using Int8 = int __attribute__((ext_vector_type(8)));
 
+template<bool Packed>
 __global__ void iqr_wave(const int8_t* activation, const float* activation_scale,
     const uint8_t* weight, const float* scales, uint16_t* output,
     int rows, int columns, int reduction, int64_t activation_pitch,
@@ -62,13 +64,29 @@ __global__ void iqr_wave(const int8_t* activation, const float* activation_scale
     float accumulator = 0.0f;
     for (int group = 0; group < reduction / 128; ++group) {
         int32_t subtotal = 0;
+        uint32_t input_word = 0, weight_word = 0;
         for (unsigned offset = 0; offset < 4; ++offset) {
             const int position = group * 128 + lane * 4 + offset;
-            const uint32_t state = r3d_iqr::trellis_state(codes, pitch, column, position,
-                header->bits, header->state_bits, header->run_rows);
+            uint32_t state;
+            if constexpr (Packed) {
+                state = header->bits == 4 ? r3d_iqr::trellis_state(codes, pitch, column, position, 4, 16, header->run_rows)
+                    : header->bits == 3 ? r3d_iqr::trellis_state(codes, pitch, column, position, 3, 16, header->run_rows)
+                    : r3d_iqr::trellis_state(codes, pitch, column, position, 5, 16, header->run_rows);
+            } else {
+                state = r3d_iqr::trellis_state(codes, pitch, column, position,
+                    header->bits, header->state_bits, header->run_rows);
+            }
             const int code = r3d_iqr::trellis_mad(state, header->multiplier, header->increment);
-            subtotal += static_cast<int>(activation[row * activation_pitch + position]) * code;
+            const int8_t input = activation[row * activation_pitch + position];
+            if constexpr (Packed) {
+                input_word |= uint32_t(uint8_t(input)) << (offset * 8);
+                weight_word |= uint32_t(uint8_t(code)) << (offset * 8);
+            } else {
+                subtotal += int(input) * code;
+            }
         }
+        if constexpr (Packed)
+            subtotal = __builtin_amdgcn_sudot4(true, int(weight_word), true, int(input_word), 0, false);
         for (unsigned distance = 16; distance; distance >>= 1)
             subtotal += __shfl_xor(subtotal, distance, 32);
         if (lane == 0) {
@@ -131,18 +149,21 @@ __global__ void iqr_wmma(const int8_t* activation, const float* activation_scale
     }
 }
 
+template<bool Wave>
 __global__ void iqr_group_bf16(const int8_t* activation, const float* activation_scale,
     const uint8_t* weight, const uint16_t* scales, uint16_t* output,
     int rows, int columns, int reduction, int64_t activation_pitch,
     int64_t activation_scale_pitch, int64_t output_pitch) {
-    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned lane = threadIdx.x & 31u;
+    const int column = Wave ? blockIdx.x * 4 + threadIdx.x / 32
+                            : blockIdx.x * blockDim.x + threadIdx.x;
     const int row = blockIdx.y;
     if (column >= columns || row >= rows) return;
     const auto* header = reinterpret_cast<const r3d_iqr::Header*>(weight);
     if (header->magic != r3d_iqr::weight_magic || header->state_bits != 16
         || (header->bits != 3 && header->bits != 4 && header->bits != 5)
         || (header->run_rows != 128 && header->run_rows != 256)
-        || header->rows != columns || header->columns != reduction
+        || header->rows != uint32_t(columns) || header->columns != uint32_t(reduction)
         || columns % header->run_rows) return;
     const auto* codes = weight + sizeof(r3d_iqr::Header);
     const uint64_t pitch = uint64_t(reduction) * header->bits / 8;
@@ -150,19 +171,24 @@ __global__ void iqr_group_bf16(const int8_t* activation, const float* activation
     float accumulator = 0.0f;
     for (int group = 0; group < groups; ++group) {
         int32_t subtotal = 0;
-        for (int offset = 0; offset < 128; ++offset) {
+        for (int offset = Wave ? int(lane) * 4 : 0; offset < (Wave ? int(lane) * 4 + 4 : 128); ++offset) {
             const int position = group * 128 + offset;
             const uint32_t state = r3d_iqr::trellis_state(codes, pitch, column,
                 position, header->bits, 16, header->run_rows);
             subtotal += int(activation[row * activation_pitch + position])
                 * int(r3d_iqr::trellis_mad(state, header->multiplier, header->increment));
         }
+        if constexpr (Wave) {
+            for (unsigned distance = 16; distance; distance >>= 1)
+                subtotal += __shfl_xor(subtotal, distance, 32);
+            if (lane != 0) continue;
+        }
         const float scaled = __fmul_rn(float(subtotal),
             activation_scale[row * activation_scale_pitch + group]);
         const float weight_scale = __uint_as_float(uint32_t(scales[column * groups + group]) << 16);
         accumulator = __fadd_rn(accumulator, __fmul_rn(scaled, weight_scale));
     }
-    output[row * output_pitch + column] = narrow_bf16(accumulator);
+    if (!Wave || lane == 0) output[row * output_pitch + column] = narrow_bf16(accumulator);
 }
 
 extern "C" int r3d_rad_gemm_iqr_scalar(const RadArgs* arguments, RadStream stream) {
@@ -222,7 +248,17 @@ extern "C" int r3d_rad_gemm_iqr_scalar(const RadArgs* arguments, RadStream strea
         || tensor[0].stride[0] < reduction || tensor[1].stride[0] < reduction / 128
         || tensor[4].stride[0] < columns) return RAD_E_SHAPE;
     if (group_scale) {
-        iqr_group_bf16<<<dim3((columns + 127) / 128, rows), dim3(128), 0,
+        const char* wave = std::getenv("RAD_IQR_DENSE_WAVE");
+        if (rows <= 16 && wave && std::strcmp(wave, "0") != 0) {
+            iqr_group_bf16<true><<<dim3((columns + 3) / 4, rows), dim3(128), 0,
+                reinterpret_cast<hipStream_t>(stream)>>>(
+                static_cast<const int8_t*>(tensor[0].data), static_cast<const float*>(tensor[1].data),
+                static_cast<const uint8_t*>(tensor[2].data), static_cast<const uint16_t*>(tensor[3].data),
+                static_cast<uint16_t*>(tensor[4].data), int(rows), int(columns), int(reduction),
+                tensor[0].stride[0], tensor[1].stride[0], tensor[4].stride[0]);
+            return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+        }
+        iqr_group_bf16<false><<<dim3((columns + 127) / 128, rows), dim3(128), 0,
             reinterpret_cast<hipStream_t>(stream)>>>(
             static_cast<const int8_t*>(tensor[0].data), static_cast<const float*>(tensor[1].data),
             static_cast<const uint8_t*>(tensor[2].data), static_cast<const uint16_t*>(tensor[3].data),
@@ -231,7 +267,17 @@ extern "C" int r3d_rad_gemm_iqr_scalar(const RadArgs* arguments, RadStream strea
         return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
     }
     if (implementation == 2) {
-        iqr_wave<<<dim3((columns + 3) / 4, rows), dim3(128), 0,
+        const char* wave = std::getenv("RAD_IQR_DENSE_WAVE");
+        if (wave && std::strcmp(wave, "0") != 0) {
+            iqr_wave<true><<<dim3((columns + 3) / 4, rows), dim3(128), 0,
+                reinterpret_cast<hipStream_t>(stream)>>>(
+                static_cast<const int8_t*>(tensor[0].data), static_cast<const float*>(tensor[1].data),
+                static_cast<const uint8_t*>(tensor[2].data), static_cast<const float*>(tensor[3].data),
+                static_cast<uint16_t*>(tensor[4].data), int(rows), int(columns), int(reduction),
+                tensor[0].stride[0], tensor[1].stride[0], tensor[4].stride[0]);
+            return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+        }
+        iqr_wave<false><<<dim3((columns + 3) / 4, rows), dim3(128), 0,
             reinterpret_cast<hipStream_t>(stream)>>>(
             static_cast<const int8_t*>(tensor[0].data), static_cast<const float*>(tensor[1].data),
             static_cast<const uint8_t*>(tensor[2].data), static_cast<const float*>(tensor[3].data),

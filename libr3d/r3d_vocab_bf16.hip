@@ -611,6 +611,41 @@ __global__ void gemm_plain_strict(const uint16_t* activation, const uint16_t* we
     }
 }
 
+__global__ __launch_bounds__(128) void logits_staged_strict(const uint16_t* activation,
+    const uint16_t* weight, float* output, int columns, int64_t activation_pitch,
+    int64_t output_pitch) {
+    __shared__ uint16_t activation_tile[32];
+    __shared__ __align__(16) uint16_t weight_tile[128][34];
+    const int tid = threadIdx.x;
+    const int column_base = blockIdx.x * 128;
+    const int column = column_base + tid;
+    float accumulator = 0.0f;
+    for (int first = 0; first < 2560; first += 32) {
+        if (tid < 32) activation_tile[tid] = activation[blockIdx.y * activation_pitch + first + tid];
+        for (int index = tid; index < 512; index += 128) {
+            const int tile_column = index / 4;
+            const int position = (index % 4) * 8;
+            uint4 packed{};
+            if (column_base + tile_column < columns)
+                packed = *reinterpret_cast<const uint4*>(weight
+                    + int64_t(column_base + tile_column) * 2560 + first + position);
+            const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+            for (int word = 0; word < 4; ++word)
+                reinterpret_cast<uint32_t*>(weight_tile[tile_column])[position / 2 + word] = words[word];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int position = 0; position < 32; ++position) {
+            const float left = __uint_as_float(uint32_t(activation_tile[position]) << 16);
+            const float right = __uint_as_float(uint32_t(weight_tile[tid][position]) << 16);
+            accumulator = __fadd_rn(accumulator, __fmul_rn(left, right));
+        }
+        __syncthreads();
+    }
+    if (column < columns) output[blockIdx.y * output_pitch + column] = accumulator;
+}
+
 __global__ void gemm_joined_strict(const uint16_t* activation, const RadPlanesHeader* header,
                                     float* output, int columns, int reduction,
                                     int64_t activation_pitch, int64_t output_pitch,
@@ -644,6 +679,47 @@ __global__ void gemm_joined_strict(const uint16_t* activation, const RadPlanesHe
 
 /* Layout/relayout certify immutable weights. Corrupted GPU-only headers suppress writes;
  * without an asynchronous status ABI they cannot produce a synchronous host error. */
+__global__ __launch_bounds__(128) void logits_joined_staged_strict(const uint16_t* activation,
+    const RadPlanesHeader* header, float* output, int columns, int64_t activation_pitch,
+    int64_t output_pitch, int64_t available) {
+    if (r3d_head::header(header, columns, 2560, available) != RAD_OK) return;
+    const auto* entries = reinterpret_cast<const RadPlanesEntry*>(header + 1);
+    const auto* base = reinterpret_cast<const uint8_t*>(header);
+    if (uint64_t(header->bytes) > UINTPTR_MAX - reinterpret_cast<uintptr_t>(base)) return;
+    const auto& codes = entries[0];
+    const auto& scales = entries[1];
+    __shared__ float activation_tile[32];
+    __shared__ float weight_tile[128][34];
+    const int tid = threadIdx.x, first_column = blockIdx.x * 128;
+    float accumulator = 0;
+    for (int first = 0; first < 2560; first += 32) {
+        if (tid < 32) activation_tile[tid] = bf16_to_f32(activation[blockIdx.y * activation_pitch + first + tid]);
+        for (int index = tid; index < 128 * 32; index += 128) {
+            const int column = first_column + index / 32;
+            const int position = first + index % 32;
+            float value = 0;
+            if (column < columns) {
+                const uint8_t code = base[codes.offset + int64_t(column) * codes.row_bytes + position];
+                const int64_t scale_row = scales.block[0] ? column / scales.block[0] : 0;
+                const int64_t scale_column = scales.block[1] ? position / scales.block[1] : 0;
+                const uint8_t* address = base + scales.offset + scale_row * scales.row_bytes
+                    + scale_column * r3d_head::scale_bytes(scales.dtype);
+                const float multiplier = scales.dtype == RAD_F32 ? *reinterpret_cast<const float*>(address)
+                    : scales.dtype == RAD_BF16 ? bf16_to_f32(*reinterpret_cast<const uint16_t*>(address))
+                    : f16_to_f32(*reinterpret_cast<const uint16_t*>(address));
+                value = __fmul_rn(codes.dtype == RAD_I8 ? float(static_cast<int8_t>(code)) : e4m3_to_f32(code), multiplier);
+            }
+            weight_tile[index / 32][index % 32] = value;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int position = 0; position < 32; ++position)
+            accumulator = __fadd_rn(accumulator, __fmul_rn(activation_tile[position], weight_tile[tid][position]));
+        __syncthreads();
+    }
+    if (first_column + tid < columns) output[blockIdx.y * output_pitch + first_column + tid] = accumulator;
+}
+
 int joined_strict_run(const RadArgs* args, RadStream stream) {
     const RadTensor& activation = args->t[0];
     const RadTensor& weight = args->t[1];
@@ -712,6 +788,13 @@ int joined_strict_run(const RadArgs* args, RadStream stream) {
         if (status != RAD_OK) return status;
     }
     const dim3 grid((columns + 127) / 128, activation.shape[0]);
+    const char* staged = std::getenv("RAD_LOGITS_STAGED");
+    if (reduction == 2560 && activation.shape[0] <= 16 && staged && std::strcmp(staged, "0") != 0) {
+        R3D_KLAUNCH(R3D_KNAME(logits_joined_staged_strict), grid, dim3(128), reinterpret_cast<hipStream_t>(stream),
+            static_cast<const uint16_t*>(activation.data), static_cast<const RadPlanesHeader*>(weight.data),
+            static_cast<float*>(output.data), int(columns), activation.stride[0], output.stride[0], available);
+        return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    }
     R3D_KLAUNCH(R3D_KNAME(gemm_joined_strict), grid, dim3(128), reinterpret_cast<hipStream_t>(stream),
                 static_cast<const uint16_t*>(activation.data),
                 static_cast<const RadPlanesHeader*>(weight.data), static_cast<float*>(output.data),
@@ -757,6 +840,14 @@ int rad_gemm_run(const RadArgs* a, RadStream s, int y_is_f32, const char* nkey, 
 
     {
         const dim3 grid((N + 127) / 128, M);
+        const char* staged = std::getenv("RAD_LOGITS_STAGED");
+        if (y_is_f32 && K == 2560 && M <= 16 && staged && std::strcmp(staged, "0") != 0) {
+            R3D_KLAUNCH(R3D_KNAME(logits_staged_strict), grid, dim3(128),
+                reinterpret_cast<hipStream_t>(s), static_cast<const uint16_t*>(x->data),
+                static_cast<const uint16_t*>(w->data), static_cast<float*>(y->data),
+                int(N), int64_t(x_pitch), int64_t(y_pitch));
+            return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+        }
         if (y_is_f32)
             R3D_KLAUNCH(R3D_KNAME((gemm_plain_strict<true>)), grid, dim3(128),
                         reinterpret_cast<hipStream_t>(s),

@@ -1,6 +1,7 @@
 #include <hip/hip_runtime.h>
 #include "r3dh_i8.h"
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #ifdef __FAST_MATH__
 #error r3dh_i8 requires strict floating point compilation
@@ -46,6 +47,49 @@ __global__ void wave_gemm(const int8_t* activation, const float* activation_scal
     }
     if (lane == 0 && column < columns && row < rows)
         output[row * output_pitch + column] = narrow(accumulator);
+}
+template<int Count, int Mask>
+__device__ __forceinline__ void halve_columns(int (&values)[16], int lane) {
+    const bool high = (lane & Mask) != 0;
+#pragma unroll
+    for (int index = 0; index < Count / 2; ++index) {
+        const int low = values[index], upper = values[index + Count / 2];
+        values[index] = (high ? upper : low) + __shfl_xor(high ? low : upper, Mask, 32);
+    }
+}
+__global__ __launch_bounds__(128) void dot4_gemv(const int8_t* activation, const float* activation_scale,
+    const int8_t* weight, const float* scale, uint16_t* output,
+    int reduction, int64_t activation_pitch, int64_t scale_pitch, int64_t output_pitch) {
+    __shared__ uint32_t cached_activation[4096];
+    __shared__ float cached_scale[128];
+    const int tid = threadIdx.x, lane = tid & 31;
+    const int row = blockIdx.y, groups = reduction / 128;
+    const int first = blockIdx.x * 64 + (tid / 32) * 16;
+    for (int index = tid; index < reduction / 4; index += 128)
+        cached_activation[index] = reinterpret_cast<const uint32_t*>(activation + row * activation_pitch)[index];
+    for (int index = tid; index < groups; index += 128)
+        cached_scale[index] = activation_scale[row * scale_pitch + index];
+    __syncthreads();
+    float accumulator = 0;
+    for (int group = 0; group < groups; ++group) {
+        const int input = int(cached_activation[group * 32 + lane]);
+        int sums[16];
+#pragma unroll
+        for (int index = 0; index < 16; ++index) {
+            const int64_t offset = (((int64_t(first / 16) * groups + group) * 8
+                + lane / 4) * 16 + index) * 16 + (lane % 4) * 4;
+            const int packed = *reinterpret_cast<const int*>(weight + offset);
+            sums[index] = __builtin_amdgcn_sudot4(true, packed, true, input, 0, false);
+        }
+        halve_columns<16, 16>(sums, lane);
+        halve_columns<8, 8>(sums, lane);
+        halve_columns<4, 4>(sums, lane);
+        halve_columns<2, 2>(sums, lane);
+        const int subtotal = sums[0] + __shfl_xor(sums[0], 1, 32);
+        const float scaled = float(subtotal) * cached_scale[group];
+        accumulator = accumulator + scaled * scale[int64_t(first + lane / 2) * groups + group];
+    }
+    if ((lane & 1) == 0) output[row * output_pitch + first + lane / 2] = narrow(accumulator);
 }
 __global__ void wmma_gemm(const int8_t* activation, const float* activation_scale,
     const int8_t* weight, const float* scale, uint16_t* output,
@@ -128,6 +172,15 @@ extern "C" int r3dh_i8_rad_gemm_nt_q(const RadArgs* arguments, RadStream stream)
         || reinterpret_cast<uintptr_t>(tensor[2].data) % 4) return RAD_E_STRIDE;
     const dim3 grid(rows <= 2 ? columns / 4 : columns / 16, rows <= 2 ? rows : (rows + 15) / 16);
     const auto native_stream = reinterpret_cast<hipStream_t>(stream);
+    const char* dot4 = std::getenv("RAD_I8_DOT4");
+    if (rows <= 2 && reduction <= 16384 && dot4 && std::strcmp(dot4, "0") != 0) {
+        dot4_gemv<<<dim3(columns / 64, rows), dim3(128), 0, native_stream>>>(
+            static_cast<const int8_t*>(tensor[0].data), static_cast<const float*>(tensor[1].data),
+            static_cast<const int8_t*>(tensor[2].data), static_cast<const float*>(tensor[3].data),
+            static_cast<uint16_t*>(tensor[4].data), reduction,
+            tensor[0].stride[0], tensor[1].stride[0], tensor[4].stride[0]);
+        return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    }
     if (rows <= 2)
         wave_gemm<<<grid, dim3(128), 0, native_stream>>>(
             static_cast<const int8_t*>(tensor[0].data), static_cast<const float*>(tensor[1].data),

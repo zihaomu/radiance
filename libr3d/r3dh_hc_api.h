@@ -10,6 +10,7 @@ struct R3dhHcTrace {
 
 extern "C" {
 int r3dh_hc_rad_hc_read_strict(const RadArgs*, RadStream);
+int r3dh_hc_rad_hc_read_profile(const RadArgs*, RadStream, float*);
 int r3dh_hc_rad_hc_read_strict_trace(const RadArgs*, RadStream, const R3dhHcTrace*);
 int64_t r3dh_hc_rad_hc_read_strict_scratch(const RadArgs*);
 int r3dh_hc_rad_hc_read_fast(const RadArgs*, RadStream);

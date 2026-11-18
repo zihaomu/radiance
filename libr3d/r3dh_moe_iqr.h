@@ -44,6 +44,7 @@ R3DH_MOE_IQR_HD inline uint32_t state(const uint8_t* codes, int columns, int row
 int config(const RadParam* params, int count, Config* output);
 }
 extern "C" {
+int64_t r3dh_moe_iqr_scratch(const RadArgs* arguments);
 int r3dh_moe_iqr_shape(const RadParam* params, int count, int operand,
     RadOpdDesc* output);
 int r3dh_moe_iqr_layout(const RadParam* params, int count, int operand,

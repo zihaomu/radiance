@@ -353,6 +353,7 @@ RadKernelInfo moe_kernel(const char* name, const RadConstraint* constraints, int
     RadKernelInfo result = kernel(name, "moe_gemm_q", "moe", constraints, count,
         nonlinear ? r3dh_moe_w4nl_launch : r3dh_moe_iqr_launch,
         nonlinear ? r3dh_moe_w4nl_shape : r3dh_moe_iqr_shape);
+    if (!nonlinear) result.scratch = r3dh_moe_iqr_scratch;
     result.layout = nonlinear ? r3dh_moe_w4nl_layout : r3dh_moe_iqr_layout;
     result.relayout = nonlinear ? r3dh_moe_w4nl_transform : r3dh_moe_iqr_relayout;
     result.unrelayout = nonlinear ? r3dh_moe_w4nl_inverse : r3dh_moe_iqr_unrelayout;

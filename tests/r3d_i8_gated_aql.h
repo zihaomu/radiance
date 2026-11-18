@@ -68,6 +68,7 @@ TEST(r3d_i8_gated_normal_device_coverage) {
         REQUIRE_EQ(rad_gate_reference_kernels(program, false, "strict normal MTP coverage test"), RAD_OK);
         uint64_t device_bands = 0, host_bands = 0, retired = 0, missing = 0, gated = 0;
         uint64_t strict_coarse = 0, strict_rerank = 0, strict_merge = 0;
+        bool dense_reported = false;
         for (size_t index = 1; index < program.ops.size(); ++index) {
             const auto& operation = program.ops[index];
             if (operation.optional_retired) { ++retired; continue; }
@@ -76,6 +77,12 @@ TEST(r3d_i8_gated_normal_device_coverage) {
                 const auto* row = band.dom[RAD_DOMAIN_DEVICE].row;
                 if (row && row->info && row->info->domain == RAD_DOMAIN_DEVICE && !row->reference) {
                     ++device_bands;
+                    if (!dense_reported && std::getenv("RAD_TRACE_DENSE_SELECTION")
+                        && operation.op == "gemm_nt_q" && operation.base.str().find("8192") != std::string::npos) {
+                        std::printf("DENSE_SELECTED mtp=%d rank=%d kernel=%s geometry=%s\n",
+                            mtp, rank, row->info->name, operation.base.str().c_str());
+                        dense_reported = true;
+                    }
                     if (operation.op == "gemm_nt_q" && operation.base.str().find("w2a8") != std::string::npos) {
                         REQUIRE_EQ(std::strcmp(row->info->name, "gemm_nt_q_w2a8_head_strict"), 0);
                         ++strict_coarse;

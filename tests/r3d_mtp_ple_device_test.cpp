@@ -4,6 +4,7 @@
 #include "rad_plugin.h"
 #include "device/device.h"
 #include "../libr3d/r3dh_i8.h"
+#include "../libr3d/r3dh_hc_api.h"
 #include <cfenv>
 #include <limits>
 #include <dlfcn.h>
@@ -498,6 +499,286 @@ TEST(r3d_bf16_actual_aql_device_and_vmem_gemm) {
 
 TEST(r3d_bf16_actual_aql_device_and_vmem_gemm_dense_exact) {
     r3d_bf16_aql_gemm(true);
+}
+
+TEST(r3d_i8_quick_dot4_exact_bench) {
+    if (!std::getenv("RAD_I8_BENCH")) SKIP("optional dense int8 decode benchmark");
+    Library native("libr3d");
+    auto launch = reinterpret_cast<int (*)(const RadArgs*, RadStream)>(dlsym(native.handle, "r3dh_i8_rad_gemm_nt_q"));
+    REQUIRE(launch);
+    Queue queue(0);
+    const char* previous = std::getenv("RAD_I8_DOT4");
+    const bool present = previous != nullptr;
+    const std::string saved = previous ? previous : "";
+    constexpr int columns = 2560;
+    for (int reduction : {2560, 10240}) {
+        const int groups = reduction / 128;
+        Buffer weight(RAD_I8, {columns, reduction}, RAD_MEM_DEVICE);
+        Buffer weight_scale(RAD_F32, {columns, groups}, RAD_MEM_DEVICE);
+        for (int column = 0; column < columns; ++column) {
+            for (int position = 0; position < reduction; ++position)
+                weight.data<int8_t>()[r3dh_i8::packed_index(column, position, reduction)]
+                    = int8_t(int((uint32_t(column * 3571 + position) * 2654435761u) % 256) - 128);
+            for (int group = 0; group < groups; ++group)
+                weight_scale.data<float>()[column * groups + group] = float((column + group) % 17 + 1) / 8192.0f;
+        }
+        weight.push(queue.stream); weight_scale.push(queue.stream);
+        for (int rows : {1, 2, 4}) {
+            Buffer activation(RAD_I8, {rows, reduction}, RAD_MEM_DEVICE, reduction + 16);
+            Buffer activation_scale(RAD_F32, {rows, groups}, RAD_MEM_DEVICE, groups + 4);
+            Buffer output(RAD_BF16, {rows, columns}, RAD_MEM_DEVICE, columns + 16);
+            for (int row = 0; row < rows; ++row) {
+                for (int position = 0; position < reduction; ++position)
+                    activation.data<int8_t>()[row * (reduction + 16) + position]
+                        = int8_t(int((uint32_t(row * 71 + position) * 2246822519u) % 256) - 128);
+                for (int group = 0; group < groups; ++group)
+                    activation_scale.data<float>()[row * (groups + 4) + group] = float((row + group) % 13 + 1) / 4096.0f;
+            }
+            activation.push(queue.stream); activation_scale.push(queue.stream); output.push(queue.stream);
+            RadTensor tensors[]{activation.device, activation_scale.device, weight.device, weight_scale.device, output.device};
+            tensors[2].dtype = r3dh_i8::weight_dtype; tensors[3].dtype = r3dh_i8::scale_dtype;
+            RadParam params[]{RAD_INT("M", 16), RAD_INT("N", columns), RAD_INT("K", reduction),
+                RAD_INT("group", 128), RAD_STR("dtype", "i8a8h")};
+            RadArgs args{}; args.t = tensors; args.n_t = 5; args.p = params; args.n_p = 5;
+            std::vector<uint8_t> baseline;
+            float timings[2]{};
+            for (int variant = 0; variant < 2; ++variant) {
+                setenv("RAD_I8_DOT4", variant ? "1" : "0", 1);
+                REQUIRE_EQ(launch(&args, queue.stream), RAD_OK);
+                auto actual = output.read(queue.stream);
+                if (variant) CHECK(actual == baseline); else baseline = std::move(actual);
+                RadEvent start{}, finish{};
+                REQUIRE_EQ(rad_event_create(&start), RAD_OK); REQUIRE_EQ(rad_event_create(&finish), RAD_OK);
+                for (int repeat = 0; repeat < 3; ++repeat) REQUIRE_EQ(launch(&args, queue.stream), RAD_OK);
+                REQUIRE_EQ(rad_event_record(start, queue.stream), RAD_OK);
+                for (int repeat = 0; repeat < 20; ++repeat) REQUIRE_EQ(launch(&args, queue.stream), RAD_OK);
+                REQUIRE_EQ(rad_event_record(finish, queue.stream), RAD_OK); REQUIRE_EQ(rad_event_sync(finish), RAD_OK);
+                REQUIRE_EQ(rad_event_elapsed_ms(start, finish, &timings[variant]), RAD_OK);
+                rad_event_destroy(start); rad_event_destroy(finish);
+            }
+            std::printf("I8_DOT4_BENCH M=%d N=%d K=%d baseline_us=%.3f dot4_us=%.3f speedup=%.3f exact=1\n",
+                rows, columns, reduction, timings[0] * 50.0f, timings[1] * 50.0f, timings[0] / timings[1]);
+        }
+    }
+    if (present) setenv("RAD_I8_DOT4", saved.c_str(), 1); else unsetenv("RAD_I8_DOT4");
+}
+
+TEST(r3d_hc_quick_wmma_candidate) {
+    const bool norm_parallel = std::getenv("RAD_HC_NORM_BENCH") != nullptr;
+    const bool exact_tile = std::getenv("RAD_HC_EXACT_BENCH") != nullptr;
+    if (!std::getenv("RAD_HC_BENCH") && !exact_tile && !norm_parallel) SKIP("optional HC matrix candidate");
+    const char* switch_name = norm_parallel ? "RAD_HC_NORM_PARALLEL"
+        : exact_tile ? "RAD_HC_EXACT_TILE" : "RAD_HC_WMMA";
+    Library native("libr3d");
+    using Launch = int (*)(const RadArgs*, RadStream, const R3dhHcTrace*);
+    auto launch = reinterpret_cast<Launch>(dlsym(native.handle, "r3dh_hc_rad_hc_read_strict_trace"));
+    auto plain = reinterpret_cast<int (*)(const RadArgs*, RadStream)>(dlsym(native.handle, "r3dh_hc_rad_hc_read_strict"));
+    auto scratch_size = reinterpret_cast<int64_t (*)(const RadArgs*)>(dlsym(native.handle, "r3dh_hc_rad_hc_read_strict_scratch"));
+    REQUIRE(launch && plain && scratch_size);
+    auto profile = reinterpret_cast<int (*)(const RadArgs*, RadStream, float*)>(dlsym(native.handle, "r3dh_hc_rad_hc_read_profile"));
+    Queue queue(0);
+    Buffer down(RAD_F8E4M3, {320, 10560}, RAD_MEM_DEVICE);
+    Buffer up(RAD_F8E4M3, {10240, 336}, RAD_MEM_DEVICE);
+    for (Buffer* matrix : {&down, &up}) {
+        const int depth = matrix == &down ? 10240 : 320;
+        const int group = matrix == &down ? 128 : 80;
+        for (int row = 0; row < matrix->host.shape[0]; ++row) {
+            uint8_t* line = matrix->data<uint8_t>() + row * matrix->host.stride[0];
+            for (int position = 0; position < depth; ++position) {
+                const uint32_t hash = uint32_t(row * 3571 + position) * 2654435761u;
+                line[position] = uint8_t(24 + (hash % 80)) | uint8_t((hash >> 17) & 128);
+            }
+            for (int block = 0; block < depth / group; ++block) {
+                const float scale = (1.0f + float((row * 13 + block) % 17) / 32.0f) * 0x1p-10f;
+                std::memcpy(line + depth + block * 4, &scale, 4);
+            }
+        }
+        matrix->push(queue.stream);
+    }
+    const char* previous = std::getenv(switch_name);
+    const bool present = previous != nullptr;
+    const std::string saved = previous ? previous : "";
+    for (int pattern = 0; pattern < (norm_parallel ? 9 : 1); ++pattern)
+    for (int rows : {1, 4, 16}) {
+        Buffer hidden(RAD_BF16, {rows, 10240}, RAD_MEM_DEVICE);
+        Buffer gain(RAD_F32, {10240}, RAD_MEM_DEVICE);
+        Buffer output(RAD_BF16, {rows, 2560}, RAD_MEM_DEVICE);
+        Buffer traced_down(RAD_BF16, {rows, 320}, RAD_MEM_DEVICE);
+        Buffer traced_logits(RAD_F32, {rows, 10240}, RAD_MEM_DEVICE);
+        Buffer traced_gates(RAD_BF16, {rows, 10240}, RAD_MEM_DEVICE);
+        Buffer inject_weights(RAD_BF16, {4, 10240}, RAD_MEM_DEVICE);
+        Buffer inject_output(RAD_BF16, {rows, 4}, RAD_MEM_DEVICE);
+        Buffer quantized(RAD_I8, {rows, 2560}, RAD_MEM_DEVICE);
+        Buffer quant_scales(RAD_F32, {rows, 20}, RAD_MEM_DEVICE);
+        Buffer rotated(RAD_I8, {rows, 2560}, RAD_MEM_DEVICE);
+        Buffer rotated_scales(RAD_F32, {rows, 20}, RAD_MEM_DEVICE);
+        for (int index = 0; index < rows * 10240; ++index)
+            hidden.data<uint16_t>()[index] = uint16_t(0x3e00u | ((uint32_t(index) * 2246822519u) & 0x83ffu));
+        if (pattern) {
+            for (int index = 0; index < rows * 10240; ++index) {
+                const uint16_t sign = index & 1 ? 0x8000 : 0;
+                int exponent = pattern == 1 ? 120 + index % 13
+                    : pattern == 2 ? 120 + index % 14
+                    : pattern == 3 ? index % 14 : index % 2 ? 100 : 150;
+                uint16_t bits = sign | uint16_t(exponent << 7) | uint16_t((index * 37) & 127);
+                if (pattern == 5) bits = sign;
+                if (pattern == 6 && index % 2560 == 0) bits = 0x7f80;
+                if (pattern == 6 && index % 2560 == 1) bits = 0x7fc1;
+                if (pattern >= 7) {
+                    const int position = index % 2560;
+                    bits = position < 5 ? 0x3f80 : position < 10 ? 0x3980 : 0;
+                    if (position == 10) bits = pattern == 7 ? 0x2b80 : 0x3780;
+                }
+                hidden.data<uint16_t>()[index] = bits;
+            }
+        }
+        for (int index = 0; index < 10240; ++index) gain.data<float>()[index] = 0.75f + float(index % 17) / 32.0f;
+        for (int index = 0; index < 40960; ++index)
+            inject_weights.data<uint16_t>()[index] = uint16_t(0x3900u | ((uint32_t(index) * 37u) & 0x807fu));
+        for (Buffer* buffer : {&hidden, &gain, &output, &traced_down, &traced_logits, &traced_gates,
+                &inject_weights, &inject_output, &quantized, &quant_scales, &rotated, &rotated_scales})
+            buffer->push(queue.stream);
+        RadTensor tensors[11]{};
+        tensors[0] = hidden.device; tensors[1] = gain.device;
+        tensors[2] = down.device; tensors[2].shape[1] = 10240; tensors[2].stride[0] = 10240;
+        tensors[3] = up.device; tensors[3].shape[1] = 320; tensors[3].stride[0] = 320;
+        tensors[5] = output.device;
+        tensors[4] = inject_weights.device; tensors[6] = inject_output.device;
+        tensors[7] = quantized.device; tensors[8] = quant_scales.device;
+        tensors[9] = rotated.device; tensors[10] = rotated_scales.device;
+        RadParam params[]{RAD_INT("M", 16), RAD_INT("n", 2560), RAD_INT("hc", 4),
+            RAD_INT("lowrank", 320), RAD_STR("dtype", "bf16"), RAD_STR("mix", "e4m3"),
+            RAD_INT("inject", 1), RAD_INT("group", 128), RAD_INT("rotate", 1)};
+        RadArgs args{}; args.t = tensors; args.n_t = 11; args.p = params; args.n_p = 9;
+        const int64_t bytes = scratch_size(&args);
+        REQUIRE(bytes > 0);
+        Buffer scratch(RAD_I8, {bytes}, RAD_MEM_DEVICE);
+        args.scratch = scratch.allocation; args.scratch_bytes = bytes;
+        R3dhHcTrace trace{static_cast<uint16_t*>(traced_down.device.data), static_cast<float*>(traced_logits.device.data),
+            static_cast<uint16_t*>(traced_gates.device.data), rows, 2560, 4, 320};
+        float timings[2]{};
+        std::vector<std::vector<uint8_t>> baseline;
+        std::vector<uint8_t> normalized_baseline;
+        for (int variant = 0; variant < 2; ++variant) {
+            setenv(switch_name, variant ? "1" : "0", 1);
+            REQUIRE_EQ(launch(&args, queue.stream, &trace), RAD_OK);
+            if (norm_parallel) {
+                auto actual = scratch.read(queue.stream);
+                actual.resize(size_t(rows) * 10240 * 2);
+                if (variant) CHECK(actual == normalized_baseline); else normalized_baseline = std::move(actual);
+            }
+            if (!pattern && (!variant || norm_parallel) && std::getenv("RAD_HC_STAGE_BENCH")) {
+                REQUIRE(profile);
+                float stages[6]{};
+                REQUIRE_EQ(profile(&args, queue.stream, stages), RAD_OK);
+                std::printf("HC_STAGES M=%d variant=%d norm_us=%.3f down_us=%.3f up_us=%.3f mix_us=%.3f inject_us=%.3f quant_us=%.3f\n",
+                    rows, variant, stages[0], stages[1], stages[2], stages[3], stages[4], stages[5]);
+            }
+            int stage = 0;
+            for (Buffer* buffer : {&traced_down, &traced_logits, &traced_gates, &output,
+                    &inject_output, &quantized, &quant_scales, &rotated, &rotated_scales}) {
+                auto actual = buffer->read(queue.stream);
+                const int element_bytes = buffer->host.dtype == RAD_F32 ? 4 : buffer->host.dtype == RAD_I8 ? 1 : 2;
+                const size_t end = 64 + size_t(buffer->host.shape[0] * buffer->host.shape[1]) * element_bytes;
+                CHECK(std::equal(actual.begin(), actual.begin() + 64, buffer->expected.begin()));
+                CHECK(std::equal(actual.begin() + end, actual.end(), buffer->expected.begin() + end));
+                if (!variant) baseline.push_back(actual);
+                else {
+                    if (exact_tile || norm_parallel) CHECK(actual == baseline[stage]);
+                    float maximum = 0, reference_max = 0;
+                    const int elements = int(buffer->host.shape[0] * buffer->host.shape[1]);
+                    for (int index = 0; index < elements; ++index) {
+                        float value = 0, expected = 0;
+                        if (buffer->host.dtype == RAD_I8) {
+                            value = float(int8_t(actual[64 + index]));
+                            expected = float(int8_t(baseline[stage][64 + index]));
+                        } else if (buffer->host.dtype == RAD_F32) {
+                            std::memcpy(&value, actual.data() + 64 + index * 4, 4);
+                            std::memcpy(&expected, baseline[stage].data() + 64 + index * 4, 4);
+                        } else {
+                            uint16_t bits = 0; uint32_t wide_bits = 0;
+                            std::memcpy(&bits, actual.data() + 64 + index * 2, 2);
+                            wide_bits = uint32_t(bits) << 16; std::memcpy(&value, &wide_bits, 4);
+                            std::memcpy(&bits, baseline[stage].data() + 64 + index * 2, 2);
+                            wide_bits = uint32_t(bits) << 16; std::memcpy(&expected, &wide_bits, 4);
+                        }
+                        if (norm_parallel && pattern == 6 && !std::isfinite(expected)) continue;
+                        REQUIRE(std::isfinite(value));
+                        maximum = std::max(maximum, std::abs(value - expected));
+                        reference_max = std::max(reference_max, std::abs(expected));
+                    }
+                    std::printf("HC_ERROR M=%d pattern=%d stage=%d max_abs=%g peak_relative=%g\n", rows, pattern, stage, maximum,
+                        maximum / std::max(reference_max, 1e-8f));
+                    CHECK(maximum <= 0.02f * std::max(reference_max, 1e-4f));
+                }
+                ++stage;
+            }
+            RadEvent start{}, finish{};
+            REQUIRE_EQ(rad_event_create(&start), RAD_OK); REQUIRE_EQ(rad_event_create(&finish), RAD_OK);
+            for (int repeat = 0; repeat < 3; ++repeat) REQUIRE_EQ(plain(&args, queue.stream), RAD_OK);
+            REQUIRE_EQ(rad_event_record(start, queue.stream), RAD_OK);
+            for (int repeat = 0; repeat < (pattern ? 1 : 20); ++repeat) REQUIRE_EQ(plain(&args, queue.stream), RAD_OK);
+            REQUIRE_EQ(rad_event_record(finish, queue.stream), RAD_OK); REQUIRE_EQ(rad_event_sync(finish), RAD_OK);
+            REQUIRE_EQ(rad_event_elapsed_ms(start, finish, &timings[variant]), RAD_OK);
+            rad_event_destroy(start); rad_event_destroy(finish);
+        }
+        if (pattern) std::printf("HC_NORM_BOUNDARY M=%d pattern=%d exact=1\n", rows, pattern);
+        else std::printf("HC_%s_BENCH M=%d strict_us=%.3f candidate_us=%.3f speedup=%.3f exact=%d\n",
+            norm_parallel ? "NORM_PARALLEL" : exact_tile ? "EXACT_TILE" : "WMMA", rows,
+            timings[0] * 50.0f, timings[1] * 50.0f, timings[0] / timings[1], int(exact_tile || norm_parallel));
+    }
+    if (present) setenv(switch_name, saved.c_str(), 1); else unsetenv(switch_name);
+}
+
+TEST(r3d_logits_quick_staged_exact_bench) {
+    if (!std::getenv("RAD_LOGITS_BENCH")) SKIP("optional actual-shard logits benchmark");
+    Library native("libr3d");
+    using Launch = int (*)(const RadArgs*, RadStream);
+    auto launch = reinterpret_cast<Launch>(dlsym(native.handle, "r3d_rad_logits_gemm_bf16"));
+    REQUIRE(launch);
+    Queue queue(0);
+    constexpr int columns = 124160, inner = 2560;
+    Buffer weight(RAD_BF16, {columns, inner}, RAD_MEM_DEVICE);
+    for (int64_t index = 0; index < int64_t(columns) * inner; ++index)
+        weight.data<uint16_t>()[index] = uint16_t(0x3c00u | ((uint32_t(index) * 2654435761u) & 0x83ffu));
+    weight.push(queue.stream);
+    const char* previous = std::getenv("RAD_LOGITS_STAGED");
+    const bool present = previous != nullptr;
+    const std::string saved = previous ? previous : "";
+    for (int rows : {1, 4, 16}) {
+        Buffer activation(RAD_BF16, {rows, inner}, RAD_MEM_DEVICE, inner + 16);
+        Buffer output(RAD_F32, {rows, columns}, RAD_MEM_DEVICE, columns + 8);
+        for (int row = 0; row < rows; ++row)
+            for (int index = 0; index < inner; ++index)
+                activation.data<uint16_t>()[row * (inner + 16) + index]
+                    = uint16_t(0x3d00u | ((uint32_t(index + row * 3571) * 2246822519u) & 0x83ffu));
+        activation.push(queue.stream);
+        output.push(queue.stream);
+        RadTensor tensors[]{activation.device, weight.device, output.device};
+        std::vector<RadParam> params{integer("M", 16), integer("n_vocab", columns), integer("n_embd", inner)};
+        RadArgs args{}; args.t = tensors; args.n_t = 3; args.p = params.data(); args.n_p = params.size();
+        std::vector<uint8_t> expected;
+        float timings[2]{};
+        for (int variant = 0; variant < 2; ++variant) {
+            REQUIRE_EQ(setenv("RAD_LOGITS_STAGED", variant ? "1" : "0", 1), 0);
+            REQUIRE_EQ(launch(&args, queue.stream), RAD_OK);
+            auto actual = output.read(queue.stream);
+            if (variant) CHECK(actual == expected); else expected = std::move(actual);
+            RadEvent start{}, finish{};
+            REQUIRE_EQ(rad_event_create(&start), RAD_OK);
+            REQUIRE_EQ(rad_event_create(&finish), RAD_OK);
+            for (int warmup = 0; warmup < 3; ++warmup) REQUIRE_EQ(launch(&args, queue.stream), RAD_OK);
+            REQUIRE_EQ(rad_event_record(start, queue.stream), RAD_OK);
+            for (int repeat = 0; repeat < 20; ++repeat) REQUIRE_EQ(launch(&args, queue.stream), RAD_OK);
+            REQUIRE_EQ(rad_event_record(finish, queue.stream), RAD_OK);
+            REQUIRE_EQ(rad_event_sync(finish), RAD_OK);
+            REQUIRE_EQ(rad_event_elapsed_ms(start, finish, &timings[variant]), RAD_OK);
+            rad_event_destroy(start); rad_event_destroy(finish);
+        }
+        std::printf("LOGITS_STAGED_BENCH M=%d N=%d K=%d strict_us=%.3f staged_us=%.3f speedup=%.3f exact=1\n",
+            rows, columns, inner, timings[0] * 50.0f, timings[1] * 50.0f, timings[0] / timings[1]);
+    }
+    if (present) setenv("RAD_LOGITS_STAGED", saved.c_str(), 1); else unsetenv("RAD_LOGITS_STAGED");
 }
 
 TEST(r3d_router_actual_aql_ragged_band) {

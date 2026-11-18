@@ -190,7 +190,9 @@ void chain(Model& model, Library& library, int layer, int rank, RadStream stream
         tables[parity * 4 + 2] = std::make_unique<Table>(weight.down, experts / 2, stream);
         tables[parity * 4 + 3] = std::make_unique<Table>(weight.down_scale, experts / 2, stream);
     }
-    for (int tokens : {1, 3, 63, 64}) {
+    for (int tokens : {1, 3, 4, 16, 63, 64, 2048}) {
+        if (std::getenv("RAD_IQR_QUICK") && tokens != 1 && tokens != 4 && tokens != 16 && tokens != 64) continue;
+        const int band = std::max(tokens, 64);
         const int rows = tokens * 10;
         Buffer input(RAD_I8, {tokens + 2, 2560}, RAD_MEM_DEVICE, 2573);
         Buffer scale(RAD_F32, {tokens + 2, 20}, RAD_MEM_DEVICE, 25);
@@ -214,7 +216,7 @@ void chain(Model& model, Library& library, int layer, int rank, RadStream stream
             for (int row = 0; row < rows; ++row) sorted.data<int32_t>()[row] = row < 8 ? (row * 37 + step * 19) % rows : -1;
             sorted.data<int32_t>()[1] = -1; sorted.data<int32_t>()[6] = rows + 1;
             for (Buffer* buffer : {&input, &scale, &sorted, &output, &codes, &factors, &result}) buffer->push(stream);
-            std::vector<RadParam> gate_params{RAD_INT("M", 64), RAD_INT("N", weights[0].width), RAD_INT("N_odd", weights[1].width),
+            std::vector<RadParam> gate_params{RAD_INT("M", band), RAD_INT("N", weights[0].width), RAD_INT("N_odd", weights[1].width),
                 RAD_INT("K", 2560), RAD_INT("K_odd", 2560), RAD_INT("n_expert", experts), RAD_INT("top_k", 10),
                 RAD_INT("group", 128), RAD_INT("a_group", 128), RAD_INT("parts", 2), RAD_STR("dtype", "i8a8h"), RAD_STR("a_order", "token")};
             std::array<RadTensor, 9> tensors{live(input, tokens), live(scale, tokens), {}, {}, sorted.device, offsets.device, {}, {}, live(output, rows)};
@@ -246,12 +248,40 @@ void chain(Model& model, Library& library, int layer, int rank, RadStream stream
                 output.data<uint16_t>()[row * 781 + column] = expected;
             }
             moe_boundary::ensure(output.read(stream) == output.expected); compared += uint64_t(rows) * 768;
+            moe_boundary::ensure(gate->scratch);
+            const int64_t scratch_bytes = gate->scratch(&args);
+            moe_boundary::ensure(scratch_bytes > 0);
+            Buffer scratch(RAD_I32, {(scratch_bytes + 3) / 4}, RAD_MEM_DEVICE);
+            scratch.push(stream);
+            const auto expected_gate = output.expected;
+            auto poison_gate = [&] {
+                std::fill(output.expected.begin(), output.expected.end(), 0x5a);
+                output.push(stream);
+                std::copy(expected_gate.begin(), expected_gate.end(), output.expected.begin());
+            };
+            poison_gate();
+            args.scratch = scratch.device.data;
+            args.scratch_bytes = scratch_bytes;
+            moe_boundary::ensure_equal(gate->launch(&args, stream), RAD_OK); ++launches;
+            moe_boundary::ensure(output.read(stream) == expected_gate); compared += uint64_t(rows) * 768;
+            const auto scratch_actual = scratch.read(stream);
+            for (size_t index = 0; index < scratch_actual.size(); ++index)
+                if (index < 64 || index >= 64 + size_t(scratch_bytes))
+                    moe_boundary::ensure_equal(scratch_actual[index], uint8_t(0x5a));
+            poison_gate();
+            const int64_t live_scratch_bytes = int64_t(std::min(rows, experts) + (rows + 63) / 64 + 1) * 8;
+            moe_boundary::ensure(scratch_bytes >= live_scratch_bytes);
+            args.scratch_bytes = live_scratch_bytes - 1;
+            moe_boundary::ensure_equal(gate->launch(&args, stream), RAD_OK); ++launches;
+            moe_boundary::ensure(output.read(stream) == expected_gate);
+            args.scratch = nullptr;
+            args.scratch_bytes = 0;
             std::array<RadTensor, 3> quant_tensors{live(output, rows), live(codes, rows), live(factors, rows)};
             std::vector<RadParam> quant_params{RAD_INT("M", rows), RAD_INT("n", 384), RAD_INT("group", 128), RAD_STR("dtype", "bf16"), RAD_STR("act", "silu")};
             RadArgs quant_args{}; quant_args.t = quant_tensors.data(); quant_args.n_t = 3; quant_args.p = quant_params.data(); quant_args.n_p = quant_params.size();
             moe_boundary::ensure_equal(quant->launch(&quant_args, stream), RAD_OK); ++launches;
             capture(codes, stream, rows, 384, 1); capture(factors, stream, rows, 3, 4);
-            std::vector<RadParam> down_params{RAD_INT("M", 64), RAD_INT("N", 2560), RAD_INT("N_odd", 2560),
+            std::vector<RadParam> down_params{RAD_INT("M", band), RAD_INT("N", 2560), RAD_INT("N_odd", 2560),
                 RAD_INT("K", weights[0].inner), RAD_INT("K_odd", weights[1].inner), RAD_INT("n_expert", experts), RAD_INT("top_k", 10),
                 RAD_INT("group", 128), RAD_INT("a_group", 128), RAD_INT("parts", 1), RAD_STR("dtype", "w4nl64a8i8h"), RAD_STR("a_order", "sorted")};
             auto down_tensors = tensors; down_tensors[0] = live(codes, rows); down_tensors[1] = live(factors, rows); down_tensors[8] = live(result, rows);
@@ -304,13 +334,65 @@ void chain(Model& model, Library& library, int layer, int rank, RadStream stream
                 invalid = call.t[3]; invalid.stride[1]++; reject(row, call, 3, invalid, RAD_E_STRIDE);
                 invalid = call.t[0]; invalid.shape[0]++; reject(row, call, 0, invalid, RAD_E_SHAPE);
                 auto* params = const_cast<RadParam*>(call.p); params[0].ival = 2049;
-                moe_boundary::ensure_equal(row->launch(&call, stream), RAD_E_SHAPE); ++rejects; params[0].ival = 64;
+                moe_boundary::ensure_equal(row->launch(&call, stream), RAD_E_SHAPE); ++rejects; params[0].ival = band;
                 params[6].ival = 11; moe_boundary::ensure_equal(row->launch(&call, stream), RAD_E_SHAPE); ++rejects; params[6].ival = 10;
             }
             moe_boundary::ensure(result.read(stream) == result.expected);
+            if (step == 1) {
+                for (int pattern = 0; pattern < 5; ++pattern) {
+                    for (int expert = 0; expert <= experts; ++expert)
+                        offsets.data<int32_t>()[expert] = pattern == 0 ? std::min(expert * 17, rows - 1)
+                            : pattern == 1 ? expert * rows / experts : pattern == 4 ? std::min(expert * 4, rows - 1)
+                            : pattern == 2 && expert == experts ? rows : 0;
+                    for (int row = 0; row < rows; ++row)
+                        sorted.data<int32_t>()[row] = row == 1 ? -1 : row == 6 ? rows + 1 : (row * 37) % rows;
+                    offsets.push(stream);
+                    sorted.push(stream);
+                    args.scratch = nullptr;
+                    args.scratch_bytes = 0;
+                    poison_gate();
+                    moe_boundary::ensure_equal(gate->launch(&args, stream), RAD_OK); ++launches;
+                    const auto reference = output.read(stream);
+                    poison_gate();
+                    args.scratch = scratch.device.data;
+                    args.scratch_bytes = scratch_bytes;
+                    moe_boundary::ensure_equal(gate->launch(&args, stream), RAD_OK); ++launches;
+                    moe_boundary::ensure(output.read(stream) == reference);
+                    compared += uint64_t(rows) * 768;
+                    const auto map_actual = scratch.read(stream);
+                    for (size_t index = 0; index < map_actual.size(); ++index)
+                        if (index < 64 || index >= 64 + size_t(scratch_bytes))
+                            moe_boundary::ensure_equal(map_actual[index], uint8_t(0x5a));
+                    if (std::getenv("RAD_IQR_BENCH")) {
+                        RadEvent start{}, finish{};
+                        moe_boundary::ensure_equal(rad_event_create(&start), RAD_OK);
+                        moe_boundary::ensure_equal(rad_event_create(&finish), RAD_OK);
+                        float milliseconds[2]{};
+                        for (int variant = 0; variant < 2; ++variant) {
+                            args.scratch = variant ? scratch.device.data : nullptr;
+                            args.scratch_bytes = variant ? scratch_bytes : 0;
+                            for (int warmup = 0; warmup < 3; ++warmup)
+                                moe_boundary::ensure_equal(gate->launch(&args, stream), RAD_OK);
+                            moe_boundary::ensure_equal(rad_event_record(start, stream), RAD_OK);
+                            for (int repeat = 0; repeat < 20; ++repeat)
+                                moe_boundary::ensure_equal(gate->launch(&args, stream), RAD_OK);
+                            moe_boundary::ensure_equal(rad_event_record(finish, stream), RAD_OK);
+                            moe_boundary::ensure_equal(rad_event_sync(finish), RAD_OK);
+                            moe_boundary::ensure_equal(rad_event_elapsed_ms(start, finish, &milliseconds[variant]), RAD_OK);
+                        }
+                        rad_event_destroy(start);
+                        rad_event_destroy(finish);
+                        std::printf("IQR_BENCH layer=%d rank=%d tokens=%d pattern=%d reference_us=%.3f mapped_us=%.3f speedup=%.3f\n",
+                            layer, rank, tokens, pattern, milliseconds[0] * 50.0f,
+                            milliseconds[1] * 50.0f, milliseconds[0] / milliseconds[1]);
+                    }
+                    args.scratch = nullptr;
+                    args.scratch_bytes = 0;
+                }
+            }
         }
-        std::printf("PASS MOE_BOUNDARY_AQL_CASE layer=%d rank=%d experts=%d entries=%d M=%d band=64 gate=%d/%d down=%d/%d inputs=2 views=physical,logical pitched=1 guards=1\n",
-            layer, rank, experts, experts / 2, tokens, weights[0].width, weights[1].width, weights[0].inner, weights[1].inner);
+        std::printf("PASS MOE_BOUNDARY_AQL_CASE layer=%d rank=%d experts=%d entries=%d M=%d band=%d gate=%d/%d down=%d/%d inputs=2 views=physical,logical pitched=1 guards=1\n",
+            layer, rank, experts, experts / 2, tokens, band, weights[0].width, weights[1].width, weights[0].inner, weights[1].inner);
         std::fflush(stdout);
     }
     for (auto& table : tables) {
@@ -333,7 +415,7 @@ TEST(r3d_moe_actual_aql_live_band_chain) {
     uint64_t launches = 0, rejects = 0, compared = 0;
     for (int layer : {0, 34, 44, 47}) for (int rank : {0, 1})
         moe_boundary::chain(model, library, layer, rank, rank ? second.stream : first.stream, launches, rejects, compared);
-    std::printf("PASS MOE_BOUNDARY_AQL fixtures=32 launches=%llu rejects=%llu exact_values=%llu queues=2 cpu_fallback=0\n",
+    std::printf("PASS MOE_BOUNDARY_AQL fixtures=40 launches=%llu rejects=%llu exact_values=%llu queues=2 cpu_fallback=0\n",
         (unsigned long long)launches, (unsigned long long)rejects, (unsigned long long)compared);
 }
 

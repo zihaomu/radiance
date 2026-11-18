@@ -1,5 +1,6 @@
 #include "r3dh_hc_api.h"
 #include "r3dh_hc_args.h"
+#include "rad_device.h"
 #include <hip/hip_runtime.h>
 #include <climits>
 
@@ -75,6 +76,66 @@ __global__ __launch_bounds__(256) void strict_norm(const uint16_t* hidden, const
 
 // MODE 0 is down (K=10240), MODE 1 is up (K=320). A block owns a tile of rows x outputs; each E4M3 weight
 // is decoded once per tile into LDS. Every output keeps one register accumulator fed in ascending k order.
+__global__ __launch_bounds__(256) void strict_norm_parallel(const uint16_t* hidden,
+    const float* weights, uint16_t* normalized, float eps, float wadd) {
+    __shared__ uint16_t staged[width];
+    __shared__ double partial[8];
+    __shared__ int minima[8], maxima[8];
+    __shared__ float factor;
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const int channel_stream = blockIdx.x, row = blockIdx.y;
+    const size_t base = size_t(row) * wide + channel_stream * width;
+    double squares = 0;
+    int lowest = 256, highest = 0;
+    for (int position = tid; position < width; position += 256) {
+        const uint16_t bits = hidden[base + position];
+        staged[position] = bits;
+        const double value = double(widen_bf16(bits));
+        squares += value * value;
+        if (bits & 0x7fffu) {
+            const int exponent = (bits >> 7) & 255;
+            const int effective = exponent ? exponent : 1;
+            lowest = min(lowest, effective);
+            highest = max(highest, effective);
+        }
+    }
+    for (int distance = 16; distance; distance >>= 1) {
+        squares += __shfl_xor(squares, distance, 32);
+        lowest = min(lowest, __shfl_xor(lowest, distance, 32));
+        highest = max(highest, __shfl_xor(highest, distance, 32));
+    }
+    if (lane == 0) {
+        partial[wave] = squares;
+        minima[wave] = lowest;
+        maxima[wave] = highest;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int first = 256, last = 0;
+        for (int index = 0; index < 8; ++index) {
+            first = min(first, minima[index]);
+            last = max(last, maxima[index]);
+        }
+        double sum = 0;
+        for (int index = 0; index < 8; ++index) sum += partial[index];
+        const float lower = float((sum * (1.0 - 0x1p-36)) / double(width));
+        const float upper = float((sum * (1.0 + 0x1p-36)) / double(width));
+        const bool certified = __float_as_uint(lower) == __float_as_uint(upper);
+        if (last > 254 || (last - first > 12 && !certified)) {
+            sum = 0;
+            for (int position = 0; position < width; ++position) {
+                const double value = double(widen_bf16(staged[position]));
+                sum += value * value;
+            }
+        }
+        factor = __fdiv_rn(1.0f, sqrtf(float(sum / double(width)) + eps));
+    }
+    __syncthreads();
+    for (int position = tid; position < width; position += 256)
+        normalized[base + position] = narrow_bf16((widen_bf16(staged[position]) * factor)
+            * (weights[channel_stream * width + position] + wadd));
+}
+
 template <int MODE, int KC, int NTN, int NTM, int RN, int RM>
 __global__ __launch_bounds__(NTN * NTM) void strict_tiled(const uint16_t* activations, const uint8_t* matrix,
                                                          int rows, uint16_t* result, uint16_t* trace_values,
@@ -184,6 +245,84 @@ __global__ __launch_bounds__(NTN * NTM) void strict_tiled(const uint16_t* activa
             }
         }
 }
+template<int Mode>
+__global__ __launch_bounds__(128) void decode_wmma(const uint16_t* activation,
+    const uint8_t* matrix, uint16_t* output, int rows, uint16_t* trace_values, float* trace_logits,
+    float* partials) {
+    constexpr bool down = Mode == 0;
+    constexpr int depth = down ? wide : rank, outputs = down ? rank : wide;
+    constexpr int group = down ? 128 : 80, pitch = down ? down_pitch : up_pitch;
+    constexpr int lds_pitch = group + 8;
+    using Bf16Fragment = __bf16 __attribute__((ext_vector_type(16)));
+    using FloatFragment = float __attribute__((ext_vector_type(8)));
+    __shared__ __align__(16) uint16_t activation_tile[16 * lds_pitch];
+    __shared__ __align__(16) uint16_t weight_tile[64 * lds_pitch];
+    const int tid = threadIdx.x, lane = tid & 31;
+    const int column_base = blockIdx.x * 64;
+    const int column = column_base + (tid / 32) * 16 + (lane & 15);
+    const int first = blockIdx.y * 16;
+    FloatFragment accumulator{};
+    const int begin_group = down ? int(blockIdx.z) * (depth / 16) : 0;
+    const int end_group = down ? begin_group + depth / 16 : depth;
+    for (int begin = begin_group; begin < end_group; begin += group) {
+        for (int index = tid; index < 16 * group; index += 128) {
+            const int row = index / group, position = index % group;
+            activation_tile[row * lds_pitch + position] = first + row < rows
+                ? activation[size_t(first + row) * depth + begin + position] : 0;
+        }
+        for (int index = tid; index < 64 * group; index += 128) {
+            const int tile_column = index / group, position = index % group;
+            weight_tile[tile_column * lds_pitch + position]
+                = narrow_bf16(e4m3(matrix[size_t(column_base + tile_column) * pitch + begin + position]));
+        }
+        __syncthreads();
+        FloatFragment subtotal{};
+        for (int position = 0; position < group; position += 16) {
+            Bf16Fragment left{}, right{};
+#pragma unroll
+            for (int index = 0; index < 16; ++index) {
+                left[index] = __builtin_bit_cast(__bf16, activation_tile[(lane & 15) * lds_pitch + position + index]);
+                right[index] = __builtin_bit_cast(__bf16, weight_tile[((tid / 32) * 16 + (lane & 15)) * lds_pitch + position + index]);
+            }
+            subtotal = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(left, right, subtotal);
+        }
+        const float scale = reinterpret_cast<const float*>(matrix + size_t(column) * pitch + depth)[begin / group];
+#pragma unroll
+        for (int index = 0; index < 8; ++index)
+            accumulator[index] = accumulator[index] + subtotal[index] * scale;
+        __syncthreads();
+    }
+#pragma unroll
+    for (int index = 0; index < 8; ++index) {
+        const int row = first + index * 2 + (lane >> 4);
+        if (row >= rows) continue;
+        const size_t offset = size_t(row) * outputs + column;
+        const float sum = accumulator[index];
+        if constexpr (down) {
+            partials[(size_t(blockIdx.z) * rows + row) * rank + column] = sum;
+            continue;
+        }
+        const float value = down ? sum / float(streams) : sum;
+        const uint16_t rounded = narrow_bf16(down ? value * sigmoid_exact(value) : sigmoid_exact(value));
+        output[offset] = rounded;
+        if (trace_values) trace_values[offset] = rounded;
+        if (trace_logits) trace_logits[offset] = sum;
+    }
+}
+
+__global__ void decode_down_finish(const float* partials, uint16_t* output, int rows, uint16_t* trace) {
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (column >= rank) return;
+    float sum = 0;
+    for (int slice = 0; slice < 16; ++slice)
+        sum += partials[(size_t(slice) * rows + row) * rank + column];
+    const float value = sum / float(streams);
+    const uint16_t rounded = narrow_bf16(value * sigmoid_exact(value));
+    output[size_t(row) * rank + column] = rounded;
+    if (trace) trace[size_t(row) * rank + column] = rounded;
+}
+
 template <int MODE, int KC, int NTN, int NTM, int RN, int RM>
 void launch_tiled(hipStream_t stream, int rows, const uint16_t* activations, const uint8_t* matrix,
                   uint16_t* result, uint16_t* trace_values, float* trace_logits) {
@@ -345,7 +484,7 @@ bool dense(const RadTensor* tensor, uint32_t dtype, int64_t count) {
     return stride >= count;
 }
 
-int strict_launch(const RadArgs* args, RadStream stream, const R3dhHcTrace* trace) {
+int strict_launch(const RadArgs* args, RadStream stream, const R3dhHcTrace* trace, float* stage_us = nullptr) {
     if (!args || !args->t || args->n_t < 6) return RAD_E_INVAL;
     const int64_t bytes = r3dh_hc_rad_hc_read_strict_scratch(args);
     if (!bytes) return RAD_E_UNSUPPORTED;
@@ -393,26 +532,62 @@ int strict_launch(const RadArgs* args, RadStream stream, const R3dhHcTrace* trac
     uint16_t* down_trace = trace ? trace->down : nullptr;
     float* up_logits = trace ? trace->logits : nullptr;
     uint16_t* up_gates = trace ? trace->gates : nullptr;
-    strict_norm<<<dim3(rows), 256, 0, device_stream>>>(static_cast<const uint16_t*>(hidden->data),
-        static_cast<const float*>(weights->data), normalized, count, eps, wadd);
-    if (rows <= 4) {
+    struct StageEvents {
+        RadEvent events[7]{};
+        ~StageEvents() { for (auto event : events) if (event) rad_event_destroy(event); }
+    } timing;
+    if (stage_us) {
+        for (auto& event : timing.events)
+            if (rad_event_create(&event) != RAD_OK) return RAD_E_DEVICE;
+        if (rad_event_record(timing.events[0], stream) != RAD_OK) return RAD_E_DEVICE;
+    }
+    const char* parallel_norm = std::getenv("RAD_HC_NORM_PARALLEL");
+    if (parallel_norm && std::strcmp(parallel_norm, "0") != 0)
+        strict_norm_parallel<<<dim3(streams, rows), 256, 0, device_stream>>>(
+            static_cast<const uint16_t*>(hidden->data), static_cast<const float*>(weights->data), normalized, eps, wadd);
+    else
+        strict_norm<<<dim3(rows), 256, 0, device_stream>>>(static_cast<const uint16_t*>(hidden->data),
+            static_cast<const float*>(weights->data), normalized, count, eps, wadd);
+    if (stage_us && rad_event_record(timing.events[1], stream) != RAD_OK) return RAD_E_DEVICE;
+    const char* fast = std::getenv("RAD_HC_WMMA");
+    const char* exact_tile = std::getenv("RAD_HC_EXACT_TILE");
+    if (stage_us && ((fast && std::strcmp(fast, "0")) || (exact_tile && std::strcmp(exact_tile, "0"))))
+        return RAD_E_UNSUPPORTED;
+    if (rows <= 16 && fast && std::strcmp(fast, "0") != 0) {
+        decode_wmma<0><<<dim3(rank / 64, (rows + 15) / 16, 16), 128, 0, device_stream>>>(
+            normalized, down_data, intermediate, count, nullptr, nullptr, reinterpret_cast<float*>(gates));
+        decode_down_finish<<<dim3((rank + 127) / 128, rows), 128, 0, device_stream>>>(
+            reinterpret_cast<float*>(gates), intermediate, count, down_trace);
+        decode_wmma<1><<<dim3(wide / 64, (rows + 15) / 16), 128, 0, device_stream>>>(
+            intermediate, up_data, gates, count, up_gates, up_logits, nullptr);
+    } else if (rows == 1 && exact_tile && std::strcmp(exact_tile, "0") != 0) {
+        launch_tiled<0, 128, 4, 8, 1, 1>(device_stream, count, normalized, down_data, intermediate, down_trace, nullptr);
+        launch_tiled<1, 64, 32, 1, 1, 1>(device_stream, count, intermediate, up_data, gates, up_gates, up_logits);
+    } else if (rows <= 4) {
         launch_tiled<0, 128, 16, 4, 1, 1>(device_stream, count, normalized, down_data, intermediate, down_trace, nullptr);
+        if (stage_us && rad_event_record(timing.events[2], stream) != RAD_OK) return RAD_E_DEVICE;
         launch_tiled<1, 64, 64, 4, 1, 1>(device_stream, count, intermediate, up_data, gates, up_gates, up_logits);
     } else if (rows <= 8) {
         launch_tiled<0, 128, 16, 8, 1, 1>(device_stream, count, normalized, down_data, intermediate, down_trace, nullptr);
+        if (stage_us && rad_event_record(timing.events[2], stream) != RAD_OK) return RAD_E_DEVICE;
         launch_tiled<1, 64, 32, 8, 1, 1>(device_stream, count, intermediate, up_data, gates, up_gates, up_logits);
     } else if (rows <= 16) {
         launch_tiled<0, 128, 16, 16, 1, 1>(device_stream, count, normalized, down_data, intermediate, down_trace, nullptr);
+        if (stage_us && rad_event_record(timing.events[2], stream) != RAD_OK) return RAD_E_DEVICE;
         launch_tiled<1, 64, 16, 16, 1, 1>(device_stream, count, intermediate, up_data, gates, up_gates, up_logits);
     } else if (rows <= 32) {
         launch_tiled<0, 128, 16, 16, 1, 2>(device_stream, count, normalized, down_data, intermediate, down_trace, nullptr);
+        if (stage_us && rad_event_record(timing.events[2], stream) != RAD_OK) return RAD_E_DEVICE;
         launch_tiled<1, 64, 16, 16, 1, 2>(device_stream, count, intermediate, up_data, gates, up_gates, up_logits);
     } else {
         launch_tiled<0, 64, 16, 16, 4, 2>(device_stream, count, normalized, down_data, intermediate, down_trace, nullptr);
+        if (stage_us && rad_event_record(timing.events[2], stream) != RAD_OK) return RAD_E_DEVICE;
         launch_tiled<1, 64, 16, 16, 4, 2>(device_stream, count, intermediate, up_data, gates, up_gates, up_logits);
     }
+    if (stage_us && rad_event_record(timing.events[3], stream) != RAD_OK) return RAD_E_DEVICE;
     strict_mix<<<dim3((width + 127) / 128, rows), 128, 0, device_stream>>>(normalized, gates,
         static_cast<uint16_t*>(output->data), count);
+    if (stage_us && rad_event_record(timing.events[4], stream) != RAD_OK) return RAD_E_DEVICE;
     if (inject_weights) {
         const auto* inject_data = static_cast<const uint16_t*>(inject_weights->data);
         auto* inject_out = static_cast<uint16_t*>(inject->data);
@@ -422,11 +597,22 @@ int strict_launch(const RadArgs* args, RadStream stream, const R3dhHcTrace* trac
             strict_inject<256, 16, 128><<<dim3((rows + 15) / 16), 128, 0, device_stream>>>(normalized,
                 inject_data, inject_out, count);
     }
+    if (stage_us && rad_event_record(timing.events[5], stream) != RAD_OK) return RAD_E_DEVICE;
     for (int pair = 0; pair < 2; ++pair)
         if (code_outputs[pair])
             strict_quant<<<dim3(width / 128, rows), 128, 0, device_stream>>>(
                 static_cast<const uint16_t*>(output->data), static_cast<uint8_t*>(code_outputs[pair]->data),
                 static_cast<float*>(scale_outputs[pair]->data), pair == 1, code_outputs[pair]->dtype == RAD_I8);
+    if (stage_us) {
+        if (rad_event_record(timing.events[6], stream) != RAD_OK || rad_event_sync(timing.events[6]) != RAD_OK)
+            return RAD_E_DEVICE;
+        for (int index = 0; index < 6; ++index) {
+            float milliseconds = 0;
+            if (rad_event_elapsed_ms(timing.events[index], timing.events[index + 1], &milliseconds) != RAD_OK)
+                return RAD_E_DEVICE;
+            stage_us[index] = milliseconds * 1000.0f;
+        }
+    }
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 }
@@ -442,6 +628,10 @@ extern "C" int64_t r3dh_hc_rad_hc_read_strict_scratch(const RadArgs* args) {
 }
 extern "C" int r3dh_hc_rad_hc_read_strict(const RadArgs* args, RadStream stream) {
     return strict_launch(args, stream, nullptr);
+}
+extern "C" int r3dh_hc_rad_hc_read_profile(const RadArgs* args, RadStream stream, float* stage_us) {
+    if (!stage_us) return RAD_E_INVAL;
+    return strict_launch(args, stream, nullptr, stage_us);
 }
 extern "C" int r3dh_hc_rad_hc_read_strict_trace(const RadArgs* args, RadStream stream, const R3dhHcTrace* trace) {
     if (!trace) return RAD_E_INVAL;
