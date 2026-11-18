@@ -1186,12 +1186,15 @@ extern "C" int halo_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s)
         if (!halo_contig(oq)) return HALO_NO(RAD_E_STRIDE);
     }
 
-    /* The window as in gdn_conv_update: max_query_len = state_len_max - (width - 2), and it must
-     * fit RU_CVT, since the fold holds the tokens in registers. */
+    /* The window as in gdn_conv_update: max_query_len = state_len_max - (width - 2). The fold
+     * holds a sequence's tokens in registers, so they must fit RU_CVT; the band bounds them too,
+     * and a deeper draft window's state is longer than any step the band serves. */
     if (halo_geti_or(a, "conv_width", 0) != HALO_GDN_CONV_W) return HALO_NO(RAD_E_UNSUPPORTED);
     const long long mql = cst->shape[2] - (HALO_GDN_CONV_W - 2);
     if (mql < 1) return HALO_NO(RAD_E_SHAPE);
-    if (mql > RU_CVT) return HALO_NO(RAD_E_UNSUPPORTED);
+    const long long band = halo_geti_or(a, "q_len", mql);
+    const long long qmax = band > 0 && band < mql ? band : mql;
+    if (qmax > RU_CVT) return HALO_NO(RAD_E_UNSUPPORTED);
 
     /* The recurrent half's checks, as in halo_rad_gdn_recurrent_update. */
     const int anc = ru_state_form(a);
