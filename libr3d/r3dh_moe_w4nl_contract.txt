@@ -1,0 +1,135 @@
+Scoped native gfx1100 MoE down W4NL64 contract
+
+Owned source inventory (all under libr3d/):
+r3dh_moe_w4nl.h: private types, headers, Config, and hook declarations.
+r3dh_moe_w4nl_layout.cpp: config, shapes, strict layout/transform/inverse.
+r3dh_moe_w4nl.hip: native scalar gfx1100 implementation and launch validation.
+r3dh_moe_w4nl_check.hip: ABI fixtures, CPU-only goldens, independent oracle, CLI.
+r3dh_moe_w4nl_check_gpu.h: WTAB/routing fixtures, guards, exact GPU comparisons.
+r3dh_moe_w4nl_check_model.h: RAD reader, bounded manifests, TP2 model slicing.
+r3dh_moe_w4nl_test.sh: existing SDK build and CPU/GPU test driver.
+r3dh_moe_w4nl_contract.txt: this integration contract and verification record.
+No shared main, rows, CMake, or core files are owned or changed by this scope.
+
+Entry points in r3dh_moe_w4nl.h:
+r3dh_moe_w4nl::config(const RadParam*, int, Config*)
+r3dh_moe_w4nl_shape(params, count, operand, RadOpdDesc*)
+r3dh_moe_w4nl_layout(params, count, operand, encoding, selection, planes, plane_count, RadLayout*)
+r3dh_moe_w4nl_transform(params, count, operand, encoding, selection, planes, plane_count, destination, bytes)
+r3dh_moe_w4nl_inverse(params, count, operand, encoding, selection, source, bytes, planes, plane_count)
+r3dh_moe_w4nl_launch(const RadArgs*, RadStream)
+
+Only moe_gemm_q dtype=w4nl64a8i8h, a_order=sorted, parts=1, group=128,
+a_group=128. M=1..2048, N positive multiple of 16, K and K_odd whole 128,
+N_odd=N, n_expert=1..512, top_k=1..min(10,n_expert). N/K are bounded at 65536.
+The actual TP2 down uses N=2560, K/K_odd=384/256 or 256/384, 512 experts,
+top_k=10. The common activation leading dimension holds max(K,K_odd).
+Protected BF16 experts, token-order activation, other quantization formats,
+other architecture targets, registration, and shared-source integration are excluded.
+
+Nine operand slots, matching arch/common/rad_block_moe_fp8.h and libref/ref_moe.cpp:
+0 rotated int8 activation [M*top_k,max(K,K_odd)]
+1 float32 activation scales [M*top_k,max(K,K_odd)/128]
+2 even expert codes/table native table
+3 even expert E4M3/scale.1 native table
+4 int32 sorted_tok [M*top_k], flattened token*top_k+slot or -1
+5 int32 expert_offset [n_expert+1], nondecreasing, first 0, last <= M*top_k
+6 odd expert codes/table native table
+7 odd expert E4M3/scale.1 native table
+8 sorted BF16 output [M*top_k,N]
+Activation and output matrices allow padded leading dimensions; inner stride is 1.
+Sorted rows use activation row i, not sorted_tok[i]/top_k. Negative slots and
+rows beyond the final offset produce zero. Empty expert spans issue no invalid grid.
+The offsets are the upstream routing contract, not host-read or synchronized by launch.
+
+Strict input encoding: affine, transform=fwht128, exactly four planes:
+codes: u4 tiled [1,1], logical dense [N,K], low nibble first, rows byte-aligned.
+table: float32 table extent [1,16]; selected with codes, after codes.
+scale: E4M3 tiled [1,64], dense [N,K/64].
+scale.1: float32 tiled [0,0], scalar or [1,1], exactly 1/8192.
+Nonfinite table values and E4M3 NaN codes 0x7f/0xff are rejected at transform.
+Signed/zero finite E4M3 values are preserved. No implicit scale rounding or cast to int8.
+The actual model table is +/-[1.125,3.25,5.5,8,11,14,18,22], NOT an int8 grid.
+
+Codes native layout: private dtype 0x72346e63, tag r3dh.moe.w4nl64.codes.f32table.v1.
+80-byte CodesHeader {magic=0x344c4e43,version=1,N,K,float table[16]}, then N*K/2 raw bytes.
+Scales native layout: private dtype 0x72346e73, tag r3dh.moe.w4nl64.e4m3.f32level.v1.
+32-byte ScalesHeader {magic=0x344c4e53,version=1,N,K,float level,uint32 reserved[3]},
+then N*(K/64) raw E4M3 bytes. Reserved words are zero. Both layouts align to 256 bytes.
+Each layout is rank 1, shape[0]=bytes. Dtypes are opaque, not ordinary u8/fp8/i8 weights.
+Native table tensors are rank 2 [entries,blob_bytes], stride[1]=1, of the private dtype.
+stride[0]=0 means DEVICE pointer array, one pointer per expert entry.
+stride[0]>0 is a BYTE stride for stacked blobs, >=blob_bytes and divisible by 16.
+The even class has ceil(n_expert/2) entries, odd has floor(n_expert/2).
+Expert e resolves class=e%2 and entry=e/2; each class uses its own K.
+Logical weight shape descriptors are F32, describing table-expanded values, not the native blobs.
+
+Launch checks descriptors, not device payload integrity. Device pointers, allocation extents,
+nondecreasing offsets, and native blobs produced by successful transform are caller preconditions.
+Malformed host descriptors return the exact RAD_E_INVAL/DTYPE/SHAPE/STRIDE classes; launch cannot
+synchronously reject corrupted device offsets or native payloads. Out-of-range sorted slots,
+inactive rows, null expert entries, and failed checked header fields produce zero output.
+This is not a promise to detect every corrupt native field; transform/inverse validate payloads.
+The checker initializes RadArgs by named ABI fields (TP rank, world_size=2, kv_used_max_h=-1)
+and checks all four encoding constructor indices, including the actual five-argument
+rad_enc_add_table(encoding, role, dtype, rows, columns) ABI.
+
+Arithmetic is libref quant_dot, with ascending groups of 64 and ascending K inside each:
+sub = float32 sequential sum of float32(float32(int8_a)*table[code]);
+sb = float32(E4M3_decode(scale[n,group])*scale.1);
+acc = float32(acc + float32(float32(sub*a_scale[row,group/2])*sb));
+Final conversion is BF16 round-to-nearest-even, with no FMA contraction.
+No CPU fallback, hidden quantization, predecoded weight cache, allocation, or host synchronization
+occurs in launch. The supplied HIP stream is used directly and checked by graph capture.
+
+Build and all checks from the repository root:
+bash libr3d/r3dh_moe_w4nl_test.sh --all
+CPU layout/manifest checks only: bash libr3d/r3dh_moe_w4nl_test.sh --host
+SDK: freetoken:rocm10.1.0-transformers518-final-gh-proxy-20261026, user 1001:1001,
+workspace mounted at the same path. HIP --offload-arch=gfx1100; all units -std=c++17 -O2
+-fPIC -ffp-contract=off -fno-fast-math. Compile layout.cpp separately as ordinary C++.
+Fast-math and finite-only flags are compile-time rejected.
+GPU3 only: ROCR_VISIBLE_DEVICES=3, HIP_VISIBLE_DEVICES=0, exclusive nonblocking production
+flock on /home/zihaomu/bigssd/oj_system/var/locks/gpu-renderD131.lock; busy exits 75.
+
+The lock file is read-opened, never created/truncated. CPU runs expose no GPU devices.
+Dependencies: Docker, bash, flock, grep, ABI headers under abi/, the C++ standard library, and
+the existing image's Clang 24 / HIP 10.1 SDK and HIP runtime. No engine library, libref binary,
+Python, package installation, or shared build-file change is needed. The standalone checker
+links only the owned layout and GPU objects plus SDK/default C++ runtime dependencies.
+
+Logs/build/manifest are under ../results/r3d-iqr/implementation/logs/r3dh_moe_w4nl-*.
+The manifest pins model path, byte size, standard FNV-1a metadata fingerprint, directory
+names/indices, and every selected plane's offset/size/fingerprint. This is not a full SHA256.
+Actual sources are blk.0.ffn_down_exps.{0,1,2,3}.weight, full [2560,640]. Rank 0 takes
+the leading 384/256 columns; rank 1 takes the complementary trailing 256/384 columns.
+Four actual expert slices are reused across 512 routing entries; this is not all 512 weights.
+Full small-M model outputs are checked exhaustively. M2048/N2560 checks every row at
+three columns, complete first two/last rows, and every padding element; other values are sampled.
+M2048/N16 actual row slices and all synthetic outputs are checked exhaustively.
+Each case repeats changed inputs on a nondefault stream, with allocation and row-padding guards.
+
+Verification on 2026-11-17, tolerance zero (BF16 bit comparisons, no relaxed error bounds):
+CPU --host: 21320 checks, including 50 exact-error launch ABI checks before any device access.
+CPU reference goldens: E4M3 signed zero/subnormal/normal/extreme values, positive/negative BF16 RNE
+ties, K128/256/384 group64/scale128 indexing, every table16/nibble value, int8 -128, and an
+ascending nonassociative cancellation case. The oracle uses raw planes and independent bit-by-bit
+code decoding, double/ldexp E4M3 decoding, explicitly rounded f32 arithmetic, and an independent
+BF16 rounder. Numerical evaluation does not call the device decoder, transform, libref, or HIP.
+Manifest: seven exact-format/identity/plane-fingerprint corruptions rejected.
+GPU synthetic: 21 cases, 5329460 compared output/padding elements, M through 2048,
+both parity geometries, active/empty routing, device pointer and stacked WTAB, and BF16 ties.
+GPU model: 10 cases, 4890324 compared output/padding elements, both ranks; coverage as above.
+ASan+UBSan: current host and manifest checks passed with leak detection and halt-on-error enabled.
+Sanitizers instrument the host checker/layout, not the GPU kernel. Sanitizer build: -O1 -g
+-fsanitize=address,undefined -fno-omit-frame-pointer plus the same strict floating-point flags;
+link the normal GPU object. Logs: *-sanitizers-build.log, *-sanitizers-host.log,
+*-sanitizers-manifest.log. No GPU is exposed to these sanitizer invocations.
+Other current logs: *-build.log, *-host.log, *-manifest-create.log, *-manifest.log,
+*-synthetic.log, *-model.log, *-fastmath-reject.log, *-finite-math-reject.log.
+Host reference/ABI suites run in every checker mode; --host terminates before GPU discovery.
+Script --all must report W4NL_ALL_PASS and exit zero. The test binary is
+../build-r3d-bootstrap/r3dh_moe_w4nl_check; sanitizer binary has suffix _san.
+
+Pending outside this unit: main schema/row/CMake integration, full graph/model execution,
+all-layer/all-expert numerical coverage, performance tuning and production throughput certification.

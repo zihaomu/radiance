@@ -1,0 +1,121 @@
+Qwen native elementwise/gating/router units for gfx1100
+
+Scope
+Only new libr3d/r3dh_qwen_ops* files belong to this port. No existing source,
+CMake, rows, core, registration, commit, or push is part of this change.
+The production units include only their private API header, ABI headers,
+the HIP runtime, and standard headers. No libref/CPU fallback, F16 staging,
+allocation, stream synchronization, or host inspection of tensor contents.
+
+C ABI, declared in r3dh_qwen_ops.h
+Every entry point is int function(const RadArgs*, RadStream).
+
+r3dh_qwen_ops_gated_had_quant_i8g
+Register as gated_had_quant_i8g, not as the old gated_had_quant_i8.
+Operands: gate_up BF16, q I8, scale F32, optional out_bf16 BF16.
+Logical shapes: [R,2*n], [R,n], [R,n/128], [R,n].
+Packed gate is the first n columns, up the second n columns of each row.
+Default act=silu. The F32 activation and F32 multiply are followed by one
+BF16 RNE rounding. There is no separate activation rounding in this form.
+
+r3dh_qwen_ops_gate_had_quant_i8g
+Register as gate_had_quant_i8g.
+Operands: gate BF16, x BF16, q I8, scale F32, optional out_bf16 BF16.
+Logical shapes: [R,n], [R,n], [R,n], [R,n/128], [R,n].
+Default act=sigmoid. Round the activation to BF16, multiply it by x in F32,
+then round the product to BF16. This is the sigmoid -> mul -> quantizer
+pipeline, not the packed silu_mul pipeline. out_bf16 may alias x.
+
+Gate parameters and row constraints
+n is required; 128 <= n <= 1048576, n divisible by 128.
+group defaults to 128 and must equal 128. Group 256 is explicitly rejected.
+dtype, if provided, must be bf16. act=silu|sigmoid|none; mode=0|1|2 is the
+legacy alternative used only when act is absent. chain must be absent/0.
+R is inferred from q's logical element count divided by n, not parameter M.
+Packed R is 1..20480; separate-gate R is 1..65535 (HIP grid.y bound).
+Register only the required model bands; current inventory has packed n=256
+and n=384, group=128, act=silu, M<=2048 or M<=20480 sorted expert rows.
+The attention site has n=256 and up to 2048*12 logical head rows.
+Rank 1..RAD_MAX_RANK is accepted if it uniformly flattens to logical rows:
+an n-wide last axis can have a padded row pitch, with uniform outer axes;
+a wider physical last axis must be contiguous and is divided into n-wide
+rows. Thus token-wide [T,3072] codes/x and [T,24] scales can meet the
+[T*12,256] strided gate, or a uniform [T,12,256] gate. Nonuniform outer
+head strides and padded token-wide inputs that cannot flatten are rejected.
+Unit inner strides and dtype alignment are required. No arbitrary transpose.
+Null optional output, omitted output, and a null descriptor are supported.
+
+Quantization math
+out_bf16 receives the unrotated product, even though q is rotated.
+Load the BF16-rounded product as F32, then unnormalized FWHT128 with
+ascending butterfly distances 1,2,4,8,16,32,64, independently per group.
+One F32 scale per 128 columns: amax*(1.0f/127.0f), or 1.0f if amax=0.
+Use the rounded F32 reciprocal 1.0f/scale; multiply, clamp to [-127,127],
+and round to nearest even. q is row-major, with no 16-byte step permutation.
+There is no sqrt(128) normalization here: the matching i8a8h/w4a8h weight
+scale carries /128. Not interchangeable with per-row gated_had_quant_i8.
+Sorted expert rows stay in sorted order. No sorted_tok gather is performed
+inside either quantizer. For parity shards the gate_up producer must put
+gate and up in the widest layout and zero each narrow class's trailing
+columns, as arch/common/rad_block_moe_fp8.h specifies (384/256, swapped by
+rank). The quantizer neither reads a weight table nor changes expert parity.
+The numerical domain is finite products/FWHT values with representable
+positive scale and reciprocal, or all-zero groups; NaN/Inf and overflowed
+reciprocals are not certified. Tensor contents are never CPU-validated.
+
+r3dh_qwen_ops_router_gemm
+Register as a strict gemm_nt row for N=512,K=2560,dtype=bf16. There is no
+router_gemm op in this architecture: the unfused path calls gemm_nt.
+Operands: a BF16 [M,2560], b BF16 [N,2560], y/logits BF16 [M,N].
+Raw row-major BF16 weights, no relayout, optional padded row strides.
+K must be 2560; implementation accepts N=1..512, M=1..2048, rank=2,
+unit inner strides. M, if passed, must equal a.shape[0]. N defaults 512.
+Only N=512 is GPU-certified here; do not broaden a registry row to N=1
+solely because the implementation accepts it. Outputs cannot alias inputs.
+Every output accumulates a separate F32 multiply and F32 add for K ascending,
+then one BF16 RNE store, matching libref gemm_nt. No split-K, F16, or WMMA.
+FP32 router precision means FP32 arithmetic, not FP32 output logits: the
+actual architecture's logits and router_topk operands are BF16.
+This overrides the existing router GEMM's F16 staging without changing it.
+
+Unfused routing and gathers
+MoeFP8's fallback is gemm_nt -> router_topk -> moe_scatter. The strict row
+above plus existing r3d_rad_moe_router_topk_bf16 and r3d_rad_moe_scatter
+serves experts=512, K=2560, top_k=10. router_gemm_topk_scatter is optional;
+its absent handle selects the separate path, so no fusion was ported.
+Existing r3d_rad_moe_gather is native for n=2560, top_k=10, BF16/F32 routing
+weights and the optional shared/sigmoid arm; the checker exercises it.
+all_gather is unrelated to MoE gather: inventory contains a missing native
+world_size=2,numel=512,dtype=f32,row=16 collective. It is not implemented by
+these units. No claim of full graph closure or full-model inference.
+
+Build
+Production sources: libr3d/r3dh_qwen_ops_quant.hip and
+libr3d/r3dh_qwen_ops_router.hip. Integrating their API/rows is another owner.
+ROCm10.1 SDK image: freetoken:rocm10.1.0-transformers518-final-gh-proxy-20261026.
+Strict flags: -std=c++20 -O2 -fPIC -fno-fast-math -ffp-contract=off
+-fdenormal-fp-math=ieee --offload-arch=gfx1100 -Iabi -Ilibr3d.
+No build-system edits are needed to run bash libr3d/r3dh_qwen_ops_test.sh --all.
+The script builds host libref objects separately, then the native checker.
+libref is linked only into that checker, never into production entrypoints.
+It rejects fast-math and finite-only flags, and runs GPU-free --host first.
+GPU execution uses user1001, same-path workspace mount, physical GPU2 only,
+ROCR_VISIBLE_DEVICES=2, HIP_VISIBLE_DEVICES=0, read-open nonblocking flock
+on /home/zihaomu/bigssd/oj_system/var/locks/gpu-renderD130.lock. Busy exit=75.
+
+Validation
+Independent CPU BF16 RNE oracle cross-checks 327680 float bit patterns.
+Independent CPU FWHT/quantization and libref had_quant_act_i8g must agree.
+GPU gate products, int8 codes, F32 scales and router logits compare by bytes.
+Router top-k ids/weights and stable-sort outputs are checked against libref.
+Native MoE gather is checked against independent CPU math and libref, with
+shared-arm double BF16 rounding, F32 routing weights, and a dropped -1 slot.
+M=1,3,8,16,32,64; widths=128,256,384,640,2560,4096; sorted heights through
+20480; attention head views through 2048 tokens*12 heads. Two changed inputs,
+omitted/optional outputs, in-place x, nondefault streams, allocation/row
+padding guards, tiny/zero/saturated inputs, BF16 and int8 RNE ties, and
+router weights outside F16 range. Only synthetic model-geometry data.
+Artifacts: ../build-r3d-bootstrap/r3dh_qwen_ops_check and
+../results/r3d-iqr/implementation/logs/r3dh_qwen_ops-{build,host,gpu}.log.
+Not validated: actual model weights, end-to-end inference, TP collectives,
+router M>64, arbitrary non-finite data, tuning or serving performance.

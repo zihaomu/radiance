@@ -1,0 +1,47 @@
+Native compact regular IQR / W4NL and protected BF16, gfx1100, HIP C++17
+
+Public integration header: r3dh_moe_mixed.h
+Registry API: int r3dh_moe_mixed_kernel_count();
+              const RadKernelInfo* r3dh_moe_mixed_kernel_at(int index);
+Count is 10. Negative and out-of-range indices return nullptr.
+Rows 0..3: moe_gemm_q, regular IQR gate/up, n_expert=510/508,
+N/N_odd=768/512 or 512/768, K/K_odd=2560, parts=2, token order.
+Rows 4..7: moe_gemm_q, regular W4NL64 down, n_expert=510/508,
+N/N_odd=2560, K/K_odd=384/256 or 256/384, parts=1, sorted order.
+Rows 8..9: moe_gemm, protected BF16, n_expert in {2,4},
+gate/up N640 K2560 token order, down N2560 K320 sorted order.
+Protected parts defaults to gate/up=2, down=1 because the current engine
+does not pass it; explicitly wrong parts is rejected by shape and launch.
+All rows: M1..2048, top_k10. Regular rows: group=a_group=128.
+
+Production source additions for the main owner:
+  r3dh_moe_mixed_registry.cpp  (CXX)
+  r3dh_moe_mixed_layout.cpp    (CXX)
+  r3dh_moe_mixed_iqr.hip       (HIP, native WMMA, gfx1100)
+  r3dh_moe_mixed_bf16.hip      (HIP, native strict BF16 FMA)
+Dependencies already in the base implementation:
+  r3dh_moe_iqr_layout.cpp, r3dh_moe_w4nl_layout.cpp, r3dh_moe_w4nl.hip.
+Base r3dh_moe_iqr.hip is also now compact-count capable and checked.
+Do not compile .hip as ordinary CXX; use HIP source language or -x hip.
+Flags: -std=c++17 -O2 -ffp-contract=off -fno-fast-math --offload-arch=gfx1100.
+No C++20 feature is required in these mixed sources or modified base units.
+No registry aggregation, CMake, engine, or shared architecture change here.
+
+Compact experts are not normalized to 512. Offset vectors are n_expert+1;
+parity tables have n_expert/2 entries. Parity is compact slot parity, not
+original checkpoint expert parity. Layer34 original expert409 maps to
+compact408 after protected407 removal. Last original510/511 map to
+compact508/509 (510 regular) or compact506/507 (508 regular), parity
+table indices254 or253 respectively. No expert contribution is skipped.
+IQR has independent gate/up halves and zero-filled inactive columns/rows.
+Regular down zero-fills protected rows; protected BF16 overwrites only its
+trailing offsets and preserves all regular rows. Sorted=-1 writes zero.
+
+Reproduce: bash libr3d/r3dh_moe_mixed_test.sh --all
+Uses the existing freetoken SDK container r3dh-moe-iqr-sdk for builds/CPU.
+GPU run uses physical5, ROCR5 HIP0, PCI0000:a3:00.0, read-open nonblocking
+production renderD133 lock, with automatic container/lock cleanup.
+Logs: results/r3d-iqr/implementation/logs/mixed-finish-*.log (workspace).
+Actual-model tests: layers34/44/47, protected407/496,292/350,122/143/399/445,
+both TP ranks, two changed inputs, nondefault streams, guards, full outputs.
+This is native op validation, not full-model serving/performance certification.

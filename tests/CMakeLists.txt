@@ -168,7 +168,7 @@ string(APPEND RAD_PERF_SCRIPT "include([==[${CMAKE_CURRENT_SOURCE_DIR}/perf_entr
 
 # shipped_plugins_test loads the shipped architecture plugins, which bind the plugin-facing C ABI
 # back to the host at dlopen, so like the engine it carries all of rad_core and exports it.
-set(RAD_TESTS_WHOLE_CORE shipped_plugins_test)
+set(RAD_TESTS_WHOLE_CORE shipped_plugins_test r3d_mtp_ple_device_test)
 
 file(GLOB RAD_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp)
 if(NOT RAD_HIP_FOUND)
@@ -176,7 +176,11 @@ if(NOT RAD_HIP_FOUND)
 endif()
 foreach(t ${RAD_TESTS})
   get_filename_component(n ${t} NAME_WE)
-  if(n IN_LIST RAD_TESTS_NO_CORE)
+  if(n STREQUAL "r3d_iqr_test")
+    add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/libr3d/r3d_iqr_layout.cpp)
+    target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/abi)
+    target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr3d)
+  elseif(n IN_LIST RAD_TESTS_NO_CORE)
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/core/util/rad_util.cpp)
     if(n STREQUAL "nemotron35_test")
       target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/core/mm/processor.cpp
@@ -1006,6 +1010,16 @@ foreach(cost IN ITEMS kbench_ref:500 r4d_selftest:350 r4d_emu_attn_sweep:80 kben
 endforeach()
 
 # Model-local device kernels are checked on the actual engine queue against libref.
+if(TARGET r3d_mtp_ple_device_test)
+  add_dependencies(r3d_mtp_ple_device_test libref)
+  if(TARGET libr3d)
+    add_dependencies(r3d_mtp_ple_device_test libr3d)
+    add_test(NAME r3d_mtp_ple_device_test_card COMMAND r3d_mtp_ple_device_test)
+    set_tests_properties(r3d_mtp_ple_device_test_card PROPERTIES LABELS "gpu" RUN_SERIAL TRUE
+      ENVIRONMENT "RADIANCE_HOME=${RAD_PLUGIN_OUT};RAD_TEST_CPU_BUDGET=0;RAD_R3D_REQUIRE_DEVICE=1" TIMEOUT 180)
+  endif()
+endif()
+
 if(TARGET nemotron35_device_test)
   set_target_properties(nemotron35_device_test PROPERTIES ENABLE_EXPORTS ON)
   add_dependencies(nemotron35_device_test libref)

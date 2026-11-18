@@ -821,6 +821,11 @@ void* rad_dev_device_ptr(void* p)                 { return dev()->device_ptr(p);
 
 int  rad_stream_create(RadStream* out, int hi)    { return dev()->stream_create(out, hi); }
 void rad_stream_destroy(RadStream s)              { dev()->stream_destroy(s); }
+int  rad_stream_device_access(RadStream s, int device, const void* address) {
+    const auto* backend = dev();
+    return backend->stream_device_access ? backend->stream_device_access(s, device, address)
+                                         : RAD_E_UNSUPPORTED;
+}
 int  rad_stream_sync(RadStream s) {
     rad::g_host_blocks.fetch_add(1, std::memory_order_relaxed);
     return dev()->stream_sync(s);

@@ -81,9 +81,10 @@
  *   about 50x slower than in VRAM, and an unprefetched managed head faults page by page because
  *   this ROCm does not migrate managed pages for read-mostly device access.
  *
- *   The container header picks the form: the shim calls `rad_planes_header(w)` and a plain bf16
- *   operand takes the bf16 path. The shim reads the header on the host (as `scaled_rows()` does)
- *   and the kernel reads the same bytes on the device, so the operand must be managed memory
+ *   The layout's private dtype identifies a joined head; plain bf16 never probes its data and
+ *   may live in device-only memory. Only the joined form calls `rad_planes_header(w)`.
+ *   The shim reads that header on the host (as `scaled_rows()` does) and the kernel reads the
+ *   same bytes on the device, so a joined operand must be managed memory
  *   (prefetched) or hipHostMalloc; plain malloc faults on the kernel's first read.
  *
  *   gfx1102 has no v_cvt_pk_f16_fp8 (clang lists the builtin but it expands to software), so the
@@ -130,9 +131,15 @@
 #include "r3d_launch.h"
 
 #include "rad_planes.h"
+#include "r3d_logits_planes.h"
+
+extern "C" int rad_stream_device_access(RadStream, int, const void*) __attribute__((weak));
+extern "C" void* rad_dev_host_ptr(void*) __attribute__((weak));
 
 namespace {
 
+constexpr uint32_t kLogitsPlanesDtype = 0x33504c4eu;
+static_assert(kLogitsPlanesDtype == r3d_head::dtype);
 constexpr int kBlockThreads = 256;
 constexpr int kWaves        = kBlockThreads / kWave;   /* 8 */
 constexpr int kTM           = 128;                     /* activation rows a block */
@@ -160,7 +167,6 @@ __device__ __forceinline__ uint4 widen8(uint4 w)
                       bf16x2_to_f16x2(w.w));
 }
 
-constexpr int kFp8Block = 128;        /* the head's scale block: R3D_FP8_BLOCK, llama_dense_fp8 */
 
 /* The head as the container stores it: E4M3 (or int8) codes with one float scale per 128x128
  * block. Passed by value; the pointers are device addresses the shim resolved out of the joined
@@ -581,59 +587,153 @@ int gemm_launch(long xv, long wv, long yv, int M, int N, int K, int x_ld, int y_
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+template<bool OutputF32>
+__global__ void gemm_plain_strict(const uint16_t* activation, const uint16_t* weight,
+                                 void* output, int columns, int reduction,
+                                 int64_t activation_pitch, int64_t output_pitch) {
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (column >= columns) return;
+    float accumulator = 0.0f;
+    for (int position = 0; position < reduction; ++position) {
+        const float left = __uint_as_float(uint32_t(activation[row * activation_pitch + position]) << 16);
+        const float right = __uint_as_float(uint32_t(weight[int64_t(column) * reduction + position]) << 16);
+        accumulator = __fadd_rn(accumulator, __fmul_rn(left, right));
+    }
+    const int64_t offset = row * output_pitch + column;
+    if constexpr (OutputF32) {
+        static_cast<float*>(output)[offset] = accumulator;
+    } else {
+        const uint32_t bits = __float_as_uint(accumulator);
+        static_cast<uint16_t*>(output)[offset] = (bits & 0x7fffffffu) > 0x7f800000u
+            ? uint16_t((bits >> 16) | 0x40u)
+            : uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+    }
+}
+
+__global__ void gemm_joined_strict(const uint16_t* activation, const RadPlanesHeader* header,
+                                    float* output, int columns, int reduction,
+                                    int64_t activation_pitch, int64_t output_pitch,
+                                    int64_t available) {
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= columns || r3d_head::header(header, columns, reduction, available) != RAD_OK)
+        return;
+    const auto* entry = reinterpret_cast<const RadPlanesEntry*>(header + 1);
+    const auto* base = reinterpret_cast<const uint8_t*>(header);
+    if (uint64_t(header->bytes) > UINTPTR_MAX - reinterpret_cast<uintptr_t>(base)) return;
+    const auto& codes = entry[0];
+    const auto& scale = entry[1];
+    const int64_t scale_row = scale.block[0] ? column / scale.block[0] : 0;
+    float accumulator = 0.0f;
+    for (int position = 0; position < reduction; ++position) {
+        const uint8_t bits = base[codes.offset + int64_t(column) * codes.row_bytes + position];
+        const float code = codes.dtype == RAD_I8 ? float(static_cast<int8_t>(bits))
+                                                 : e4m3_to_f32(bits);
+        const int64_t scale_col = scale.block[1] ? position / scale.block[1] : 0;
+        const uint8_t* address = base + scale.offset + scale_row * scale.row_bytes +
+                                 scale_col * r3d_head::scale_bytes(scale.dtype);
+        const float multiplier = scale.dtype == RAD_F32 ? *reinterpret_cast<const float*>(address)
+            : scale.dtype == RAD_BF16 ? bf16_to_f32(*reinterpret_cast<const uint16_t*>(address))
+                                      : f16_to_f32(*reinterpret_cast<const uint16_t*>(address));
+        const float weight = __fmul_rn(code, multiplier);
+        const float left = bf16_to_f32(activation[int64_t(blockIdx.y) * activation_pitch + position]);
+        accumulator = __fadd_rn(accumulator, __fmul_rn(left, weight));
+    }
+    output[int64_t(blockIdx.y) * output_pitch + column] = accumulator;
+}
+
+/* Layout/relayout certify immutable weights. Corrupted GPU-only headers suppress writes;
+ * without an asynchronous status ABI they cannot produce a synchronous host error. */
+int joined_strict_run(const RadArgs* args, RadStream stream) {
+    const RadTensor& activation = args->t[0];
+    const RadTensor& weight = args->t[1];
+    const RadTensor& output = args->t[2];
+    if (activation.dtype != RAD_BF16 || output.dtype != RAD_F32) return RAD_E_DTYPE;
+    const int64_t columns = r3d_geti_or(args, "n_vocab", 0);
+    const int64_t reduction = r3d_geti_or(args, "n_embd", 0);
+    const int64_t band = r3d_geti_or(args, "M", 0);
+    if (columns <= 0 || columns > (1LL << 28) || reduction <= 0 || reduction > (1LL << 28))
+        return RAD_E_SHAPE;
+    if (activation.rank != 2 || output.rank != 2 || activation.shape[0] <= 0 ||
+        activation.shape[0] > band || band > (1LL << 24) ||
+        activation.shape[1] != reduction || output.shape[0] != activation.shape[0] ||
+        output.shape[1] != columns) return RAD_E_SHAPE;
+    if (activation.stride[1] != 1 || output.stride[1] != 1 ||
+        activation.stride[0] < reduction || output.stride[0] < columns) return RAD_E_STRIDE;
+    const int64_t minimum = r3d_head::rounded(sizeof(RadPlanesHeader) + 2 * sizeof(RadPlanesEntry));
+    int64_t available = 0;
+    if (weight.rank == 1) {
+        if (weight.stride[0] != 1 || weight.shape[0] < minimum) return RAD_E_SHAPE;
+        available = weight.shape[0];
+    } else if (weight.rank != 2 || weight.shape[0] != columns || weight.shape[1] != reduction ||
+               weight.stride[0] != reduction || weight.stride[1] != 1) return RAD_E_SHAPE;
+    for (const RadTensor* tensor : {&activation, &output}) {
+        const int width = tensor == &activation ? 2 : 4;
+        if (tensor->stride[0] > (INT64_MAX / width - tensor->shape[1]) / tensor->shape[0])
+            return RAD_E_STRIDE;
+        const uint64_t bytes = ((tensor->shape[0] - 1) * tensor->stride[0] + tensor->shape[1]) * width;
+        if (bytes > UINTPTR_MAX - reinterpret_cast<uintptr_t>(tensor->data)) return RAD_E_STRIDE;
+    }
+    if (!r3d_aligned(activation.data, 16) || !r3d_aligned(weight.data, 16) ||
+        !r3d_aligned(output.data, 16)) return RAD_E_ALIGN;
+    int current = -1;
+    if (hipGetDevice(&current) != hipSuccess) return RAD_E_DEVICE;
+    bool native = false;
+    if (stream && rad_stream_device_access) {
+        const int status = rad_stream_device_access(stream, current, nullptr);
+        if (status != RAD_OK && status != RAD_E_UNSUPPORTED) return RAD_E_DEVICE;
+        native = status == RAD_OK;
+    }
+    if (stream && !native) {
+        unsigned flags = 0;
+        if (hipStreamGetFlags(reinterpret_cast<hipStream_t>(stream), &flags) != hipSuccess)
+            return RAD_E_DEVICE;
+    }
+    const void* host_weight = nullptr;
+    for (const RadTensor* tensor : {&activation, &weight, &output}) {
+        hipPointerAttribute_t attributes{};
+        const bool hip_known = hipPointerGetAttributes(&attributes, tensor->data) == hipSuccess;
+        if (!hip_known) (void)hipGetLastError();
+        if (native) {
+            if (rad_stream_device_access(stream, current, tensor->data) != RAD_OK) return RAD_E_DEVICE;
+        } else if (!hip_known || (!attributes.isManaged && attributes.type != hipMemoryTypeHost &&
+                    (attributes.type != hipMemoryTypeDevice || attributes.device != current))) {
+            return RAD_E_DEVICE;
+        }
+        if (tensor == &weight && hip_known && attributes.type == hipMemoryTypeHost &&
+            attributes.hostPointer) host_weight = attributes.hostPointer;
+        if (tensor == &weight && native && rad_dev_host_ptr) {
+            if (void* alias = rad_dev_host_ptr(tensor->data)) host_weight = alias;
+        }
+    }
+    if (host_weight) {
+        const int status = r3d_head::header(static_cast<const RadPlanesHeader*>(host_weight),
+                                           columns, reduction, available);
+        if (status != RAD_OK) return status;
+    }
+    const dim3 grid((columns + 127) / 128, activation.shape[0]);
+    R3D_KLAUNCH(R3D_KNAME(gemm_joined_strict), grid, dim3(128), reinterpret_cast<hipStream_t>(stream),
+                static_cast<const uint16_t*>(activation.data),
+                static_cast<const RadPlanesHeader*>(weight.data), static_cast<float*>(output.data),
+                int(columns), int(reduction), activation.stride[0], output.stride[0], available);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
 /* The shim body both ops share (ref_logits_gemm is gemm_nt_impl with the axes renamed).
  * `y_is_f32` is the op's output dtype; nkey/kkey are libref's axis names ("n_vocab"/"n_embd" or
  * "N"/"K"). */
 int rad_gemm_run(const RadArgs* a, RadStream s, int y_is_f32, const char* nkey, const char* kkey, int alu)
 {
-    if (a->n_t < 3 || !a->t[0].data || !a->t[1].data || !a->t[2].data)
+    (void)alu;
+    if (!a || !a->t || a->n_t < 3 || !a->t[0].data || !a->t[1].data || !a->t[2].data)
         return R3D_NO(RAD_E_INVAL);
     const RadTensor* x = &a->t[0];
     const RadTensor* w = &a->t[1];
     const RadTensor* y = &a->t[2];
 
-    const RadPlanesEntry* ce = nullptr;
-    const RadPlanesEntry* se = nullptr;
-    HeadQ h;
-    std::memset(&h, 0, sizeof h);
-    int joined = 0;
+    if (w->dtype == kLogitsPlanesDtype) return y_is_f32 ? joined_strict_run(a, s) : RAD_E_DTYPE;
 
-    /* ---- the head's stored form ---------------------------------------------------------------
-     * The launch-side twin of r3d_layout_logits_head: a `rad.planes` header means the quantised
-     * head, read as its two planes; no header means a plain bf16 head. The checks follow the
-     * reference's `scaled_rows` in order: roles, then dtypes and blocks, then coverage (below,
-     * once N and K are known).
-     */
-    const RadPlanesHeader* ph = rad_planes_header(r3d_p(w));
-    if (ph) {
-        if (!y_is_f32) return R3D_NO(RAD_E_DTYPE);   /* the bf16-y row takes a bf16 head only */
-        if (rad_planes_find(r3d_p(w), "zero", nullptr))
-            return R3D_NO(RAD_E_DTYPE);   /* codes+scale+zero: gemm_nt_q's asymmetric grid */
-        if (ph->n_planes != 2) return R3D_NO(RAD_E_DTYPE);
-        const uint8_t* cb = (const uint8_t*)rad_planes_find(r3d_p(w), "codes", &ce);
-        const uint8_t* sb = (const uint8_t*)rad_planes_find(r3d_p(w), "scale", &se);
-        if (!cb || !sb || !ce || !se)
-            return R3D_NO(RAD_E_DTYPE);   /* a joined head that is not codes + one scale */
-        if (ce->kind != RAD_PLANE_TILED || ce->block[0] != 1 || ce->block[1] != 1)
-            return R3D_NO(RAD_E_DTYPE);   /* codes must be one code an element, tiled plain */
-        if (ce->dtype != RAD_F8E4M3 && ce->dtype != RAD_I8) {
-            if (rad_dtype_bytes(ce->dtype, 8) < 8)
-                return R3D_NO(RAD_E_DTYPE);   /* sub-byte codes */
-            return R3D_NO(RAD_E_DTYPE);       /* e5m2 and the rest: no decoder here */
-        }
-        if (se->kind != RAD_PLANE_TILED) return R3D_NO(RAD_E_DTYPE);
-        if (se->dtype == RAD_BF16) h.sdt = 0;
-        else if (se->dtype == RAD_F16) h.sdt = 1;
-        else if (se->dtype == RAD_F32) h.sdt = 2;
-        else return R3D_NO(RAD_E_DTYPE);        /* not in float_scale_dt's set */
-        if (se->block[0] != kFp8Block || se->block[1] != kFp8Block)
-            return R3D_NO(RAD_E_SHAPE);   /* only 128x128 blocks; other grids are gemm_nt_q's */
-        h.codes = cb; h.scale = sb; h.code_row = ce->row_bytes; h.scale_row = se->row_bytes;
-        h.cdt = ce->dtype == RAD_I8 ? 1 : 0;
-        joined = 1;
-    } else if (w->dtype != RAD_BF16) {
-        return R3D_NO(RAD_E_DTYPE);
-    }
+    if (w->dtype != RAD_BF16) return R3D_NO(RAD_E_DTYPE);
     if (x->dtype != RAD_BF16) return R3D_NO(RAD_E_DTYPE);
     if (y->dtype != (y_is_f32 ? (uint32_t)RAD_F32 : (uint32_t)RAD_BF16)) return R3D_NO(RAD_E_DTYPE);
 
@@ -650,58 +750,26 @@ int rad_gemm_run(const RadArgs* a, RadStream s, int y_is_f32, const char* nkey, 
     if (x_pitch < K || x_rows < M) return R3D_NO(RAD_E_STRIDE);
     if (r3d_numel(w) < N * K) return R3D_NO(RAD_E_SHAPE);
     if (!r3d_contig(w)) return R3D_NO(RAD_E_STRIDE);         /* N rows of K contiguous codes */
-    if (joined) {
-        /* `scaled_rows`' coverage checks: the planes must cover the band, the scale plane by
-         * ceil-divided blocks, so a ragged vocabulary is fine (131 rows need 2 scale rows). */
-        const long long sb_r = (N + kFp8Block - 1) / kFp8Block;
-        const long long sb_c = (K + kFp8Block - 1) / kFp8Block;
-        if (ce->rows != N || ce->cols != K) return R3D_NO(RAD_E_SHAPE);
-        if (se->rows != sb_r || se->cols != sb_c) return R3D_NO(RAD_E_SHAPE);
-        if (ce->row_bytes < ce->cols || se->row_bytes < se->cols * (h.sdt == 2 ? 4 : 2))
-            return R3D_NO(RAD_E_STRIDE);
-    }
     if (M > (long long)1 << 24 || N > (long long)1 << 28 || K > (long long)1 << 28)
         return R3D_NO(RAD_E_SHAPE);
     if (!r3d_aligned(r3d_p(x), 16) || !r3d_aligned(r3d_p(w), 16) || !r3d_aligned(r3d_p(y), 16))
         return R3D_NO(RAD_E_ALIGN);
 
-    /* No `sk`/`kb`/`nt` in the rows' tune tables (impl only): the grid is vocab-wide, KC = 32 and
-     * the non-temporal stream is off, see the header's refusals. */
-    const int sk = 1, kb = 0, nt = 0;
-
-    const HeadQ* hp = joined ? &h : nullptr;
-    const int e = y_is_f32
-        ? gemm_launch<true>(r3d_addr(x), r3d_addr(w), r3d_addr(y), (int)M, (int)N, (int)K,
-                            (int)x_pitch, (int)y_pitch, sk, kb, nt, (long)(uintptr_t)s, hp, alu)
-        : gemm_launch<false>(r3d_addr(x), r3d_addr(w), r3d_addr(y), (int)M, (int)N, (int)K,
-                             (int)x_pitch, (int)y_pitch, sk, kb, nt, (long)(uintptr_t)s, hp, alu);
-    if (e == 0) return RAD_OK;
-    return R3D_NO(e == -1 ? RAD_E_INVAL : e == -2 ? RAD_E_SHAPE
-                        : e == -3 ? RAD_E_STRIDE : e == -5 ? RAD_E_ALIGN : RAD_E_DEVICE);
-}
-
-/* The reference's `enc_scaled_rows` and `float_scale_dt`, transcribed (libref keeps them static
- * inline), checks in its order: affine, untransformed, two planes, the roles in order, codes tiled
- * with block {1,1} in an admitted dtype, the scale tiled with a float dtype. */
-bool float_scale_dt(uint32_t dt)
-{
-    return dt == RAD_BF16 || dt == RAD_F16 || dt == RAD_F32;
-}
-
-bool enc_scaled_rows(const RadEncoding* enc, const int* sel, int n)
-{
-    if (!rad_enc_is(enc, "affine") || enc->transform[0] || enc->n_planes != 2) return false;
-    if (n != 2 || !sel) return false;                 /* sel_roles(enc, sel, n, "codes", "scale") */
-    const char* want[2] = { "codes", "scale" };
-    for (int i = 0; i < 2; ++i) {
-        if (sel[i] < 0 || sel[i] >= enc->n_planes) return false;
-        if (std::strncmp(enc->plane[sel[i]].role, want[i], RAD_ENC_STR) != 0) return false;
+    {
+        const dim3 grid((N + 127) / 128, M);
+        if (y_is_f32)
+            R3D_KLAUNCH(R3D_KNAME((gemm_plain_strict<true>)), grid, dim3(128),
+                        reinterpret_cast<hipStream_t>(s),
+                        static_cast<const uint16_t*>(x->data), static_cast<const uint16_t*>(w->data),
+                        y->data, int(N), int(K), int64_t(x_pitch), int64_t(y_pitch));
+        else
+            R3D_KLAUNCH(R3D_KNAME((gemm_plain_strict<false>)), grid, dim3(128),
+                        reinterpret_cast<hipStream_t>(s),
+                        static_cast<const uint16_t*>(x->data), static_cast<const uint16_t*>(w->data),
+                        y->data, int(N), int(K), int64_t(x_pitch), int64_t(y_pitch));
+        return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
     }
-    const RadEncPlane& c = enc->plane[sel[0]];
-    const RadEncPlane& sc = enc->plane[sel[1]];
-    return c.kind == RAD_PLANE_TILED && c.block[0] == 1 && c.block[1] == 1 &&
-           (c.dtype == RAD_F8E4M3 || c.dtype == RAD_I8) && sc.kind == RAD_PLANE_TILED &&
-           float_scale_dt(sc.dtype);
+
 }
 
 }  // namespace
@@ -766,11 +834,17 @@ extern "C" int r3d_relayout_logits_head(const RadParam* p, int n_p, int operand,
 {
     (void)p; (void)n_p;
     if (operand != 1) return R3D_NO(RAD_E_UNSUPPORTED);
+    RadLayout certified{};
+    const int status = r3d_head::plan(enc, sel, planes, n_planes, &certified);
+    if (status != RAD_OK) return status;
+    if (!dst || dst_bytes < certified.bytes) return RAD_E_SHAPE;
+    for (int index = 0; index < n_planes; ++index)
+        if (!planes[index].data) return RAD_E_INVAL;
     return rad_planes_relayout(enc, sel, planes, n_planes, dst, dst_bytes);
 }
 
 /* The head's layout hook, `ref::ref_layout_head` transcribed: operand 1 of logits_gemm, two planes
- * (codes and one scale), untransformed, answered with the container's own form and no byte moved.
+ * (codes and one scale), untransformed, answered with the container's bytes and a private dtype.
  * Operand 0 (the activations), a one-plane selection and every other encoding are declined, as
  * `layout_scaled` declines them. */
 extern "C" int r3d_layout_logits_head(const RadParam* p, int n_p, int operand,
@@ -779,6 +853,5 @@ extern "C" int r3d_layout_logits_head(const RadParam* p, int n_p, int operand,
 {
     (void)p; (void)n_p;                                        /* layout_scaled ignores both */
     if (n < 2 || operand != 1) return RAD_E_UNSUPPORTED;       /* layout_scaled(operand, 1, -1, ...) */
-    if (!enc_scaled_rows(enc, sel, n)) return RAD_E_DTYPE;
-    return rad_planes_layout(enc, sel, planes, n, out);
+    return r3d_head::plan(enc, sel, planes, n, out);
 }

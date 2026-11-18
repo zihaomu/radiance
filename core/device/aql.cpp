@@ -1698,6 +1698,48 @@ Loc locate(const void* p, const Stream* s, const void** gpu) {
 
 std::atomic<int64_t> g_pageable_bytes{0};
 
+int stream_device_access(RadStream rs, int device, const void* address) {
+    std::lock_guard<std::mutex> lock(G().streams_mu);
+    auto found = std::find(G().streams.begin(), G().streams.end(), rs);
+    if (found == G().streams.end()) return RAD_E_INVAL;
+    const Stream* stream = *found;
+    if (queue_of(stream->id) != stream->q || stream->ord != device) return RAD_E_DEVICE;
+    if (!address) return RAD_OK;
+    if (pinned_range(address, nullptr, nullptr)) return RAD_OK;
+    hsa_amd_pointer_info_t info{};
+    info.size = sizeof info;
+    uint32_t count = 0;
+    hsa_agent_t* agents = nullptr;
+    const auto status = hsa_amd_pointer_info(const_cast<void*>(address), &info,
+                                            std::malloc, &count, &agents);
+    bool accessible = false;
+    if (status == HSA_STATUS_SUCCESS)
+        for (uint32_t index = 0; index < count; ++index)
+            accessible = accessible || agents[index].handle == stream->agent.handle;
+    std::free(agents);
+    if (status != HSA_STATUS_SUCCESS) return RAD_E_DEVICE;
+    if (info.type == HSA_EXT_POINTER_TYPE_RESERVED_ADDR) {
+        int owner = -1;
+        hsa_access_permission_t permission = HSA_ACCESS_PERMISSION_NONE;
+        return aql_vmem_device_of(address, &owner) == 0 && owner == device &&
+                       hsa_amd_vmem_get_access(const_cast<void*>(address), &permission,
+                                               stream->agent) == HSA_STATUS_SUCCESS &&
+                       permission == HSA_ACCESS_PERMISSION_RW
+                   ? RAD_OK : RAD_E_DEVICE;
+    }
+    if (!accessible) return RAD_E_DEVICE;
+    if (info.type == HSA_EXT_POINTER_TYPE_LOCKED)
+        return info.hostBaseAddress == info.agentBaseAddress ? RAD_OK : RAD_E_DEVICE;
+    if (info.type != HSA_EXT_POINTER_TYPE_HSA && info.type != HSA_EXT_POINTER_TYPE_HSA_VMEM &&
+        info.type != HSA_EXT_POINTER_TYPE_GRAPHICS) return RAD_E_DEVICE;
+    hsa_device_type_t owner{};
+    if (hsa_agent_get_info(info.agentOwner, HSA_AGENT_INFO_DEVICE, &owner) != HSA_STATUS_SUCCESS)
+        return RAD_E_DEVICE;
+    return info.agentOwner.handle == stream->agent.handle ||
+                   (owner == HSA_DEVICE_TYPE_CPU && info.hostBaseAddress == info.agentBaseAddress)
+               ? RAD_OK : RAD_E_DEVICE;
+}
+
 }  // namespace
 
 void set_next_fence(uint8_t f) { t_next_fence = f; }
@@ -4691,6 +4733,7 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_aql.host_ptr = a_host_ptr;
         g_aql.device_ptr = a_device_ptr;
         g_aql.stream_create = a_stream_create;
+        g_aql.stream_device_access = stream_device_access;
         g_aql.stream_destroy = a_stream_destroy;
         g_aql.stream_sync = a_stream_sync;
         g_aql.event_create = a_event_create;

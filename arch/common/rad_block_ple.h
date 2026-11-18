@@ -459,8 +459,11 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
                {w.h, b_out}, {w.h});
 
     if (!op_ids || !op_gather || !op_embd || !key.op || !value.op || !op_gate || !op_conv ||
-        !op_add)
+        !op_add) {
+        fprintf(stderr, "PLE declare layer=%d ids=%u gather=%u copy=%u key=%u value=%u gate=%u conv=%u add=%u\n",
+                layer, op_ids, op_gather, op_embd, key.op, value.op, op_gate, op_conv, op_add);
         return RAD_E_INVAL;
+    }
     return RAD_OK;
 }
 

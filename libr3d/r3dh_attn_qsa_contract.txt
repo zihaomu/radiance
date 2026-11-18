@@ -1,0 +1,190 @@
+R3DH ATTENTION / QSA SCOPED HANDOFF
+Validated on 2026-11-17 in the actual Linux libr3d-iqr-dev worktree.
+
+Ownership and status
+Only libr3d/r3dh_attn_qsa* files belong to this port. No shared rows, CMake,
+schemas, plugin initialization, other agents' files, commits, or pushes were
+changed by this finish. Main integration is the main owner's responsibility.
+The standalone .so is a link/exports artifact, NOT a complete RadPlugin.
+All eight exports launch real device kernels. There are no success-returning
+stubs and no production CPU fallback. Strict scalar DEVICE code is implemented;
+no WMMA, native matrix-accelerated, fast-math, FP16-activation, or FP8 path is
+exposed or certified. This is correctness qualification, not a speed claim.
+
+Files and source build list
+Public ABI: libr3d/r3dh_attn_qsa.h
+Production HIP sources, and ONLY these production sources:
+  libr3d/r3dh_attn_qsa_device.hip
+  libr3d/r3dh_attn_qsa_rope.hip
+  libr3d/r3dh_attn_qsa_state.hip
+Checker: libr3d/r3dh_attn_qsa_check.hip
+Checker-only fixtures: libr3d/r3dh_attn_qsa_check_extra.h
+Linux host build/run driver: libr3d/r3dh_attn_qsa_test.sh
+This contract: libr3d/r3dh_attn_qsa_contract.txt
+Checker-only external sources: libref/ref_attn.cpp, libref/ref_qsa.cpp.
+Never add the checker, its fixtures, or libref oracles to the production library.
+
+Build and run
+From libr3d-iqr-dev: bash libr3d/r3dh_attn_qsa_test.sh all
+Modes: build (compile and host), host (existing binary), gpu (existing binary),
+all (compile, host, GPU). --host and --all spellings are also accepted.
+SDK image: freetoken:rocm10.1.0-transformers518-final-gh-proxy-20261026
+Compiler: /opt/rocm/llvm/bin/clang++, AMD clang 24.
+Every host/HIP unit uses -std=c++17 -O2 -fPIC -ffp-contract=off -fno-fast-math.
+HIP target: --offload-arch=gfx1100. Includes: abi, libr3d, libref (checker only).
+Main may keep HIP C++17; C++20 is not required by these files. Preserve strict
+flags on these production units. The public header disables clang contraction
+and refuses __FAST_MATH__ or nonzero __FINITE_MATH_ONLY__ for every unit.
+Separate production objects link with --hip-link -shared -lamdhip64.
+Artifacts: ../build-r3d-bootstrap/r3dh_attn_qsa{.so,_check}; prefixed .o files.
+The runner checks eight C exports and absence of CPU oracle symbols in the .so.
+GPU mode opens the existing production gpu-renderD131.lock READ ONLY, uses
+flock -n -E 75, ROCR_VISIBLE_DEVICES=3, HIP_VISIBLE_DEVICES=0, and releases the
+lock on command exit. Exit 75 means busy: no wait, steal, truncate, or fallback
+to another GPU. Host mode has no GPU device mounts. The checker requires exactly
+one visible gfx1100 and uses a nondefault, nonblocking HIP stream.
+
+ABI and canonical op mapping
+Every signature below is extern "C" int NAME(const RadArgs*, RadStream).
+  rope_table        -> r3dh_attn_qsa_rope_table
+  qk_norm_rope_gate -> r3dh_attn_qsa_prepare
+  rope              -> r3dh_attn_qsa_rope
+  kv_store          -> r3dh_attn_qsa_kv_store
+  attn_dense        -> r3dh_attn_qsa_dense
+  attn_paged        -> r3dh_attn_qsa_paged
+  qsa_work          -> r3dh_attn_qsa_work
+  qsa_tail_store    -> r3dh_attn_qsa_tail_store
+qsa_qprep_h128_pitched is a CHECKER LABEL for the k-only preparation form,
+not an additional canonical operation or a complete QSA indexer.
+All operands with non-null data, including positions, weights, tables, state,
+and metadata, must be DEVICE resident. RadArgs/RadTensor/parameters are host ABI
+descriptors. Entry points do not allocate, synchronize, or run host numerics.
+Return codes: RAD_OK for successful enqueue, RAD_E_INVAL for bad call arity or
+invalid numerical scalars, RAD_E_UNSUPPORTED for unsupported parameters,
+RAD_E_SHAPE for unsupported tensor geometry/type/stride, RAD_E_DEVICE on launch
+failure. Enqueue success is not a synchronization/execution-success guarantee.
+
+Schemas: preserve the canonical parameter lists and operand order
+Canonical definitions: libref/ref_registry.cpp pRopeTable/pRope/pKvStore/
+pAttnDense/pAttnPaged/pQsaWork/pQsaTailStore and their o* arrays; fused prepare
+uses libr4d/r4d_rows.cpp pQkNormRopeGate/oQkNormRopeGate (not a libref schema).
+Do not install broad DT_FLOAT/DT_ANY rows unchanged. Restrict candidate selection
+to the following parameters, types, optional-operand presence, and shape hooks.
+M, q_len, max_ctx/max_seqlen, max_seqs, seqs and work must agree with the
+actual descriptors/capacities. Runtime code derives work from tensor shapes.
+
+rope_table parameters: M,rot,theta,scale,dtype; optional yarn_factor,yarn_low,
+yarn_high,yarn_magnitude,head_dim,ladder. Operands: positions, cos_sin(out).
+Restrict rot=64, dtype=f32, ladder absent/rotary, no YaRN/Llama3 extensions.
+positions is contiguous I32[M], 1<=M<=2048; cos_sin contiguous F32[C,64], C>=1.
+theta/scale are finite and positive. Writes at each position's OWN table row;
+negative or >=C positions leave the table unchanged. Other rows are preserved.
+
+qk_norm_rope_gate parameters: M,head_dim,n_head,n_head_kv,rot,q_dtype;
+optional eps,wadd,cs_f32,pos_i64. Operands (9, including absent placeholders):
+q_gate?,k,cos_sin,positions,q_w?,k_w,q_out?,k_out,gate_out?.
+Restrict (head_dim,n_head,n_head_kv)=(256,12,1) OR (128,0,4); rot=64,
+q_dtype=bf16, cs_f32=1, pos_i64 absent/0. eps finite >0, wadd finite.
+q_gate is per-head [Q(256),G(256)] interleaved, total width 6144, NOT planar
+[all Q,all G]. Q/K/out/gate are BF16; q_w/k_w are contiguous F32[head_dim].
+cos_sin is contiguous F32[C,64]; positions contiguous I32[M]. Normalization
+rounds to BF16 before split-half partial-64 RoPE. The remaining head dimensions
+are normalized but not rotated. Gate values are copied unchanged, not sigmoided
+or applied to attention output. n_head=0 has four k-only 128-wide heads and no
+Q/gate operands. k_out==k is tested; all other input/output overlaps are outside
+the tested contract. Invalid table positions perform normalization without RoPE.
+
+rope parameters: M,head_dim,n_head,n_head_kv,theta,scale,mode; optional
+rotary_dim,sections,yarn_factor,yarn_low,yarn_high,yarn_magnitude,ladder,
+llama3_factor,llama3_low,llama3_high,llama3_orig. Operands: qkv(inout),positions.
+Restrict BF16 tensors, rotary_dim=64, n_head_kv=0; (head_dim,n_head)=(256,12),
+(256,1), or (128,4); mode=neox OR imrope with sections="11 11 10";
+ladder absent/rotary and no YaRN/Llama3. theta/scale finite >0.
+Positions I32[M], or I32[3,M] for imrope; component planes can be pitched.
+Partial rotation changes only dimensions [0,64); negative positions are no-op.
+
+kv_store parameters: M,head_dim,n_head_kv,block_size,kv_dtype; optional
+k_scale,v_scale (FP8-only knobs, not this per-token-scale i8 format).
+Operands: k,v,slot_mapping,kv_cache(inout). Restrict head_dim=256,n_head_kv=1,
+block_size=4,kv_dtype=i8; K/V BF16[M,256], slots contiguous I32[M].
+Cache is contiguous I8[P,1,4,516], 1<=P<=50000: K bytes[0,256), V[256,512),
+then F16 k_scale/v_scale at byte offsets 512/514. These F16 scale fields are the
+canonical i8 format, NOT FP16 activation or accumulation staging. Scale is
+RNE-F16(min(max_abs/127,515)); quantization is nearest-even and clamps to
+[-127,127]. Negative or out-of-range slot ids leave the cache untouched.
+Slot mappings must be unique for concurrent writers.
+
+attn_dense parameters: M,head_dim,gqa,causal,dtype; optional scale,max_seqlen,
+window,cu_div,block,window_right. Operands: q,k,v,cu_seqlens,out.
+Restrict head_dim=256,gqa=12,causal=1,dtype=bf16,window=0,window_right=0,
+cu_div=1,block=0. Q/out width3072; K/V width256; contiguous I32[S+1] cu.
+Ragged segments use their own causal origin. scale finite >0, default 1/16.
+
+attn_paged parameters: q_len,head_dim,gqa,block_size,causal,window,q_dtype,
+kv_dtype; optional scale,max_ctx,n_head,max_seqs,prefill_fp8. Operands (8):
+q,kv_cache,block_table,seqused,k_descale?,v_descale?,cu_seqlens?,out.
+Restrict head_dim=256,gqa=12,n_head=12,block_size=4,causal=1,window=0,
+q_dtype=bf16,kv_dtype=i8, both descale operands ABSENT; scale finite >0.
+Q/out width3072; cache exactly as kv_store; I32[S,B] block table, B<=50000,
+last stride1; contiguous I32[S] used lengths. Optional cu is I32[S+1]; without
+cu, Q rows must divide evenly across S. Historical KV uses used-(end-begin)
+as the causal query start. Logical pages are contiguous history even when
+physical page ids are shuffled. This is NOT a QSA signed/union/tree cache path.
+
+For dense/paged/preparation/RoPE, 1<=M<=2048. BF16 matrices may be rank2 or
+packed-head rank3, last dimensions contiguous and leading pitch >= width and
+<=2^30. Dense/paged accept 1<=S<=2048. Require valid nondecreasing cu with
+cu[0]=0,cu[S]=M; nonnegative finite-range positions; valid cache pages and used
+lengths within allocated history. Inputs/weights must be finite. These are
+device-data preconditions, not host-side validation of device contents.
+
+qsa_tail_store parameters: M,n,ratio,ring,seqs,dtype. Operands (5):
+k,pos,cu,state(inout),sidx.
+qsa_work parameters: M,n,ratio,ring,seqs,work(capacity),dtype. Operands (11):
+k,pos,cu,state,sidx,bt,rope?,stage(out),page(out),bpos(out),nc(out).
+Restrict n=128,ratio=4,ring=7,dtype=bf16; M<=2048,1<=S<=8.
+K BF16[M,128]; pos I32[M]; cu I32[S+1]; state BF16[slots,1,7,128],
+1<=slots<=65536, unit final stride, ring pitch>=128, slot pitch>=7*ring pitch.
+sidx I32[S] or pitched I32[S,W>=1], first column is the state slot, -1 absent.
+For work: bt pitched I32[S,B],1<=B<=50000; optional rope pitched I32[3,M];
+S<=work<=520; stage BF16[4*work,128]; page I32[work]; nc I32[S];
+bpos I32[work] or pitched [work,1] without rope, [work,3] with rope.
+Capacity must fit every completing block. Valid cu/monotonic contiguous token
+positions and distinct nonnegative state slots per sequence are preconditions.
+Call qsa_work BEFORE qsa_tail_store on the same stream. Ring7 preserves the
+ratio4 speculative-restart history; absent slots yield page=-1 and untouched
+stage. Unused work slots have page=-1 and zero bpos. Strided state/stage tested.
+
+Qualification and explicit exclusions
+Latest all run: host 93 cases; GPU 93 cases, including 9 host ABI rejections;
+108 device-kernel invocations, 6 changed-input HIP graph replays,
+30,902,240 comparisons (numeric elements plus exact-byte/guard comparisons).
+Every reported output has differences=0 on physical GPU3 W7900D/gfx1100.
+Checker acceptance bounds are F32 abs<=3e-6; BF16 <=1 ULP or abs<1e-6;
+cache/state/gate/outer guards exact. Observed results were bit-exact, not merely
+within those bounds. Host oracle uses independent cpu_prepare plus separately
+compiled strict libref RoPE/table/KV/attention/QSA state implementations.
+Coverage: M=1,3,17,64 preparations/RoPE with changed inputs; M=2048 prepare
+and k-only indexer; dense/paged ragged M=1,3,17; decode history65/M3 and
+history1025/M1 with and without cu; negative slots; table positions through
+199999 with invalid-position no-op; optional gate; in-place K; ring7 rollback
+at restarts9/10, absent state, and independent state work/tail references.
+Resident graph chain is rope_table -> prepare -> kv_store -> dense AND paged,
+M=1,3,17, replayed twice with changed inputs; no intermediate CPU recomputation
+or upload supplies the DEVICE chain. Uploads synchronize before CPU oracle
+mutation. QSA work/tail are separately qualified, NOT a complete QSA graph.
+
+NOT IMPLEMENTED: qsa_block_key, qsa_score, qsa_select, sparse/selected QSA
+attention, union/signed masks, streamed KV, tree/sink attention, fused
+prepare+KV-store entry points, other head geometries/cache dtypes, YaRN/Llama3,
+full model/TP2 execution, performance certification. Do not register any of
+these as supported or describe this as all-QSA/full-model completion.
+
+Evidence, relative to ../results/r3d-iqr/implementation/logs/
+r3dh_attn_qsa-finish.log: final build/host/GPU gate summary.
+r3dh_attn_qsa-build.log: actual SDK/compiler/flags and compile/link diagnostics.
+r3dh_attn_qsa-host.log and r3dh_attn_qsa-gpu.log: complete case output.
+r3dh_attn_qsa-exports.log: eight production C symbols.
+r3dh_attn_qsa-{fast-math,finite-math-only}-reject.log: build-policy rejection.
+r3dh_attn_qsa-cli-reject.log: invalid checker mode refuses before HIP init.
+Final source/binary SHA256 values are recorded in r3dh_attn_qsa-sha256.log.

@@ -1,0 +1,1161 @@
+#include "rad_test.h"
+#include "rad_abi.h"
+#include "rad_device.h"
+#include "rad_plugin.h"
+#include "device/device.h"
+#include "../libr3d/r3dh_i8.h"
+#include <cfenv>
+#include <limits>
+#include <dlfcn.h>
+#include <memory>
+
+namespace {
+struct Library {
+    void* handle;
+    explicit Library(const char* name) {
+        handle = dlopen((home() + "/kernels/" + name + ".so").c_str(),
+                        RTLD_NOW | RTLD_LOCAL);
+        if (!handle) throw std::runtime_error(dlerror());
+    }
+    ~Library() { dlclose(handle); }
+    const RadKernelInfo* ngram(const char* operation = "ngram_ids") {
+        auto count = reinterpret_cast<int (*)()>(dlsym(handle, "rad_kernel_count"));
+        auto at = reinterpret_cast<const RadKernelInfo* (*)(int)>(dlsym(handle, "rad_kernel_at"));
+        if (!count || !at) throw std::runtime_error("missing plugin enumeration");
+        for (int index = 0; index < count(); ++index) {
+            const auto* row = at(index);
+            if (!std::strcmp(row->op, operation)) return row;
+        }
+        throw std::runtime_error("missing ngram_ids row");
+    }
+};
+struct Queue {
+    RadStream stream = nullptr;
+    explicit Queue(int priority) { REQUIRE_EQ(rad_stream_create(&stream, priority), RAD_OK); }
+    ~Queue() { rad_stream_destroy(stream); }
+};
+struct Buffer {
+    std::vector<uint8_t> expected;
+    void* allocation;
+    int kind;
+    RadTensor host{}, device{};
+    Buffer(int dtype, std::initializer_list<int64_t> shape, int memory, int pitch = 0)
+        : kind(memory) {
+        host.dtype = dtype;
+        host.rank = shape.size();
+        int64_t elements = 1;
+        std::copy(shape.begin(), shape.end(), host.shape);
+        for (int dim = host.rank - 1; dim >= 0; --dim) {
+            host.stride[dim] = elements;
+            elements *= host.shape[dim];
+        }
+        if (pitch) {
+            host.stride[0] = pitch;
+            elements = host.shape[0] * pitch;
+        }
+        expected.assign(128 + elements * (dtype == RAD_I64 ? 8 : dtype == RAD_BF16 ? 2 : 4), 0x5a);
+        host.data = expected.data() + 64;
+        allocation = rad_dev_alloc(expected.size(), kind);
+        REQUIRE(allocation);
+        device = host;
+        device.data = static_cast<uint8_t*>(allocation) + 64;
+    }
+    ~Buffer() { rad_dev_free(allocation, kind); }
+    template <class Value> Value* data() { return static_cast<Value*>(host.data); }
+    void push(RadStream stream) {
+        REQUIRE_EQ(rad_memcpy_async(allocation, expected.data(), expected.size(), stream), RAD_OK);
+    }
+    std::vector<uint8_t> read(RadStream stream) {
+        std::vector<uint8_t> bytes(expected.size());
+        if (rad_memcpy_async(bytes.data(), allocation, bytes.size(), stream) != RAD_OK ||
+            rad_stream_sync(stream) != RAD_OK)
+            throw std::runtime_error("buffer read failed");
+        return bytes;
+    }
+};
+RadParam integer(const char* key, int64_t value) {
+    RadParam param{};
+    param.key = key;
+    param.kind = RAD_P_INT;
+    param.ival = value;
+    return param;
+}
+}
+
+TEST(r3d_mtp_ple_access_host_backend) {
+    RadDeviceProps props{};
+    REQUIRE_EQ(rad_dev_props(0, &props), RAD_OK);
+    if (!props.is_host_backend) SKIP("host backend only");
+    Queue queue(0);
+    int pageable = 0;
+    CHECK_EQ(rad_stream_device_access(queue.stream, 0, &pageable), RAD_E_UNSUPPORTED);
+    CHECK_EQ(rad_stream_device_access(reinterpret_cast<RadStream>(0x12345), 0, nullptr),
+             RAD_E_UNSUPPORTED);
+}
+
+TEST(r3d_mtp_ple_actual_aql_mapped_ngram) {
+    RadDeviceProps props{};
+    REQUIRE_EQ(rad_dev_props(0, &props), RAD_OK);
+    if (props.is_host_backend) {
+        REQUIRE(!std::getenv("RAD_R3D_REQUIRE_DEVICE"));
+        SKIP("explicit gfx1100 card run required");
+    }
+    REQUIRE_EQ(std::strcmp(props.arch, "gfx1100"), 0);
+    REQUIRE_EQ(rad_dev_set(0), RAD_OK);
+    Library native("libr3d"), reference("libref");
+    auto* row = native.ngram();
+    auto* oracle = reference.ngram();
+    REQUIRE_EQ(std::strcmp(row->name, "r3d_ngram_ids_i32"), 0);
+    Queue compute(0), other(1);
+    uint64_t compared = 0, launches = 0, rejects = 0;
+    std::vector<int> counts;
+    for (int count = 1; count <= 64; ++count) counts.push_back(count);
+    for (int count : {127, 511, 2047, 2048}) counts.push_back(count);
+    for (int memory : {RAD_MEM_HOST_MAPPED, RAD_MEM_HOST_PINNED})
+        for (int count : counts) {
+            RadStream stream = count % 2 ? compute.stream : other.stream;
+            REQUIRE_EQ(rad_stream_device_access(stream, 0, nullptr), RAD_OK);
+            CHECK_EQ(rad_stream_device_access(stream, 1, nullptr), RAD_E_DEVICE);
+            CHECK_EQ(rad_stream_device_access(reinterpret_cast<RadStream>(0x12345), 0, nullptr),
+                     RAD_E_INVAL);
+            std::vector<std::unique_ptr<Buffer>> buffers;
+            auto add = [&](int type, std::initializer_list<int64_t> shape, int kind, int pitch = 0) {
+                buffers.push_back(std::make_unique<Buffer>(type, shape, kind, pitch));
+            };
+            add(RAD_I32, {count}, memory);
+            add(RAD_I32, {3, 1, 2}, RAD_MEM_DEVICE);
+            add(RAD_I32, {4}, memory);
+            add(RAD_I64, {3}, RAD_MEM_DEVICE);
+            add(RAD_I64, {16}, RAD_MEM_DEVICE);
+            add(RAD_I64, {16}, RAD_MEM_DEVICE);
+            add(RAD_I32, {3}, memory);
+            add(RAD_I32, {3}, memory);
+            add(RAD_I32, {3}, memory);
+            add(RAD_I32, {count, 16}, memory, 21);
+            auto ints = [&](int index) { return buffers[index]->data<int32_t>(); };
+            auto longs = [&](int index) { return buffers[index]->data<int64_t>(); };
+            for (int index = 0; index < 6; ++index) ints(1)[index] = index * 7919;
+            const int32_t cumulative[]{0, count / 2, count / 2, count};
+            std::memcpy(ints(2), cumulative, sizeof cumulative);
+            longs(3)[0] = 24000000000001ll;
+            longs(3)[1] = -51000000000007ll;
+            longs(3)[2] = INT64_MAX - 2;
+            for (int head = 0; head < 16; ++head) {
+                longs(4)[head] = 101 + head * 2;
+                longs(5)[head] = head * 200;
+            }
+            for (int sequence = 0; sequence < 3; ++sequence) {
+                ints(6)[sequence] = 2 - sequence;
+                ints(7)[sequence] = 1;
+                ints(8)[sequence] = 1;
+            }
+            std::vector<RadTensor> host, device;
+            for (auto& buffer : buffers) {
+                host.push_back(buffer->host);
+                device.push_back(buffer->device);
+            }
+            host.push_back({});
+            device.push_back({});
+            host[8] = {};
+            device[8] = {};
+            std::vector<RadParam> params{integer("M", 2048), integer("heads", 16),
+                                         integer("ngram", 3), integer("eos", 248044)};
+            RadArgs args{};
+            args.t = device.data(); args.n_t = device.size();
+            args.p = params.data(); args.n_p = params.size();
+            for (int step = 0; step < 4; ++step) {
+                for (int token = 0; token < count; ++token)
+                    ints(0)[token] = (token + step) % 7 == 0 ? 248044 :
+                        int32_t((uint32_t(token * 7919) ^ uint32_t((step + 1) * 2246822519u)) % 248000);
+                for (int sequence = 0; sequence < 3; ++sequence)
+                    ints(7)[sequence] = step == 0 ? sequence % 2 : 1;
+                std::fill(buffers[9]->expected.begin() + 64,
+                          buffers[9]->expected.end() - 64, uint8_t(0xa5));
+                for (size_t index = 0; index < buffers.size(); ++index)
+                    if (index != 1 || step == 0) buffers[index]->push(stream);
+                for (int repeat = 0; repeat < 2; ++repeat) {
+                    args.t = host.data();
+                    REQUIRE_EQ(oracle->launch(&args, nullptr), RAD_OK);
+                    args.t = device.data();
+                    REQUIRE_EQ(row->launch(&args, stream), RAD_OK);
+                    ++launches;
+                }
+                REQUIRE_EQ(rad_stream_sync(stream), RAD_OK);
+                for (auto& buffer : buffers) {
+                    auto actual = buffer->read(stream);
+                    REQUIRE(actual == buffer->expected);
+                    compared += actual.size();
+                }
+                auto before = buffers[9]->read(stream);
+                for (int index : {0, 1, 3, 9}) {
+                    void* saved = device[index].data;
+                    device[index].data = host[index].data;
+                    CHECK_EQ(row->launch(&args, stream), RAD_E_DEVICE);
+                    device[index].data = saved;
+                    ++rejects;
+                }
+                CHECK(buffers[9]->read(stream) == before);
+            }
+        }
+    RadStream closed = nullptr;
+    REQUIRE_EQ(rad_stream_create(&closed, 0), RAD_OK);
+    rad_stream_destroy(closed);
+    CHECK_EQ(rad_stream_device_access(closed, 0, nullptr), RAD_E_DEVICE);
+    std::fprintf(stderr, "AQL_NGRAM_PASS fixtures=136 band=2048 launches=%llu rejects=%llu compared_bytes=%llu\n",
+                 (unsigned long long)launches, (unsigned long long)rejects,
+                 (unsigned long long)compared);
+}
+
+TEST(r3d_mtp_ple_actual_aql_shared_validator_and_gate) {
+    RadDeviceProps props{};
+    REQUIRE_EQ(rad_dev_props(0, &props), RAD_OK);
+    if (props.is_host_backend) {
+        REQUIRE(!std::getenv("RAD_R3D_REQUIRE_DEVICE"));
+        SKIP("explicit gfx1100 card run required");
+    }
+    REQUIRE_EQ(rad_dev_set(0), RAD_OK);
+    Library native("libr3d"), reference("libref");
+    using Launch = int (*)(const RadArgs*, RadStream);
+    auto validate = reinterpret_cast<Launch>(dlsym(native.handle, "r3dh_mtp_ple_device"));
+    auto gate = reinterpret_cast<Launch>(dlsym(native.handle, "r3dh_mtp_ple_ple_gate"));
+    REQUIRE(validate && gate);
+    const auto* oracle = reference.ngram("ple_gate");
+    Queue queue(1);
+    std::vector<std::unique_ptr<Buffer>> buffers;
+    for (int index = 0; index < 8; ++index) {
+        const bool weight = index >= 3 && index <= 5;
+        buffers.push_back(std::make_unique<Buffer>(weight ? RAD_F32 : RAD_BF16,
+            weight ? std::initializer_list<int64_t>{16} :
+                     std::initializer_list<int64_t>{3, index == 2 ? 8 : 16},
+            weight ? RAD_MEM_DEVICE : RAD_MEM_HOST_MAPPED));
+    }
+    std::vector<RadTensor> host, device;
+    for (auto& buffer : buffers) {
+        host.push_back(buffer->host);
+        device.push_back(buffer->device);
+    }
+    std::vector<RadParam> params{integer("M", 3), integer("n", 8), integer("hc", 2)};
+    RadArgs args{};
+    args.t = device.data(); args.n_t = device.size();
+    args.p = params.data(); args.n_p = params.size();
+    args.scratch = device[0].data;
+    REQUIRE_EQ(validate(&args, queue.stream), RAD_OK);
+    args.scratch = device[3].data;
+    REQUIRE_EQ(validate(&args, queue.stream), RAD_OK);
+    int pageable = 0;
+    args.scratch = &pageable;
+    CHECK_EQ(validate(&args, queue.stream), RAD_E_DEVICE);
+    args.scratch = reinterpret_cast<void*>(0x12345);
+    CHECK_EQ(validate(&args, queue.stream), RAD_E_DEVICE);
+    args.scratch = nullptr;
+    CHECK_EQ(validate(&args, reinterpret_cast<RadStream>(0x12345)), RAD_E_DEVICE);
+    void* saved = device[0].data;
+    device[0].data = reinterpret_cast<void*>(0x12345);
+    CHECK_EQ(validate(&args, queue.stream), RAD_E_DEVICE);
+    device[0].data = saved;
+    const auto* backend = rad::active_backend();
+    REQUIRE(backend->vmem_granularity && backend->vmem_reserve && backend->vmem_commit &&
+            backend->vmem_decommit && backend->vmem_release);
+    const int64_t granule = backend->vmem_granularity();
+    REQUIRE(granule > 0);
+    void* mapping = backend->vmem_reserve(granule, granule);
+    REQUIRE(mapping);
+    CHECK_EQ(rad_stream_device_access(queue.stream, 0, mapping), RAD_E_DEVICE);
+    REQUIRE_EQ(backend->vmem_commit(mapping, granule), RAD_OK);
+    CHECK_EQ(rad_stream_device_access(queue.stream, 0, mapping), RAD_OK);
+    CHECK_EQ(rad_stream_device_access(queue.stream, 0,
+             static_cast<uint8_t*>(mapping) + granule - 1), RAD_OK);
+    args.scratch = mapping;
+    CHECK_EQ(validate(&args, queue.stream), RAD_OK);
+    args.scratch = nullptr;
+    REQUIRE_EQ(backend->vmem_decommit(mapping, granule), RAD_OK);
+    CHECK_EQ(rad_stream_device_access(queue.stream, 0, mapping), RAD_E_DEVICE);
+    backend->vmem_release(mapping, granule);
+    double maximum = 0;
+    for (int step = 0; step < 4; ++step) {
+        for (size_t index = 0; index < buffers.size(); ++index) {
+            auto& buffer = *buffers[index];
+            for (int64_t element = 0; element < rad_tensor_numel(&buffer.host); ++element) {
+                if (buffer.host.dtype == RAD_F32)
+                    buffer.data<float>()[element] = float(1 + element % 3) / 4;
+                else
+                    buffer.data<uint16_t>()[element] = uint16_t(0x3e80 + ((element + step) % 7) * 64);
+            }
+            buffer.push(queue.stream);
+        }
+        args.t = host.data();
+        REQUIRE_EQ(oracle->launch(&args, nullptr), RAD_OK);
+        args.t = device.data();
+        REQUIRE_EQ(gate(&args, queue.stream), RAD_OK);
+        REQUIRE_EQ(rad_stream_sync(queue.stream), RAD_OK);
+        for (size_t index = 0; index < buffers.size(); ++index) {
+            auto actual = buffers[index]->read(queue.stream);
+            auto expected = buffers[index]->expected;
+            if (index >= 6) {
+                for (int64_t element = 0; element < rad_tensor_numel(&host[index]); ++element) {
+                    uint16_t value = 0;
+                    std::memcpy(&value, actual.data() + 64 + element * 2, 2);
+                    double error = std::abs(double(rad_bf16_to_f32(value)) -
+                        rad_bf16_to_f32(buffers[index]->data<uint16_t>()[element]));
+                    REQUIRE(std::isfinite(error));
+                    maximum = std::max(maximum, error);
+                    std::memcpy(expected.data() + 64 + element * 2, &value, 2);
+                }
+            }
+            CHECK(actual == expected);
+        }
+    }
+    CHECK(maximum <= 0.015);
+    std::fprintf(stderr, "AQL_PLE_GATE_PASS launches=4 shared_validator_rejects=4 max_abs=%.9g\n", maximum);
+}
+
+static void r3d_bf16_aql_gemm(bool dense, bool router = false) {
+    RadDeviceProps props{};
+    REQUIRE_EQ(rad_dev_props(0, &props), RAD_OK);
+    if (props.is_host_backend) {
+        REQUIRE(!std::getenv("RAD_R3D_REQUIRE_DEVICE"));
+        SKIP("explicit gfx1100 card run required");
+    }
+    REQUIRE_EQ(std::strcmp(props.arch, "gfx1100"), 0);
+    REQUIRE_EQ(rad_dev_set(0), RAD_OK);
+    Library native("libr3d"), reference("libref");
+    using Launch = int (*)(const RadArgs*, RadStream);
+    auto gemm = reinterpret_cast<Launch>(dlsym(native.handle, "r3d_rad_gemm_nt_bf16_tiled"));
+    auto logits = reinterpret_cast<Launch>(dlsym(native.handle, "r3d_rad_logits_gemm_bf16"));
+    REQUIRE(gemm && logits);
+    if (router) {
+        auto count = reinterpret_cast<int (*)()>(dlsym(native.handle, "rad_kernel_count"));
+        auto at = reinterpret_cast<const RadKernelInfo* (*)(int)>(dlsym(native.handle, "rad_kernel_at"));
+        REQUIRE(count && at);
+        gemm = nullptr;
+        for (int index = 0; index < count(); ++index) {
+            const auto* row = at(index);
+            if (row && !std::strcmp(row->name, "model_router_gemm_strict")) gemm = row->launch;
+        }
+        REQUIRE(gemm);
+    }
+    Queue compute(0), other(1);
+    const auto* backend = rad::active_backend();
+    REQUIRE(backend->vmem_granularity && backend->vmem_reserve && backend->vmem_commit_units &&
+            backend->vmem_decommit && backend->vmem_release);
+    struct Mapping {
+        const rad::DeviceBackend* backend;
+        void* address = nullptr;
+        int64_t bytes = 0;
+        bool committed = false;
+        ~Mapping() {
+            if (committed) backend->vmem_decommit(address, bytes);
+            if (address) backend->vmem_release(address, bytes);
+        }
+    };
+    uint64_t fixtures = 0, launches = 0, compared = 0, rejects = 0;
+    for (bool virtual_weights : {false, true})
+        for (bool f32_output : {false, true})
+            for (int rows : {1, 3, 63, 64})
+                for (int columns : {48, 96, 1, 512}) {
+                    if (router && (f32_output || (columns != 1 && columns != 512))) continue;
+                    constexpr int inner = 2560;
+                    const int x_pitch = inner + 16;
+                    const int y_pitch = ((columns + 7) / 8 + 1) * 8;
+                    Buffer activation(RAD_BF16, {rows, inner}, RAD_MEM_DEVICE, x_pitch);
+                    Buffer weight(RAD_BF16, {columns, inner}, RAD_MEM_DEVICE);
+                    Buffer output(f32_output ? RAD_F32 : RAD_BF16,
+                                  {rows, columns}, RAD_MEM_DEVICE, y_pitch);
+                    Mapping mapping{backend};
+                    if (virtual_weights) {
+                        const int64_t granule = backend->vmem_granularity();
+                        REQUIRE(granule > 0);
+                        mapping.bytes = (int64_t(weight.expected.size()) + granule - 1) /
+                                        granule * granule;
+                        mapping.address = backend->vmem_reserve(mapping.bytes, granule);
+                        REQUIRE(mapping.address);
+                        REQUIRE(backend->vmem_commit_units(mapping.address, mapping.bytes,
+                                                           granule) >= 0);
+                        mapping.committed = true;
+                        weight.device.data = static_cast<uint8_t*>(mapping.address) + 64;
+                    }
+                    RadTensor host[]{activation.host, weight.host, output.host};
+                    RadTensor device[]{activation.device, weight.device, output.device};
+                    std::vector<RadParam> params{integer("M", rows <= 16 ? 16 : 64),
+                        integer(f32_output ? "n_vocab" : "N", columns),
+                        integer(f32_output ? "n_embd" : "K", inner), integer("impl", 0)};
+                    RadArgs args{};
+                    args.t = device; args.n_t = 3;
+                    args.p = params.data(); args.n_p = params.size();
+                    const auto* oracle = reference.ngram(f32_output ? "logits_gemm" : "gemm_nt");
+                    Launch launch = f32_output ? logits : gemm;
+                    RadStream stream = rows % 2 ? other.stream : compute.stream;
+                    REQUIRE_EQ(rad_stream_device_access(stream, 0, weight.device.data), RAD_OK);
+                    for (int step = 0; step < 2; ++step) {
+                        for (int row = 0; row < rows; ++row)
+                            for (int index = 0; index < inner; ++index) {
+                                const uint32_t mixed = uint32_t(index + row * 3571 + step * 65537) *
+                                                       2246822519u;
+                                activation.data<uint16_t>()[row * x_pitch + index] =
+                                    rad_f32_to_bf16(dense ? float(int((mixed >> 19) % 33) - 16) / 32 :
+                                        float((row % 3 + 1) * (step ? -2 : 1)) / 8);
+                            }
+                        for (int column = 0; column < columns; ++column)
+                            for (int index = 0; index < inner; ++index) {
+                                const uint32_t mixed = uint32_t(index + column * 7919) * 3266489917u;
+                                weight.data<uint16_t>()[column * inner + index] =
+                                    rad_f32_to_bf16(dense ? float(int((mixed >> 17) % 17) - 8) / 16 :
+                                        float(column % 3 + 1));
+                            }
+                        std::fill(output.expected.begin(), output.expected.end(), uint8_t(0x5a));
+                        activation.push(stream);
+                        output.push(stream);
+                        if (virtual_weights)
+                            REQUIRE_EQ(rad_memcpy_async(mapping.address, weight.expected.data(),
+                                weight.expected.size(), stream), RAD_OK);
+                        else weight.push(stream);
+                        args.t = host;
+                        REQUIRE_EQ(oracle->launch(&args, nullptr), RAD_OK);
+                        args.t = device;
+                        REQUIRE_EQ(launch(&args, stream), RAD_OK);
+                        ++launches;
+                        REQUIRE_EQ(rad_stream_sync(stream), RAD_OK);
+                        auto actual = output.read(stream);
+                        uint64_t differences = 0;
+                        for (size_t byte = 0; byte < actual.size(); ++byte)
+                            differences += actual[byte] != output.expected[byte];
+                        std::fprintf(stderr,
+                            "AQL_BF16 memory=%s op=%s M=%d band=%lld N=%d K=%d step=%d diff_bytes=%llu\n",
+                            virtual_weights ? "VMEM" : "DEVICE", f32_output ? "logits_gemm" : "gemm_nt",
+                            rows, (long long)params[0].ival, columns, inner, step,
+                            (unsigned long long)differences);
+                        if (differences) {
+                            int printed = 0;
+                            for (int row = 0; row < rows && printed < 4; ++row)
+                                for (int column = 0; column < columns && printed < 4; ++column) {
+                                    const size_t offset = 64 + (row * y_pitch + column) *
+                                                          (f32_output ? 4 : 2);
+                                    if (!std::memcmp(actual.data() + offset,
+                                            output.expected.data() + offset, f32_output ? 4 : 2)) continue;
+                                    double dot = 0;
+                                    for (int index = 0; index < inner; ++index)
+                                        dot += double(rad_bf16_to_f32(activation.data<uint16_t>()[
+                                            row * x_pitch + index])) * rad_bf16_to_f32(
+                                            weight.data<uint16_t>()[column * inner + index]);
+                                    uint32_t got = 0, want = 0;
+                                    std::memcpy(&got, actual.data() + offset, f32_output ? 4 : 2);
+                                    std::memcpy(&want, output.expected.data() + offset, f32_output ? 4 : 2);
+                                    std::fprintf(stderr, "AQL_BF16_DIFF row=%d column=%d gpu=0x%x ref=0x%x dot=%.17g\n",
+                                                 row, column, got, want, dot);
+                                    ++printed;
+                                }
+                        }
+                        CHECK_EQ(differences, uint64_t(0));
+                        auto guarded = output.expected;
+                        for (int row = 0; row < rows; ++row)
+                            for (int column = 0; column < columns; ++column) {
+                                const size_t offset = 64 + (row * y_pitch + column) *
+                                                      (f32_output ? 4 : 2);
+                                std::memcpy(guarded.data() + offset, actual.data() + offset,
+                                            f32_output ? 4 : 2);
+                            }
+                        CHECK(actual == guarded);
+                        CHECK(activation.read(stream) == activation.expected);
+                        if (virtual_weights) {
+                            std::vector<uint8_t> actual_weight(weight.expected.size());
+                            REQUIRE_EQ(rad_memcpy_async(actual_weight.data(), mapping.address,
+                                actual_weight.size(), stream), RAD_OK);
+                            REQUIRE_EQ(rad_stream_sync(stream), RAD_OK);
+                            CHECK(actual_weight == weight.expected);
+                        } else CHECK(weight.read(stream) == weight.expected);
+                        compared += actual.size();
+                    }
+                    const auto before = output.read(stream);
+                    if (router) {
+                        for (int invalid_band : {rows - 1, 2049}) {
+                            params[0].ival = invalid_band;
+                            CHECK_EQ(launch(&args, stream), RAD_E_SHAPE);
+                            ++rejects;
+                        }
+                        params[0].ival = rows <= 16 ? 16 : 64;
+                    }
+                    for (uint32_t dtype : {uint32_t(RAD_F32), uint32_t(RAD_F16),
+                            uint32_t(RAD_I8), uint32_t(RAD_F8E4M3), uint32_t(0x7fffffffu)}) {
+                        device[1].dtype = dtype;
+                        device[1].data = reinterpret_cast<void*>(uintptr_t(0x123450000000ull));
+                        CHECK_EQ(launch(&args, stream), RAD_E_DTYPE);
+                        ++rejects;
+                    }
+                    device[1] = weight.device;
+                    CHECK(output.read(stream) == before);
+                    ++fixtures;
+                }
+    std::fprintf(stderr,
+        "AQL_BF16_SUMMARY fixture=%s fixtures=%llu launches=%llu rejects=%llu compared_output_guard_bytes=%llu\n",
+        router ? "router_band_exact" : dense ? "dense_exact" : "representable_exact",
+        (unsigned long long)fixtures, (unsigned long long)launches,
+        (unsigned long long)rejects, (unsigned long long)compared);
+}
+
+TEST(r3d_bf16_actual_aql_device_and_vmem_gemm) {
+    r3d_bf16_aql_gemm(false);
+}
+
+TEST(r3d_bf16_actual_aql_device_and_vmem_gemm_dense_exact) {
+    r3d_bf16_aql_gemm(true);
+}
+
+TEST(r3d_router_actual_aql_ragged_band) {
+    r3d_bf16_aql_gemm(true, true);
+}
+
+TEST(r3d_bf16_actual_aql_joined_layout_compatibility) {
+    RadDeviceProps props{};
+    REQUIRE_EQ(rad_dev_props(0, &props), RAD_OK);
+    if (props.is_host_backend) {
+        REQUIRE(!std::getenv("RAD_R3D_REQUIRE_DEVICE"));
+        SKIP("explicit gfx1100 card run required");
+    }
+    REQUIRE_EQ(std::strcmp(props.arch, "gfx1100"), 0);
+    REQUIRE_EQ(rad_dev_set(0), RAD_OK);
+    Library native("libr3d"), reference("libref");
+    using Launch = int (*)(const RadArgs*, RadStream);
+    auto launch = reinterpret_cast<Launch>(dlsym(native.handle, "r3d_rad_logits_gemm_bf16"));
+    auto layout = reinterpret_cast<RadLayoutFn>(dlsym(native.handle, "r3d_layout_logits_head"));
+    auto relayout = reinterpret_cast<RadRelayoutFn>(dlsym(native.handle, "r3d_relayout_logits_head"));
+    REQUIRE(launch && layout && relayout);
+    const auto* oracle = reference.ngram("logits_gemm");
+    Queue queue(1);
+    uint64_t launches = 0;
+    for (uint32_t dtype : {uint32_t(RAD_I8), uint32_t(RAD_F8E4M3)}) {
+        Buffer codes(dtype, {8, 128}, RAD_MEM_HOST_MAPPED);
+        Buffer scale(RAD_F32, {1, 1}, RAD_MEM_HOST_MAPPED);
+        std::fill_n(codes.data<uint8_t>(), 8 * 128, dtype == RAD_I8 ? 1 : 0x38);
+        scale.data<float>()[0] = 1.0f;
+        RadTensor planes[]{codes.host, scale.host};
+        const auto encoding = rad_enc_affine(dtype, RAD_F32, 128, 128);
+        const int selected[]{0, 1};
+        RadLayout stored{};
+        REQUIRE_EQ(layout(nullptr, 0, 1, &encoding, selected, planes, 2, &stored), RAD_OK);
+        REQUIRE(stored.dtype != RAD_BF16 && stored.dtype != dtype);
+        CHECK_EQ(std::strcmp(stored.tag, "rad.planes"), 0);
+        Buffer joined(RAD_I8, {stored.bytes}, RAD_MEM_HOST_MAPPED);
+        REQUIRE_EQ(relayout(nullptr, 0, 1, &encoding, selected, planes, 2,
+                            joined.host.data, stored.bytes), RAD_OK);
+        joined.device.dtype = stored.dtype;
+        joined.host.dtype = stored.dtype;
+        Buffer activation(RAD_BF16, {3, 128}, RAD_MEM_DEVICE, 144);
+        Buffer output(RAD_F32, {3, 8}, RAD_MEM_DEVICE, 16);
+        RadTensor host[]{activation.host, joined.host, output.host};
+        RadTensor device[]{activation.device, joined.device, output.device};
+        RadParam params[]{integer("M", 16), integer("n_vocab", 8),
+                          integer("n_embd", 128), integer("impl", 0)};
+        RadArgs args{};
+        args.t = device; args.n_t = 3; args.p = params; args.n_p = 4;
+        for (int step = 0; step < 2; ++step) {
+            for (int row = 0; row < 3; ++row)
+                for (int index = 0; index < 128; ++index)
+                    activation.data<uint16_t>()[row * 144 + index] =
+                        rad_f32_to_bf16(step ? -0.25f : 0.125f);
+            std::fill(output.expected.begin(), output.expected.end(), uint8_t(0x5a));
+            activation.push(queue.stream);
+            joined.push(queue.stream);
+            output.push(queue.stream);
+            args.t = host;
+            REQUIRE_EQ(oracle->launch(&args, nullptr), RAD_OK);
+            args.t = device;
+            REQUIRE_EQ(launch(&args, queue.stream), RAD_OK);
+            REQUIRE_EQ(rad_stream_sync(queue.stream), RAD_OK);
+            CHECK(output.read(queue.stream) == output.expected);
+            CHECK(activation.read(queue.stream) == activation.expected);
+            CHECK(joined.read(queue.stream) == joined.expected);
+            ++launches;
+        }
+        const auto before = output.read(queue.stream);
+        std::memset(joined.host.data, 0, 4);
+        joined.push(queue.stream);
+        REQUIRE_EQ(rad_stream_sync(queue.stream), RAD_OK);
+        CHECK_EQ(launch(&args, queue.stream), RAD_E_FORMAT);
+        CHECK(output.read(queue.stream) == before);
+    }
+    std::fprintf(stderr, "AQL_BF16_JOINED_SUMMARY launches=%llu codes=I8,E4M3 exact_assertions=1\n",
+                 (unsigned long long)launches);
+}
+
+TEST(r3d_bf16_inaccessible_pointer_format_refusals) {
+    Library native("libr3d");
+    using Launch = int (*)(const RadArgs*, RadStream);
+    for (const char* symbol : {"r3d_rad_gemm_nt_bf16_tiled", "r3d_rad_logits_gemm_bf16"}) {
+        auto launch = reinterpret_cast<Launch>(dlsym(native.handle, symbol));
+        REQUIRE(launch);
+        RadTensor tensors[3]{};
+        for (auto& tensor : tensors) tensor.data = reinterpret_cast<void*>(uintptr_t(0x123450000000ull));
+        tensors[0].dtype = RAD_I32;
+        RadArgs args{};
+        RadParam impl = integer("impl", 0);
+        args.t = tensors; args.n_t = 3; args.p = &impl; args.n_p = 1;
+        for (uint32_t dtype : {uint32_t(RAD_BF16), uint32_t(RAD_I8),
+                              uint32_t(RAD_F8E4M3), uint32_t(0x7fffffffu)}) {
+            tensors[1].dtype = dtype;
+            CHECK_EQ(launch(&args, nullptr), RAD_E_DTYPE);
+        }
+    }
+}
+
+RAD_TEST_MAIN()
+
+TEST(r3d_gdn_actual_aql_compact_conv_prep) {
+    RadDeviceProps props{};
+    REQUIRE_EQ(rad_dev_props(0, &props), RAD_OK);
+    if (props.is_host_backend) {
+        REQUIRE(!std::getenv("RAD_R3D_REQUIRE_DEVICE"));
+        SKIP("explicit gfx1100 card run required");
+    }
+    REQUIRE_EQ(std::strcmp(props.arch, "gfx1100"), 0);
+    REQUIRE_EQ(rad_dev_set(0), RAD_OK);
+    Library native("libr3d"), reference("libref");
+    auto count = reinterpret_cast<int (*)()>(dlsym(native.handle, "rad_kernel_count"));
+    auto at = reinterpret_cast<const RadKernelInfo* (*)(int)>(dlsym(native.handle, "rad_kernel_at"));
+    REQUIRE(count && at);
+    const RadKernelInfo* row = nullptr;
+    for (int index = 0; index < count(); ++index) {
+        const auto* candidate = at(index);
+        if (!std::strcmp(candidate->name, "model_gdn_conv_prep_strict")) {
+            row = candidate;
+            break;
+        }
+    }
+    REQUIRE(row);
+    const auto* oracle = reference.ngram("gdn_conv_prep");
+    REQUIRE_EQ(std::strcmp(row->name, "model_gdn_conv_prep_strict"), 0);
+    std::printf("GDN_AQL rows native=%s reference=%s\n", row->name, oracle->name);
+    Queue compute(0), other(1);
+    uint64_t fixtures = 0, launches = 0, compared = 0, rejects = 0;
+    for (int rows : {1, 63, 64, 65})
+        for (int sequences : {1, 4}) {
+            std::vector<std::unique_ptr<Buffer>> buffers;
+            auto add = [&](int type, std::initializer_list<int64_t> shape, int pitch = 0) {
+                buffers.push_back(std::make_unique<Buffer>(type, shape, RAD_MEM_DEVICE, pitch));
+            };
+            add(RAD_BF16, {rows, 5120}, 8192);
+            add(RAD_BF16, {5120, 4});
+            add(RAD_F32, {24});
+            add(RAD_F32, {24});
+            add(RAD_BF16, {sequences, 5120, 3});
+            add(RAD_I32, {sequences + 1});
+            add(RAD_BF16, {rows, 48});
+            add(RAD_I32, {sequences});
+            add(RAD_I32, {sequences});
+            add(RAD_BF16, {rows, 8, 128});
+            add(RAD_BF16, {rows, 8, 128});
+            add(RAD_BF16, {rows, 24, 128});
+            add(RAD_F32, {rows, 24}, 32);
+            add(RAD_F32, {rows, 24}, 32);
+            auto fill_bf16 = [&](int index, int count, int pitch, int width, int seed) {
+                auto* destination = buffers[index]->data<uint16_t>();
+                for (int token = 0; token < count; ++token)
+                    for (int column = 0; column < width; ++column) {
+                        const float value = float((token * 7 + column * 13 + seed) % 23 - 11) / 32.0f;
+                        uint32_t bits;
+                        std::memcpy(&bits, &value, sizeof bits);
+                        destination[token * pitch + column] = uint16_t(bits >> 16);
+                    }
+            };
+            fill_bf16(4, sequences, 5120 * 3, 5120 * 3, 19);
+            auto* cumulative = buffers[5]->data<int32_t>();
+            cumulative[0] = 0;
+            if (sequences == 1) cumulative[1] = rows;
+            else {
+                cumulative[1] = rows > 1 ? 1 : 0;
+                cumulative[2] = cumulative[1];
+                cumulative[3] = rows / 2;
+                cumulative[4] = rows;
+            }
+            for (int sequence = 0; sequence < sequences; ++sequence)
+                buffers[7]->data<int32_t>()[sequence] = sequences - sequence - 1;
+            RadParam params[]{integer("M", rows <= 64 ? 64 : 128),
+                integer("head_k", 128), integer("head_v", 128), integer("n_head_v", 24),
+                integer("conv_width", 4), integer("chunk", 64), integer("group", 128)};
+            RadArgs args{};
+            args.p = params; args.n_p = int(sizeof params / sizeof params[0]); args.n_t = 16;
+            for (int step = 0; step < 3; ++step) {
+                RadStream stream = step % 2 ? compute.stream : other.stream;
+                REQUIRE_EQ(rad_stream_device_access(stream, 0, nullptr), RAD_OK);
+                fill_bf16(0, rows, 8192, 5120, step * 29 + 3);
+                fill_bf16(1, 5120, 4, 4, step * 31 + 5);
+                fill_bf16(6, rows, 48, 48, step * 37 + 7);
+                for (int head = 0; head < 24; ++head) {
+                    buffers[2]->data<float>()[head] = float(head % 7 - 3 + step) / 16.0f;
+                    buffers[3]->data<float>()[head] = float(head % 5 - 2 - step) / 32.0f;
+                }
+                for (int sequence = 0; sequence < sequences; ++sequence)
+                    buffers[8]->data<int32_t>()[sequence] = step != 0;
+                std::vector<RadTensor> host, device;
+                for (auto& buffer : buffers) {
+                    host.push_back(buffer->host); device.push_back(buffer->device);
+                }
+                auto operands = [&](const std::vector<RadTensor>& source) {
+                    std::vector<RadTensor> result{source[0], source[1], RadTensor{}, source[2],
+                        source[3], source[4], source[5], source[6], source[6], source[7],
+                        source[8], source[9], source[10], source[11], source[12], source[13]};
+                    result[7].shape[1] = result[8].shape[1] = 24;
+                    result[8].data = static_cast<uint16_t*>(result[8].data) + 24;
+                    return result;
+                };
+                auto host_args = operands(host), device_args = operands(device);
+                for (int index = 0; index < int(buffers.size()); ++index)
+                    if (index != 4 || step == 0) buffers[index]->push(stream);
+                args.t = host_args.data();
+                REQUIRE_EQ(oracle->launch(&args, nullptr), RAD_OK);
+                args.t = device_args.data();
+                REQUIRE_EQ(row->launch(&args, stream), RAD_OK);
+                REQUIRE_EQ(rad_stream_sync(stream), RAD_OK);
+                ++launches;
+                for (auto& buffer : buffers) {
+                    REQUIRE(buffer->read(stream) == buffer->expected);
+                    compared += buffer->expected.size();
+                }
+                const auto before = buffers[9]->read(stream);
+                device_args[0].stride[0] = (int64_t(1) << 36) + 1;
+                CHECK_EQ(row->launch(&args, stream), RAD_E_SHAPE);
+                CHECK(buffers[9]->read(stream) == before);
+                ++rejects;
+            }
+            ++fixtures;
+        }
+    std::printf("PASS GDN_AQL fixtures=%llu launches=%llu rejects=%llu exact_bytes=%llu queues=2\n",
+        (unsigned long long)fixtures, (unsigned long long)launches,
+        (unsigned long long)rejects, (unsigned long long)compared);
+}
+
+TEST(r3d_gdn_actual_aql_compact_kkt_chunk) {
+    RadDeviceProps props{};
+    REQUIRE_EQ(rad_dev_props(0, &props), RAD_OK);
+    if (props.is_host_backend) {
+        REQUIRE(!std::getenv("RAD_R3D_REQUIRE_DEVICE"));
+        SKIP("explicit gfx1100 card run required");
+    }
+    REQUIRE_EQ(std::strcmp(props.arch, "gfx1100"), 0);
+    REQUIRE_EQ(rad_dev_count(), 1);
+    REQUIRE_EQ(rad_dev_set(0), RAD_OK);
+    Library native("libr3d"), reference("libref");
+    auto count = reinterpret_cast<int (*)()>(dlsym(native.handle, "rad_kernel_count"));
+    auto at = reinterpret_cast<const RadKernelInfo* (*)(int)>(dlsym(native.handle, "rad_kernel_at"));
+    REQUIRE(count && at);
+    const RadKernelInfo* solve = nullptr;
+    const RadKernelInfo* scan = nullptr;
+    for (int index = 0; index < count(); ++index) {
+        const auto* candidate = at(index);
+        if (!std::strcmp(candidate->name, "model_gdn_kkt_strict")) solve = candidate;
+        if (!std::strcmp(candidate->name, "model_gdn_chunk_strict")) scan = candidate;
+    }
+    REQUIRE(solve && scan);
+    REQUIRE_EQ(solve->domain, RAD_DOMAIN_DEVICE);
+    REQUIRE_EQ(scan->domain, RAD_DOMAIN_DEVICE);
+    const auto* solve_ref = reference.ngram("gdn_kkt_solve");
+    const auto* scan_ref = reference.ngram("gdn_chunk_scan");
+    Queue compute(0), other(1);
+    REQUIRE(compute.stream && other.stream && compute.stream != other.stream);
+    uint64_t fixtures = 0, pipelines = 0, compared = 0, rejects = 0;
+    const std::vector<std::vector<int>> batches{{1}, {3}, {63}, {64}, {65}, {128},
+        {65, 63}, {0, 65}, {0, 1, 63, 64, 65, 127, 128, 1},
+        {0, 63, 0, 64, 0, 65, 0, 1}};
+    for (const auto& lengths : batches)
+        for (int padded : {0, 1})
+            for (int mode : {0, 1, 2}) {
+                const int sequences = int(lengths.size()), slots = sequences + 2;
+                std::vector<int32_t> cumulative{0};
+                for (int length : lengths) cumulative.push_back(cumulative.back() + length);
+                const int rows = cumulative.back();
+                std::vector<std::unique_ptr<Buffer>> buffers;
+                auto add = [&](int type, std::initializer_list<int64_t> shape, int pitch = 0) {
+                    buffers.push_back(std::make_unique<Buffer>(type, shape, RAD_MEM_DEVICE, pitch));
+                };
+                auto plane = [&](int heads, int width) {
+                    const int stored = width + padded * 8;
+                    add(RAD_BF16, {rows, heads, stored}, heads * stored + padded * 16);
+                    buffers.back()->host.shape[2] = buffers.back()->device.shape[2] = width;
+                };
+                auto state = [&] {
+                    const int stored = 128 + padded;
+                    add(RAD_F32, {slots, 24, stored, 128}, 24 * stored * 128 + padded * 32);
+                    buffers.back()->host.shape[2] = buffers.back()->device.shape[2] = 128;
+                };
+                plane(8, 128);
+                plane(8, 128);
+                plane(24, 128);
+                plane(24, 64);
+                add(RAD_F32, {rows, 24}, 24 + padded * 8);
+                add(RAD_F32, {rows, 24}, 24 + padded * 16);
+                state();
+                add(RAD_I32, {sequences + 1});
+                plane(24, 128);
+                state();
+                if (padded) add(RAD_I32, {sequences, 3}, 5);
+                else add(RAD_I32, {sequences});
+                std::memcpy(buffers[7]->host.data, cumulative.data(), cumulative.size() * sizeof(int32_t));
+                for (int sequence = 0; sequence < sequences; ++sequence)
+                    buffers[10]->data<int32_t>()[sequence * buffers[10]->host.stride[0]] =
+                        padded && sequences == 8 && sequence == 7 ? -1 : sequences - sequence;
+                auto fill_plane = [&](int operand, int seed, float amplitude) {
+                    const auto& tensor = buffers[operand]->host;
+                    for (int token = 0; token < rows; ++token)
+                        for (int head = 0; head < tensor.shape[1]; ++head)
+                            for (int column = 0; column < tensor.shape[2]; ++column)
+                                buffers[operand]->data<uint16_t>()[token * tensor.stride[0]
+                                    + head * tensor.stride[1] + column] = rad_f32_to_bf16(
+                                        float((token * 7 + head * 13 + column * 11 + seed) % 31 - 15) * amplitude);
+                };
+                auto fill_state = [&](int operand, int seed) {
+                    const auto& tensor = buffers[operand]->host;
+                    for (int slot = 0; slot < slots; ++slot)
+                        for (int head = 0; head < 24; ++head)
+                            for (int column = 0; column < 16384; ++column)
+                                buffers[operand]->data<float>()[slot * tensor.stride[0]
+                                    + head * tensor.stride[1] + column] =
+                                        float((slot * 3 + head * 7 + column * 11 + seed) % 29 - 14) / 16384.0f;
+                };
+                std::vector<uint8_t> previous_inverse, previous_output, previous_state;
+                RadParam params[]{integer("M", rows <= 64 ? 64 : rows <= 128 ? 128 : 512),
+                    integer("head_k", 128), integer("head_v", 128), integer("n_head_v", 24),
+                    integer("chunk", 64), {}};
+                params[5].key = "scale"; params[5].kind = RAD_P_F64;
+                params[5].dval = padded ? 0.125 : 1.0;
+                RadArgs args{};
+                args.p = params; args.n_p = int(sizeof params / sizeof params[0]);
+                for (int step = 0; step < 2; ++step) {
+                    RadStream stream = step ? compute.stream : other.stream;
+                    REQUIRE_EQ(rad_stream_device_access(stream, 0, nullptr), RAD_OK);
+                    fill_plane(0, 3 + step * 17, 1.0f / 128);
+                    fill_plane(1, 5 + step * 19, 1.0f / 512);
+                    fill_plane(2, 7 + step * 23, 1.0f / 32);
+                    fill_state(6, 11 + step * 31);
+                    for (int sequence = 0; sequence < sequences; ++sequence)
+                        for (int local = 0; local < lengths[sequence]; ++local) {
+                            const int token = cumulative[sequence] + local;
+                            for (int head = 0; head < 24; ++head) {
+                                buffers[4]->data<float>()[token * buffers[4]->host.stride[0] + head] =
+                                    -0.001f * (local % 64 + 1) * (1 + head % 3 + step);
+                                buffers[5]->data<float>()[token * buffers[5]->host.stride[0] + head] =
+                                    0.125f + float((token + head + step) % 17) / 128;
+                            }
+                        }
+                    for (int operand : {3, 8})
+                        std::fill(buffers[operand]->expected.begin(), buffers[operand]->expected.end(), uint8_t(0x5a));
+                    if (mode != 2 || step == 0) {
+                        std::fill(buffers[9]->expected.begin(), buffers[9]->expected.end(), uint8_t(0x5a));
+                        if (mode == 2) fill_state(9, 37);
+                    }
+                    std::vector<RadTensor> host, device;
+                    for (auto& buffer : buffers) {
+                        host.push_back(buffer->host); device.push_back(buffer->device);
+                    }
+                    if (mode == 0) host[6] = device[6] = {};
+                    if (mode == 2) { host[6] = host[9]; device[6] = device[9]; }
+                    std::vector<RadTensor> host_solve{host[1], host[5], host[4], host[7], host[3]};
+                    std::vector<RadTensor> device_solve{device[1], device[5], device[4], device[7], device[3]};
+                    for (int operand = 0; operand < int(buffers.size()); ++operand)
+                        if (operand != 9 || mode != 2 || step == 0) buffers[operand]->push(stream);
+                    args.n_t = 5; args.t = host_solve.data();
+                    REQUIRE_EQ(solve_ref->launch(&args, nullptr), RAD_OK);
+                    args.t = device_solve.data();
+                    REQUIRE_EQ(solve->launch(&args, stream), RAD_OK);
+                    args.n_t = 11; args.t = host.data();
+                    REQUIRE_EQ(scan_ref->launch(&args, nullptr), RAD_OK);
+                    args.t = device.data();
+                    REQUIRE_EQ(scan->launch(&args, stream), RAD_OK);
+                    REQUIRE_EQ(rad_stream_sync(stream), RAD_OK);
+                    for (auto& buffer : buffers) {
+                        REQUIRE(buffer->read(stream) == buffer->expected);
+                        compared += buffer->expected.size();
+                    }
+                    if (step) {
+                        if (rows > 1) CHECK(buffers[3]->expected != previous_inverse);
+                        CHECK(buffers[8]->expected != previous_output);
+                        CHECK(buffers[9]->expected != previous_state);
+                    }
+                    previous_inverse = buffers[3]->expected;
+                    previous_output = buffers[8]->expected;
+                    previous_state = buffers[9]->expected;
+                    params[1].ival = 127;
+                    args.n_t = 5; args.t = device_solve.data();
+                    CHECK_EQ(solve->launch(&args, stream), RAD_E_UNSUPPORTED);
+                    args.n_t = 11; args.t = device.data();
+                    CHECK_EQ(scan->launch(&args, stream), RAD_E_UNSUPPORTED);
+                    params[1].ival = 128;
+                    device[9].rank = 3;
+                    CHECK_EQ(scan->launch(&args, stream), RAD_E_SHAPE);
+                    device[9].rank = 4;
+                    device[7].shape[0] = 10;
+                    CHECK_EQ(scan->launch(&args, stream), RAD_E_UNSUPPORTED);
+                    device[7] = buffers[7]->device;
+                    for (int operand : {3, 8, 9}) CHECK(buffers[operand]->read(stream) == buffers[operand]->expected);
+                    rejects += 4;
+                    ++pipelines;
+                }
+                ++fixtures;
+                std::printf("PASS GDN_CHUNK_AQL_CASE M=%d seq=%d padded=%d state=%d steps=2\n",
+                    rows, sequences, padded, mode);
+                std::fflush(stdout);
+            }
+    std::printf("PASS GDN_CHUNK_AQL fixtures=%llu pipelines=%llu kkt=%llu scan=%llu rejects=%llu exact_bytes=%llu queues=2 tolerance=0\n",
+        (unsigned long long)fixtures, (unsigned long long)pipelines,
+        (unsigned long long)pipelines, (unsigned long long)pipelines,
+        (unsigned long long)rejects, (unsigned long long)compared);
+}
+
+TEST(r3d_i8_actual_aql_quant_boundary) {
+    RadDeviceProps props{};
+    REQUIRE_EQ(rad_dev_props(0, &props), RAD_OK);
+    if (props.is_host_backend) {
+        REQUIRE(!std::getenv("RAD_R3D_REQUIRE_DEVICE"));
+        SKIP("explicit gfx1100 card run required");
+    }
+    REQUIRE_EQ(std::strcmp(props.arch, "gfx1100"), 0);
+    REQUIRE_EQ(rad_dev_set(0), RAD_OK);
+    struct Rounding {
+        int saved = std::fegetround();
+        ~Rounding() { std::fesetround(saved); }
+    } rounding;
+    REQUIRE_EQ(std::fesetround(FE_TONEAREST), 0);
+    Library native("libr3d");
+    using Launch = int (*)(const RadArgs*, RadStream);
+    auto quant = reinterpret_cast<Launch>(dlsym(native.handle, "r3dh_i8_rad_quant_act_i8g"));
+    auto had = reinterpret_cast<Launch>(dlsym(native.handle, "r3dh_i8_rad_had_quant_act_i8g"));
+    auto gemm = reinterpret_cast<Launch>(dlsym(native.handle, "r3dh_i8_rad_gemm_nt_q"));
+    REQUIRE(quant && had && gemm);
+    auto round_even = [](float value) {
+        const float lower = std::floor(value);
+        int result = static_cast<int>(lower);
+        const float fraction = value - lower;
+        if (fraction > 0.5f || (fraction == 0.5f && (result & 1))) ++result;
+        return static_cast<int8_t>(result);
+    };
+    CHECK_EQ(round_even(0.5f), 0); CHECK_EQ(round_even(-0.5f), 0);
+    CHECK_EQ(round_even(1.5f), 2); CHECK_EQ(round_even(-1.5f), -2);
+    CHECK_EQ(round_even(2.5f), 2); CHECK_EQ(round_even(-2.5f), -2);
+    Queue compute(0), other(1);
+    uint64_t fixtures = 0, pipelines = 0, rejects = 0, compared = 0;
+    constexpr int columns = 128;
+    for (int width : {2560, 3072, 6144}) {
+        const int groups = width / 128;
+        std::vector<int8_t> real_codes(columns * width);
+        std::vector<uint16_t> real_scales(columns * groups);
+        std::unique_ptr<FILE, int (*)(FILE*)> model(std::fopen(
+            "/home/zihaomu/bigssd2/radiance_workspace/models/qwen3.8-next-flash-iqr-v4.rad", "rb"), std::fclose);
+        REQUIRE(model);
+        const int model_width = width == 2560 ? 2560 : 6144;
+        const int shard = width == 3072 ? 3072 : 0;
+        const int64_t code_offset = width == 2560 ? 58022457344ll : 53973250048ll;
+        const int64_t scale_offset = width == 2560 ? 58023768064ll : 53988978688ll;
+        for (int column = 0; column < columns; ++column) {
+            REQUIRE_EQ(fseeko(model.get(), code_offset + int64_t(column) * model_width + shard, SEEK_SET), 0);
+            REQUIRE_EQ(std::fread(real_codes.data() + column * width, 1, width, model.get()), size_t(width));
+            REQUIRE_EQ(fseeko(model.get(), scale_offset + int64_t(column) * model_width / 64 + shard / 64, SEEK_SET), 0);
+            REQUIRE_EQ(std::fread(real_scales.data() + column * groups, 2, groups, model.get()), size_t(groups));
+        }
+        for (int rows : {1, 3, 63, 64})
+            for (int padded : {0, 1})
+                for (int rotated : {0, 1}) {
+                    const int input_pitch = width + padded * 32;
+                    const int code_pitch = width + padded * 12;
+                    const int scale_pitch = groups + padded * 5;
+                    const int output_pitch = columns + padded * 16;
+                    Buffer input(RAD_BF16, {rows + 2, groups, 128}, RAD_MEM_DEVICE, input_pitch);
+                    Buffer codes(RAD_I8, {rows + 2, width}, RAD_MEM_DEVICE, code_pitch);
+                    Buffer scales(RAD_F32, {rows + 2, groups}, RAD_MEM_DEVICE, scale_pitch);
+                    Buffer weight(RAD_I8, {columns, width}, RAD_MEM_DEVICE);
+                    Buffer weight_scale(RAD_F32, {columns, groups}, RAD_MEM_DEVICE);
+                    Buffer output(RAD_BF16, {rows + 2, columns}, RAD_MEM_DEVICE, output_pitch);
+                    for (Buffer* buffer : {&input, &codes, &scales, &output})
+                        buffer->host.shape[0] = buffer->device.shape[0] = rows;
+                    weight.device.dtype = r3dh_i8::weight_dtype;
+                    weight_scale.device.dtype = r3dh_i8::scale_dtype;
+                    std::vector<int8_t> natural(columns * width);
+                    std::vector<float> factors(columns * groups);
+                    for (int column = 0; column < columns; ++column) {
+                        for (int position = 0; position < width; ++position) {
+                            const int index = column * width + position;
+                            natural[index] = rotated ? real_codes[index] :
+                                static_cast<int8_t>((column * 73 + position * 37 + position / 128 * 19) % 255 - 127);
+                            const int packed = (((column / 16 * groups + position / 128) * 8
+                                + position % 128 / 16) * 16 + column % 16) * 16 + position % 16;
+                            weight.data<int8_t>()[packed] = natural[index];
+                        }
+                        for (int group = 0; group < groups; ++group) {
+                            const int index = column * groups + group;
+                            const uint16_t bits = rotated ? real_scales[index] : rad_f32_to_bf16(
+                                float((column * 11 + group * 7) % 31 - 15) / 8192.0f);
+                            factors[index] = rad_bf16_to_f32(bits);
+                            weight_scale.data<float>()[index] = factors[index];
+                        }
+                    }
+                    RadParam params[]{integer("M", 64), integer("n", width), integer("group", 128)};
+                    RadParam gemm_params[]{integer("M", 64), integer("N", columns), integer("K", width),
+                        integer("group", 128), integer("w_rb", 1), {}};
+                    gemm_params[5].key = "dtype"; gemm_params[5].kind = RAD_P_STR;
+                    gemm_params[5].sval = rotated ? "i8a8h" : "i8a8";
+                    Launch producer = rotated ? had : quant;
+                    std::vector<uint8_t> previous_codes, previous_scales, previous_output;
+                    for (int step = 0; step < 2; ++step) {
+                        RadStream stream = step ? compute.stream : other.stream;
+                        REQUIRE_EQ(rad_stream_device_access(stream, 0, nullptr), RAD_OK);
+                        params[0].ival = gemm_params[0].ival = step ? 2048 : 64;
+                        for (int row = 0; row < rows; ++row)
+                            for (int position = 0; position < width; ++position) {
+                                float value = float((row * 197 + position * 29 + position / 128 * 17 + step * 71) % 509 - 254)
+                                    / float(8 << ((position / 128 + step) % 5));
+                                if (row == 0 && position < 128) value = 0.0f;
+                                if (!rotated && row == 0 && position >= 128 && position < 256) {
+                                    const float ties[]{127.0f, 0.5f, -0.5f, 1.5f, -1.5f, 2.5f, -2.5f};
+                                    value = ties[(position - 128 + step) % 7];
+                                }
+                                input.data<uint16_t>()[row * input_pitch + position] = rad_f32_to_bf16(value);
+                            }
+                        for (Buffer* buffer : {&codes, &scales, &output})
+                            std::fill(buffer->expected.begin(), buffer->expected.end(), uint8_t(0x5a));
+                        for (Buffer* buffer : {&input, &codes, &scales, &weight, &weight_scale, &output}) buffer->push(stream);
+                        for (int row = 0; row < rows; ++row)
+                            for (int group = 0; group < groups; ++group) {
+                                float values[128];
+                                for (int position = 0; position < 128; ++position)
+                                    values[position] = rad_bf16_to_f32(input.data<uint16_t>()[row * input_pitch + group * 128 + position]);
+                                if (rotated)
+                                    for (int distance = 1; distance < 128; distance *= 2)
+                                        for (int base = 0; base < 128; base += distance * 2)
+                                            for (int offset = 0; offset < distance; ++offset) {
+                                                const float left = values[base + offset];
+                                                const float right = values[base + distance + offset];
+                                                values[base + offset] = left + right;
+                                                values[base + distance + offset] = left - right;
+                                            }
+                                float maximum = 0.0f;
+                                for (float value : values) maximum = std::max(maximum, std::fabs(value));
+                                if (!(maximum > 0.0f)) maximum = 1e-8f;
+                                scales.data<float>()[row * scale_pitch + group] = maximum / 127.0f;
+                                const float inverse = 127.0f / maximum;
+                                for (int position = 0; position < 128; ++position)
+                                    codes.data<int8_t>()[row * code_pitch + group * 128 + position] =
+                                        round_even(std::max(-127.0f, std::min(127.0f, values[position] * inverse)));
+                            }
+                        for (int row = 0; row < rows; ++row)
+                            for (int column = 0; column < columns; ++column) {
+                                float accumulator = 0.0f;
+                                for (int group = 0; group < groups; ++group) {
+                                    int subtotal = 0;
+                                    for (int position = 0; position < 128; ++position)
+                                        subtotal += int(codes.data<int8_t>()[row * code_pitch + group * 128 + position])
+                                            * int(natural[column * width + group * 128 + position]);
+                                    const float scaled = static_cast<float>(subtotal)
+                                        * scales.data<float>()[row * scale_pitch + group];
+                                    accumulator = accumulator + scaled * factors[column * groups + group];
+                                }
+                                output.data<uint16_t>()[row * output_pitch + column] = rad_f32_to_bf16(accumulator);
+                            }
+                        RadTensor tensors[]{input.device, codes.device, scales.device};
+                        const RadTensor original = tensors[0];
+                        RadArgs args{}; args.t = tensors; args.n_t = 3; args.p = params; args.n_p = 3;
+                        REQUIRE_EQ(producer(&args, stream), RAD_OK);
+                        REQUIRE(std::memcmp(&original, &tensors[0], sizeof original) == 0);
+                        REQUIRE(codes.read(stream) == codes.expected);
+                        REQUIRE(scales.read(stream) == scales.expected);
+                        RadTensor gemm_tensors[]{codes.device, scales.device, weight.device, weight_scale.device, output.device};
+                        RadArgs gemm_args{}; gemm_args.t = gemm_tensors; gemm_args.n_t = 5;
+                        gemm_args.p = gemm_params; gemm_args.n_p = 6;
+                        REQUIRE_EQ(gemm(&gemm_args, stream), RAD_OK);
+                        int operand = 0;
+                        for (Buffer* buffer : {&input, &codes, &scales, &weight, &weight_scale, &output}) {
+                            const auto actual = buffer->read(stream);
+                            if (actual != buffer->expected) {
+                                const size_t offset = std::mismatch(actual.begin(), actual.end(), buffer->expected.begin()).first - actual.begin();
+                                std::fprintf(stderr, "I8_BOUNDARY_DIFF n=%d rows=%d padded=%d rotated=%d step=%d operand=%d byte=%zu actual=%u expected=%u\n",
+                                    width, rows, padded, rotated, step, operand, offset,
+                                    unsigned(actual[offset]), unsigned(buffer->expected[offset]));
+                            }
+                            REQUIRE(actual == buffer->expected);
+                            compared += buffer->expected.size();
+                            ++operand;
+                        }
+                        if (step) {
+                            CHECK(codes.expected != previous_codes);
+                            CHECK(scales.expected != previous_scales);
+                            CHECK(output.expected != previous_output);
+                        }
+                        previous_codes = codes.expected; previous_scales = scales.expected; previous_output = output.expected;
+                        auto reject = [&](int expected) {
+                            CHECK_EQ(producer(&args, stream), expected); ++rejects;
+                            tensors[0] = input.device; tensors[1] = codes.device; tensors[2] = scales.device;
+                        };
+                        tensors[0].rank = 1; reject(RAD_E_SHAPE);
+                        tensors[0].rank = 7; reject(RAD_E_SHAPE);
+                        tensors[0].shape[1]++; reject(RAD_E_SHAPE);
+                        tensors[0].shape[1] = 0; reject(RAD_E_SHAPE);
+                        tensors[0].shape[1] = std::numeric_limits<int64_t>::max(); reject(RAD_E_SHAPE);
+                        tensors[0].stride[1]++; reject(RAD_E_STRIDE);
+                        tensors[0].stride[2] = 2; reject(RAD_E_STRIDE);
+                        tensors[0].stride[0] = width - 1; reject(RAD_E_STRIDE);
+                        tensors[0].stride[0] = -width; reject(RAD_E_STRIDE);
+                        if (rows > 1) { tensors[0].stride[0] = std::numeric_limits<int64_t>::max(); reject(RAD_E_STRIDE); }
+                        tensors[0].shape[0] = 2049; reject(RAD_E_SHAPE);
+                        tensors[1].rank = 3; reject(RAD_E_SHAPE);
+                        tensors[1].stride[1] = 2; reject(RAD_E_STRIDE);
+                        tensors[2].shape[1]++; reject(RAD_E_SHAPE);
+                        tensors[2].stride[0] = groups - 1; reject(RAD_E_STRIDE);
+                        params[0].ival = rows - 1; reject(RAD_E_SHAPE);
+                        params[0].ival = 2049; reject(RAD_E_SHAPE);
+                        params[0].ival = step ? 2048 : 64;
+                        params[1].ival = width + 128; reject(RAD_E_SHAPE); params[1].ival = width;
+                        tensors[0].dtype = RAD_F32; reject(RAD_E_DTYPE);
+                        tensors[1].dtype = RAD_I32; reject(RAD_E_DTYPE);
+                        params[0].ival = rows;
+                        tensors[0].rank = 2; tensors[0].shape[1] = width; tensors[0].stride[1] = 1;
+                        REQUIRE_EQ(producer(&args, stream), RAD_OK);
+                        tensors[0] = input.device;
+                        tensors[0].rank = 4; tensors[0].shape[1] = groups / 4; tensors[0].shape[2] = 4;
+                        tensors[0].shape[3] = 128; tensors[0].stride[1] = 512;
+                        tensors[0].stride[2] = 128; tensors[0].stride[3] = 1;
+                        REQUIRE_EQ(producer(&args, stream), RAD_OK);
+                        for (Buffer* buffer : {&codes, &scales}) REQUIRE(buffer->read(stream) == buffer->expected);
+                        gemm_params[0].ival = rows - 1;
+                        CHECK_EQ(gemm(&gemm_args, stream), RAD_E_SHAPE); ++rejects;
+                        gemm_params[0].ival = 2049;
+                        CHECK_EQ(gemm(&gemm_args, stream), RAD_E_SHAPE); ++rejects;
+                        gemm_params[0].ival = rows;
+                        gemm_tensors[0].rank = 3;
+                        CHECK_EQ(gemm(&gemm_args, stream), RAD_E_SHAPE); ++rejects;
+                        gemm_tensors[0] = codes.device;
+                        gemm_tensors[3].shape[1] = groups + 1;
+                        CHECK_EQ(gemm(&gemm_args, stream), RAD_E_SHAPE); ++rejects;
+                        gemm_tensors[3] = weight_scale.device;
+                        REQUIRE_EQ(gemm(&gemm_args, stream), RAD_OK);
+                        REQUIRE(output.read(stream) == output.expected);
+                        ++pipelines;
+                    }
+                    ++fixtures;
+                }
+        std::printf("PASS I8_BOUNDARY_AQL_WIDTH n=%d real_weight=%s queues=2\n", width,
+            width == 2560 ? "attn_k_first128" : width == 3072 ? "ssm_out_rank1_k_shard_first128" : "ssm_out_first128");
+        std::fflush(stdout);
+    }
+    std::printf("PASS I8_BOUNDARY_AQL fixtures=%llu pipelines=%llu producer_launches=%llu gemm_launches=%llu rejects=%llu exact_bytes=%llu queues=2 tolerance=0\n",
+        (unsigned long long)fixtures, (unsigned long long)pipelines,
+        (unsigned long long)(pipelines * 3), (unsigned long long)(pipelines * 2),
+        (unsigned long long)rejects, (unsigned long long)compared);
+}
+
+#include "r3d_moe_boundary_aql.h"
+#include "r3d_attn_prepare_aql.h"
+#include "r3d_qsa_index_aql.h"
+#include "r3d_qsa_ring_aql.h"
+#include "r3d_iqr_output_aql.h"
+#include "r3d_attn_fused_actual_aql.h"
+#include "r3d_joined_head_aql.h"
+#include "r3d_rerank_aql.h"
+#include "r3d_sample_pair_aql.h"
+#include "r3d_sample_merge32_aql.h"
+#include "r3d_allgather_pair_aql.h"
+#include "r3d_gdn_decode_actual_aql.h"
+#include "r3d_iqr_group_aql.h"
+#include "r3d_w4nl_gate_aql.h"
+#include "r3d_i8_gated_aql.h"
+#include "r3d_ple_domain_aql.h"
+#include "r3d_mtp_fc_aql.h"
+#include "r3d_w2_head_aql.h"
+#include "r3d_vision_actual_aql.h"
+#include "r3d_attn_fused_paged_aql.h"
+#include "r3d_paged_wide_aql.h"

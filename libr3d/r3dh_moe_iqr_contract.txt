@@ -1,0 +1,123 @@
+r3dh_moe_iqr implementation handoff (2026-11-17)
+
+Status: standalone routed gate/up implementation, native gfx1100 wave32
+integer WMMA. No CPU compute fallback. This handoff changes no CMake, rows,
+registry, or core files and does not claim integrated/full-model inference.
+
+Owned files in libr3d/:
+  r3dh_moe_iqr.h                 public API, layout IDs, decoder helpers
+  r3dh_moe_iqr_layout.cpp        config, shape, layout, forward/inverse packing
+  r3dh_moe_iqr.hip               GPU gate/up launcher and WMMA kernel
+  r3dh_moe_iqr_check.hip         independent host oracle and test entry point
+  r3dh_moe_iqr_gpu_check.h       synthetic GPU, guards, streams, graph checks
+  r3dh_moe_iqr_actual_check.h    actual model planes and both TP2 shard fixtures
+  r3dh_moe_iqr_contract.txt      this handoff
+
+Exported C ABI (authoritative named declarations: r3dh_moe_iqr.h):
+  int r3dh_moe_iqr_shape(const RadParam*, int, int, RadOpdDesc*);
+  int r3dh_moe_iqr_layout(const RadParam*, int, int, const RadEncoding*,
+      const int*, const RadTensor*, int, RadLayout*);
+  int r3dh_moe_iqr_relayout(const RadParam*, int, int, const RadEncoding*,
+      const int*, const RadTensor*, int, void*, int64_t);
+  int r3dh_moe_iqr_unrelayout(const RadParam*, int, int, const RadEncoding*,
+      const int*, const void*, int64_t, const RadTensor*, int);
+  int r3dh_moe_iqr_launch(const RadArgs*, RadStream);
+The first three arguments of metadata callbacks are params, count, operand.
+Launch consumes exactly nine operands and uses the caller's HIP stream.
+The C++ config helper is not a registration callback.
+
+Supported parameters:
+  dtype=i8a8h, a_order=token (default), 1 <= M <= 2048,
+  N and N_odd independently in {512,768}; N_odd defaults to N,
+  K=K_odd=2560, n_expert=512, top_k=10, group=a_group=128, parts=2.
+  K_odd, group, a_group, parts default to 2560,128,128,2.
+  Output width O=max(N,N_odd); even/odd refers to expert parity.
+
+Runtime operand order and shapes:
+  0: RAD_I8   activation [M,2560], token order
+  1: RAD_F32  activation scale [M,20]
+  2: private weight table [256,N,2560], even experts
+  3: private scale table  [256,N,20], even experts
+  4: RAD_I32  sorted routed slots [M*10]
+  5: RAD_I32  expert offsets [513]
+  6: private weight table [256,N_odd,2560], odd experts
+  7: private scale table  [256,N_odd,20], odd experts
+  8: RAD_BF16 raw concatenated gate/up output [M*10,O]
+Matrices have unit inner stride and row pitch >= width, <= 2^40.
+Routing vectors have unit stride. Valid sorted slot s selects token s/10;
+negative/out-of-range slots and unused gate/up columns produce zero.
+Caller supplies monotonic in-bounds expert offsets and valid device storage;
+launch validates descriptors, not routing contents or each device blob header.
+Each expert has equal gate/up halves; narrow experts pad each half separately.
+No SiLU, routing-weight merge, scatter-add, or down projection is performed.
+
+Metadata shape callbacks describe one logical expert weight/scale as rank 2;
+the runtime rank-3 tables above wrap 256 parity-local expert entries.
+Table index is expert/2. stride[0]==0 means a device pointer array; otherwise
+stride[0] is the byte pitch of stacked packed entries, >= packed entry bytes.
+For both table modes stride[1] is logical width (2560 or 20), stride[2]==1.
+
+Packed layouts (alignment 256):
+  weight dtype 0x334d0100, tag r3dh.moe.iqr.u4.l16.r128.v1:
+    32-byte Header followed by N*2560/2 raw packed code bytes.
+    Header: eight uint32 fields signature=0x314d5149, version=1, rows=N,
+    columns=2560, multiplier, increment, run=128, bits=4.
+  scale dtype 0x334d0200, tag r3dh.moe.iqr.rowcol.f32.v1:
+    N row F32 scales followed by 20 column-group F32 scales.
+  Packing requires exact byte counts. N means the chosen parity's width.
+  Source encoding: trellis/fwht128, U4 codes, L16 state, row-run128,
+    I8 trellis[65536,1], U32 trellis.mad[2,1], F32 scale[N,1],
+    F32 scale.col[1,20]; strict plane kinds/block dimensions are checked.
+  Weight operands select codes/trellis/trellis.mad; scale operands select
+    scale/scale.col. Relayout checks all 65536 computed-MAD entries and rejects
+    nonfinite scales. Host layout/packing is not a CPU execution fallback.
+  GPU decodes compressed codes directly, uses INT32 WMMA group sums, ordered
+    F32 scaling and BF16 round-to-nearest-even; no expanded weight buffer.
+
+Build dependencies and standalone recipe (from repo root):
+  ROCm HIP clang++, C++20, gfx1100, HIP runtime; includes abi/ and libr3d/.
+  Checker additionally uses abi/rad_format.h and the two owned checker headers.
+  No libref, halo kernel implementation, generated stub, or core object needed.
+  Compiler used: /opt/rocm/llvm/bin/clang++ in image
+    freetoken:rocm10.1.0-transformers518-final-gh-proxy-20261026.
+  Strict FP is required: -ffp-contract=off -fno-fast-math (no fast-math).
+
+  CXX=/opt/rocm/llvm/bin/clang++
+  OUT=../build-r3d-bootstrap
+  "$CXX" -std=c++20 -O2 -fPIC -ffp-contract=off -fno-fast-math \
+    -Iabi -Ilibr3d -c libr3d/r3dh_moe_iqr_layout.cpp \
+    -o "$OUT/r3dh_moe_iqr_handoff_layout.o"
+  "$CXX" -std=c++20 -O2 -fPIC -ffp-contract=off -fno-fast-math \
+    -Iabi -Ilibr3d -x hip --offload-arch=gfx1100 \
+    -c libr3d/r3dh_moe_iqr.hip -o "$OUT/r3dh_moe_iqr_handoff_gpu.o"
+  "$CXX" -std=c++20 -O2 -ffp-contract=off -fno-fast-math -Iabi -Ilibr3d \
+    -x hip --offload-arch=gfx1100 libr3d/r3dh_moe_iqr_check.hip -x none \
+    "$OUT/r3dh_moe_iqr_handoff_layout.o" "$OUT/r3dh_moe_iqr_handoff_gpu.o" \
+    --hip-link -lamdhip64 -o "$OUT/r3dh_moe_iqr_handoff_check"
+
+Verified evidence in ../results/r3d-iqr/implementation/logs/:
+  moe-iqr-synthetic.log: 12 cases, 24 runs, 1075200 BF16-exact outputs,
+    1432791 checks. Both parity orientations; M=1,3,8,17; pointer/stacked;
+    changed-input repeats, guards, nondefault stream, HIP graph.
+  moe-iqr-actual-gpu.log: 12 cases, 24 runs, 1075200 BF16-exact outputs,
+    13107200 exact GPU-decoded values, 28068269 checks. Four real full
+    gate/up experts and both TP2 shard fixtures; not concurrent TP2 inference.
+  Combined: 24 cases, 48 runs, 2150400 BF16-exact outputs plus
+    13107200 exact GPU-decoded values. Do not double-count host oracle checks.
+  moe-iqr-actual-host.log: 26899922 checks.
+  Fresh handoff checks: header syntax, host/HIP object compile, checker link,
+    five unmangled C exports, and --host PASS (268612 checks).
+  Existing large GPU suites were inspected, not rerun for this metadata edit.
+  GPU suites assert physical GPU3/logical GPU0, gfx1100; reruns must hold
+    /home/zihaomu/bigssd/oj_system/var/locks/gpu-renderD131.lock.
+    ROCR_VISIBLE_DEVICES=3 HIP_VISIBLE_DEVICES=0.
+  Checker modes: --host, --gpu, --actual-host MODEL, --actual-gpu MODEL.
+  Actual checker pins model size and records the previously verified SHA256;
+    it does not recompute the full 121678372864-byte model hash each run.
+
+Limits: only this U4 computed-MAD/fwht128 gate/up format and gfx1100 are
+validated. No U3/U5, arbitrary tables, K/experts/top-k/group generalization,
+performance claim, full-model execution, or multi-device transport claim.
+M=2048 is an accepted limit, not a reported GPU test case. CPU oracle code
+exists only in the checker. Production launch has no fallback path, allocation,
+scratch requirement, CPU weight decode, or host synchronization.

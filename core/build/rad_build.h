@@ -173,6 +173,7 @@ public:
      * (a ring, a peer's buffers), and libavx's n-gram gather refuses a process that cannot create
      * an io_uring ring, which must not stop a sandboxed conversion. */
     void set_instances(bool on) { instances_ = on; }
+    void set_audit_only(bool on) { audit_only_ = on; }
 
     /* Runtime LoRA (core/lora/): the HF module leaves an adapter may target. Set before the plugin
      * declares, so a fused GEMM over a targeted weight (the gated gate_up fold), which leaves no
@@ -215,6 +216,7 @@ private:
     Program prog_;
     const Program* ref_ = nullptr;
     bool instances_ = true;
+    bool audit_only_ = false;
 
     std::vector<std::string> errors_;
     int  status_ = RAD_OK;

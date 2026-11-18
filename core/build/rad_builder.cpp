@@ -835,7 +835,7 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
     /* An unresolved op is recorded (the graph dump shows it) but returns a null handle, so the
      * plugin can declare the unfused sequence instead. It becomes an error only if issued
      * (spec §2.3, §3.2). */
-    return resolved ? h : RAD_NULL_HANDLE;
+    return resolved || audit_only_ ? h : RAD_NULL_HANDLE;
 }
 
 int Builder::op_declared(const char* op) const {
@@ -2666,8 +2666,34 @@ void Builder::finish_buffer_liveness() {
 }
 
 int Builder::finish() {
+    if (audit_only_) return RAD_E_STATE;
     if (finished_) return status_;
     finished_ = true;
+
+    std::set<int32_t> abandoned;
+    for (size_t index = 1; index < prog_.ops.size(); ++index) {
+        OpInfo& candidate = prog_.ops[index];
+        const bool optional = candidate.op == "ar_hc_write" ||
+                              candidate.op == "router_gemm_topk_scatter" ||
+                              candidate.op == "prefetch";
+        if (!optional || candidate.issued || !op_bufs_[index].reads.empty() ||
+            !op_bufs_[index].writes.empty()) continue;
+        const bool unresolved = std::any_of(candidate.bands.begin(), candidate.bands.end(),
+                                           [](const Band& band) {
+            return !band.dom[RAD_DOMAIN_DEVICE] && !band.dom[RAD_DOMAIN_HOST];
+        });
+        if (!unresolved) continue;
+        candidate.optional_retired = true;
+        abandoned.insert(candidate.index);
+        candidate.weights.clear();
+        candidate.weight_opd.clear();
+        for (Band& band : candidate.bands)
+            for (Resolved& resolved : band.dom) resolved = Resolved{};
+    }
+    prog_.misses.erase(std::remove_if(prog_.misses.begin(), prog_.misses.end(),
+                                     [&](const Program::Miss& miss) {
+        return abandoned.count(miss.index) != 0;
+    }), prog_.misses.end());
 
     /* A sizing declare needs only buffers and liveness; its kernels are the real declare's and its
      * weights and KV groups are unused. */

@@ -595,11 +595,42 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(4) void sample_topk_kernel(
 
     const float x0 = ldg_f32(lg + (size_t)row * lg_ld);
     if (x0 != x0) {                                /* topk_next's seed, as in row_topk */
-        for (uint32_t r = 0; r < n_cand; ++r) {
+        for (uint32_t r = threadIdx.x; r < n_cand; r += kThreads) {
             if (r >= k) { hole(r); continue; }
             ir[r] = 0;                              /* cand_idx is local: the NaN logit's column */
             vr[r] = x0;
             if (pp) { pp[2 * r] = vocab_off; pp[2 * r + 1] = *(const int32_t*)&x0; }
+        }
+        return;
+    }
+
+    if (threadIdx.x == 0) s2[0] = 0;
+    __syncthreads();
+    for (uint32_t column = threadIdx.x; k && column < n_vocab; column += kThreads) {
+        const float candidate = ldg_f32(lg + (size_t)row * lg_ld + column);
+        if (candidate != candidate || candidate == INFINITY) atomicOr(&s2[0], 1u);
+    }
+    __syncthreads();
+    if (s2[0]) {
+        if (threadIdx.x == 0) {
+            float previous = INFINITY;
+            int32_t previous_id = -1;
+            for (uint32_t item = 0; item < n_cand; ++item) {
+                if (item >= k) { hole(item); continue; }
+                float best = 0.0f;
+                int32_t best_id = -1;
+                for (uint32_t column = 0; column < n_vocab; ++column) {
+                    const float candidate = ldg_f32(lg + (size_t)row * lg_ld + column);
+                    if (candidate > previous || (candidate == previous && (int32_t)column <= previous_id)) continue;
+                    if (best_id < 0 || candidate > best) { best = candidate; best_id = (int32_t)column; }
+                }
+                if (best_id < 0) { hole(item); continue; }
+                ir[item] = best_id;
+                vr[item] = best;
+                if (pp) { pp[2 * item] = best_id + vocab_off; pp[2 * item + 1] = __float_as_int(best); }
+                previous = best;
+                previous_id = best_id;
+            }
         }
         return;
     }
@@ -628,11 +659,13 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(4) void sample_topk_kernel(
             }
             for (; j < room; ++j) hole(done + j);   /* holes to the end of the window */
             s2[0] = pi;
-            s2[1] = nout == 0 ? k : done + take;
+            s2[1] = done + take;
+            st[0] = (float)nout;
             st[1] = pv;
         }
         __syncthreads();
         pv = st[1]; pi = s2[0]; done = s2[1];
+        if (st[0] == 0.0f) break;
     }
     for (uint32_t r = done + threadIdx.x; r < n_cand; r += kThreads) hole(r);
 }
@@ -1054,7 +1087,7 @@ extern "C" int r3d_rad_sample_topk(const RadArgs* a, RadStream stream) {
     if (!ci || !ci->data || !cv || !cv->data) return R3D_NO(RAD_E_INVAL);
     if (!r3d_is_i32(ci)) return R3D_NO(RAD_E_DTYPE);
     if (!r3d_is_f32(cv)) return R3D_NO(RAD_E_DTYPE);
-    if (pp && pp->data && !r3d_is_i32(pp)) return R3D_NO(RAD_E_DTYPE);
+    if (pp && pp->data && !sp_is_word(pp)) return R3D_NO(RAD_E_DTYPE);
     if (!r3d_aligned(r3d_p(ci), 4) || !r3d_aligned(r3d_p(cv), 4)) return R3D_NO(RAD_E_ALIGN);
 
     const long long n_vocab = r3d_geti_or(a, "n_vocab", r3d_dim(lg, (int)lg->rank - 1));
@@ -1071,6 +1104,7 @@ extern "C" int r3d_rad_sample_topk(const RadArgs* a, RadStream stream) {
     R3D_NEED(params_ok(pr, rows));
     long long pairs = 0, pairs_ld = 0;
     if (pp && pp->data) {
+        if (!r3d_aligned(r3d_p(pp), 4)) return R3D_NO(RAD_E_ALIGN);
         pairs_ld = r3d_rows_pitch(pp, 2 * n_cand, &prows);
         if (pairs_ld < 0) return R3D_NO(RAD_E_STRIDE);
         if (prows < rows || r3d_numel(pp) < rows * 2 * n_cand) return R3D_NO(RAD_E_SHAPE);

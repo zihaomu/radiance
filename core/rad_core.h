@@ -285,6 +285,7 @@ struct OpInfo {
      * follow): recorded unresolved and never handed to the plugin, so it is never issued and the
      * reference-kernel gate does not count it. */
     bool                  lora_declined = false;
+    bool                  optional_retired = false;
 };
 
 struct KVGroupInfo {

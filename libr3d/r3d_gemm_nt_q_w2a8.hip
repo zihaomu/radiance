@@ -89,6 +89,7 @@
 #include "r3d_args.h"
 
 #include "rad_planes.h"
+#include "r3d_w2_head.h"
 
 namespace {
 
@@ -356,7 +357,147 @@ extern "C" int r3d_gemm_nt_q_w2a8(long a, long a_scale, long b, long b_scale, lo
  * gemm_nt_q's slots, as gemm_ntq_impl takes them: 0 a (i8, step order), 1 a_scale (f32, one per
  * row), 2 b (the u2 codes), 3 b_scale (the joined scale+zero), 4 y (bf16), 5 a_sum (f32,
  * group-major, mpad = 16 columns). */
-extern "C" int r3d_rad_gemm_nt_q_w2a8(const RadArgs* a, RadStream s)
+extern "C" int rad_stream_device_access(RadStream, int, const void*) __attribute__((weak));
+extern "C" void* rad_dev_host_ptr(void*) __attribute__((weak));
+
+namespace {
+__global__ void w2_head_strict(const int8_t* activation, const float* activation_scale,
+                              const uint8_t* codes, const RadPlanesHeader* joined,
+                              const float* sums, uint16_t* output, int columns, int reduction,
+                              int64_t activation_pitch, int64_t scale_pitch,
+                              int64_t sums_pitch, int64_t output_pitch, int64_t available) {
+    const int column = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x);
+    const int row = int(blockIdx.y);
+    if (column >= columns || r3d_w2::header(joined, columns, reduction, available) != RAD_OK)
+        return;
+    const auto* entries = reinterpret_cast<const RadPlanesEntry*>(joined + 1);
+    const auto* base = reinterpret_cast<const uint8_t*>(joined);
+    const auto* scales = reinterpret_cast<const uint16_t*>(base + entries[0].offset);
+    const auto* zeros = base + entries[1].offset;
+    const int groups = reduction / 128;
+    float accumulated = 0.0f;
+    for (int group = 0; group < groups; ++group) {
+        int32_t dot = 0;
+        for (int inner = 0; inner < 128; ++inner) {
+            const int position = group * 128 + inner;
+            const int code = (codes[int64_t(column) * (reduction / 4) + position / 4] >>
+                              (2 * (position & 3))) & 3;
+            dot += int32_t(activation[int64_t(row) * activation_pitch + step_pos(position)]) * code;
+        }
+        const float sum = sums[int64_t(group) * sums_pitch + row];
+        if (!isfinite(sum) || sum < -16384.0f || sum > 16384.0f || float(int32_t(sum)) != sum)
+            return;
+        const int32_t sub = dot - int32_t(zeros[int64_t(column) * groups + group]) * int32_t(sum);
+        const float scaled = __fmul_rn(__fmul_rn(float(sub), activation_scale[int64_t(row) * scale_pitch]),
+                                     f16_to_f32(scales[int64_t(column) * groups + group]));
+        accumulated = __fadd_rn(accumulated, scaled);
+    }
+    output[int64_t(row) * output_pitch + column] = f32_to_bf16(accumulated);
+}
+
+int w2_strict_run(const RadArgs* args, RadStream stream) {
+    if (!args || !args->t || args->n_t < 6 || args->n_t > 7) return RAD_E_INVAL;
+    if (!r3d_gets(args, "dtype") || std::strcmp(r3d_gets(args, "dtype"), "w2a8")) return RAD_E_DTYPE;
+    if (args->n_t == 7 && args->t[6].data) return RAD_E_UNSUPPORTED;
+    for (int index = 0; index < 6; ++index) if (!args->t[index].data) return RAD_E_INVAL;
+    const auto& activation = args->t[0];
+    const auto& scale = args->t[1];
+    const auto& codes = args->t[2];
+    const auto& joined = args->t[3];
+    const auto& output = args->t[4];
+    const auto& sums = args->t[5];
+    if (activation.dtype != RAD_I8 || scale.dtype != RAD_F32 || codes.dtype != RAD_U2 ||
+        (joined.dtype != r3d_w2::dtype && joined.dtype != RAD_F16) ||
+        output.dtype != RAD_BF16 || sums.dtype != RAD_F32) return RAD_E_DTYPE;
+    const int64_t columns = r3d_geti_or(args, "N", 0);
+    const int64_t reduction = r3d_geti_or(args, "K", 0);
+    const int64_t band = r3d_geti_or(args, "M", 0);
+    const int64_t rows = activation.shape[0];
+    const bool model_head = columns == 124160 && reduction == 2560;
+    if (columns <= 0 || columns > (1LL << 28) || reduction <= 0 || reduction > (1LL << 28) ||
+        reduction % 128 || r3d_geti_or(args, "group", 0) != 128 ||
+        rows < 1 || rows > band || band > (model_head ? 32 : 16)) return RAD_E_SHAPE;
+    const int64_t sum_rows = ((rows + 15) / 16) * 16;
+    if (activation.rank != 2 || activation.shape[1] != reduction ||
+        codes.rank != 2 || codes.shape[0] != columns || codes.shape[1] != reduction ||
+        output.rank != 2 || output.shape[0] != rows || output.shape[1] != columns ||
+        scale.rank != 2 || scale.shape[0] != rows || scale.shape[1] != 1 ||
+        sums.rank != 2 || sums.shape[0] != reduction / 128 ||
+        sums.shape[1] < sum_rows || sums.shape[1] > ((band + 15) / 16) * 16 ||
+        (sums.shape[1] != 16 && sums.shape[1] != 32))
+        return RAD_E_SHAPE;
+    if (sums.shape[1] == 32 && sums.stride[0] != 32) return RAD_E_STRIDE;
+    const int64_t sums_pitch = sums.shape[1] == 32 ? sum_rows : sums.stride[0];
+    int64_t available = 0;
+    if (joined.rank == 1) {
+        if (joined.stride[0] != 1 || joined.shape[0] < r3d_head::rounded(sizeof(RadPlanesHeader) +
+            2 * sizeof(RadPlanesEntry))) return RAD_E_SHAPE;
+        available = joined.shape[0];
+    } else if (joined.rank != 2 || joined.shape[0] != columns || joined.shape[1] != reduction ||
+               joined.stride[0] != reduction || joined.stride[1] != 1) return RAD_E_SHAPE;
+    if (codes.stride[0] != reduction || codes.stride[1] != 1) return RAD_E_STRIDE;
+    for (const RadTensor* tensor : {&activation, &scale, &output, &sums}) {
+        const int width = tensor == &activation ? 1 : tensor == &output ? 2 : 4;
+        if (tensor->stride[1] != 1 || tensor->stride[0] < tensor->shape[1] ||
+            tensor->stride[0] > (INT64_MAX / width - tensor->shape[1]) / tensor->shape[0])
+            return RAD_E_STRIDE;
+        const uint64_t bytes = ((tensor->shape[0] - 1) * tensor->stride[0] + tensor->shape[1]) * width;
+        if (bytes > UINTPTR_MAX - reinterpret_cast<uintptr_t>(tensor->data)) return RAD_E_STRIDE;
+        if (!r3d_aligned(tensor->data, width)) return RAD_E_ALIGN;
+    }
+    if (!r3d_aligned(codes.data, 16) || !r3d_aligned(joined.data, 16)) return RAD_E_ALIGN;
+    const uint64_t code_bytes = uint64_t(columns) * uint64_t(reduction / 4);
+    if (code_bytes > UINTPTR_MAX - reinterpret_cast<uintptr_t>(codes.data)) return RAD_E_STRIDE;
+    int current = -1;
+    if (hipGetDevice(&current) != hipSuccess) return RAD_E_DEVICE;
+    bool native = false;
+    if (stream && rad_stream_device_access) {
+        const int status = rad_stream_device_access(stream, current, nullptr);
+        if (status != RAD_OK && status != RAD_E_UNSUPPORTED) return RAD_E_DEVICE;
+        native = status == RAD_OK;
+    }
+    if (stream && !native) {
+        unsigned flags = 0;
+        if (hipStreamGetFlags(reinterpret_cast<hipStream_t>(stream), &flags) != hipSuccess)
+            return RAD_E_DEVICE;
+    }
+    const void* host_joined = nullptr;
+    for (int index = 0; index < 6; ++index) {
+        const auto& tensor = args->t[index];
+        hipPointerAttribute_t attributes{};
+        const bool known = hipPointerGetAttributes(&attributes, tensor.data) == hipSuccess;
+        if (!known) (void)hipGetLastError();
+        if (native) {
+            if (rad_stream_device_access(stream, current, tensor.data) != RAD_OK) return RAD_E_DEVICE;
+        } else if (!known || (!attributes.isManaged && attributes.type != hipMemoryTypeHost &&
+                   (attributes.type != hipMemoryTypeDevice || attributes.device != current)))
+            return RAD_E_DEVICE;
+        if (index == 3 && known && attributes.type == hipMemoryTypeHost && attributes.hostPointer)
+            host_joined = attributes.hostPointer;
+        if (index == 3 && native && rad_dev_host_ptr)
+            if (void* alias = rad_dev_host_ptr(tensor.data)) host_joined = alias;
+    }
+    if (joined.dtype != r3d_w2::dtype && !host_joined) return RAD_E_DTYPE;
+    if (host_joined) {
+        const int status = r3d_w2::header(static_cast<const RadPlanesHeader*>(host_joined),
+                                         columns, reduction, available);
+        if (status != RAD_OK) return status;
+    }
+    R3D_KLAUNCH(R3D_KNAME(w2_head_strict), dim3((columns + 127) / 128, rows), dim3(128),
+                reinterpret_cast<hipStream_t>(stream), static_cast<const int8_t*>(activation.data),
+                static_cast<const float*>(scale.data), static_cast<const uint8_t*>(codes.data),
+                static_cast<const RadPlanesHeader*>(joined.data), static_cast<const float*>(sums.data),
+                static_cast<uint16_t*>(output.data), int(columns), int(reduction), activation.stride[0],
+                scale.stride[0], sums_pitch, output.stride[0], available);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+}
+
+extern "C" int r3d_rad_gemm_nt_q_w2a8(const RadArgs* args, RadStream stream) {
+    return w2_strict_run(args, stream);
+}
+
+[[maybe_unused]] static int w2_legacy_shim(const RadArgs* a, RadStream s)
 {
     if (!a) return R3D_NO(RAD_E_INVAL);
     const char* dt = r3d_gets(a, "dtype");
@@ -517,4 +658,59 @@ extern "C" int r3d_layout_gemm_nt_q_w2a8(const RadParam* p, int n_p, int operand
         }
     }
     return r3d_layout_trace("r3d_layout_gemm_nt_q_w2a8", operand, r3d_pgets(p, n_p, "dtype"), n, rad_planes_layout(enc, sel, planes, n, out));
+}
+
+extern "C" int r3d_layout_w2_head_strict(const RadParam* params, int count, int operand,
+    const RadEncoding* encoding, const int* selected, const RadTensor* planes, int n, RadLayout* output) {
+    if (operand != 3) return RAD_E_UNSUPPORTED;
+    if (!encoding || !selected || !planes || !output || n != 2 || encoding->n_planes != 3 ||
+        !rad_enc_is(encoding, "affine") ||
+        (encoding->transform[0] && !r3d_head::role(encoding->transform, "givens")) ||
+        !r3d_pgets(params, count, "dtype") || std::strcmp(r3d_pgets(params, count, "dtype"), "w2a8") ||
+        r3d_pgeti_or(params, count, "group", 0) != 128) return RAD_E_DTYPE;
+    int codes = 0;
+    for (int index = 0; index < 3; ++index) {
+        const auto& plane = encoding->plane[index];
+        if (r3d_head::role(plane.role, "codes")) {
+            if (plane.dtype != RAD_U2 || plane.kind != RAD_PLANE_TILED ||
+                plane.block[0] != 1 || plane.block[1] != 1) return RAD_E_DTYPE;
+            ++codes;
+        }
+    }
+    if (codes != 1 || selected[0] == selected[1]) return RAD_E_DTYPE;
+    const int64_t rows = planes[0].shape[0], groups = planes[0].shape[1];
+    if (rows <= 0 || rows > (1LL << 28) || groups <= 0 || groups > (1LL << 21)) return RAD_E_SHAPE;
+    if (r3d_pgeti_or(params, count, "N", rows) != rows ||
+        r3d_pgeti_or(params, count, "K", groups * 128) != groups * 128) return RAD_E_SHAPE;
+    for (int index = 0; index < 2; ++index) {
+        if (selected[index] < 0 || selected[index] >= 3) return RAD_E_DTYPE;
+        const auto& plane = encoding->plane[selected[index]];
+        const auto& tensor = planes[index];
+        const uint32_t type = index ? RAD_U8 : RAD_F16;
+        if (!r3d_head::role(plane.role, index ? "zero" : "scale") ||
+            plane.dtype != type || tensor.dtype != type || plane.kind != RAD_PLANE_TILED)
+            return RAD_E_DTYPE;
+        if (plane.block[0] != 1 || plane.block[1] != 128 || tensor.rank != 2 ||
+            tensor.shape[0] != rows || tensor.shape[1] != groups) return RAD_E_SHAPE;
+        if (tensor.stride[1] != 1 || tensor.stride[0] != groups) return RAD_E_STRIDE;
+    }
+    const int64_t start = r3d_head::rounded(sizeof(RadPlanesHeader) + 2 * sizeof(RadPlanesEntry));
+    if (rows > (r3d_head::limit - start) / (groups * 3 + RAD_PLANES_ALIGN * 2)) return RAD_E_SHAPE;
+    const int status = rad_planes_layout(encoding, selected, planes, n, output);
+    if (status == RAD_OK) output->dtype = r3d_w2::dtype;
+    return status;
+}
+
+extern "C" int r3d_relayout_w2_head_strict(const RadParam* params, int count, int operand,
+    const RadEncoding* encoding, const int* selected, const RadTensor* planes, int n,
+    void* destination, int64_t bytes) {
+    RadLayout layout{};
+    const int status = r3d_layout_w2_head_strict(params, count, operand, encoding, selected, planes, n, &layout);
+    if (status != RAD_OK) return status;
+    if (!destination || bytes < layout.bytes) return RAD_E_INVAL;
+    for (int index = 0; index < n; ++index) if (!planes[index].data) return RAD_E_INVAL;
+    const int result = rad_planes_relayout(encoding, selected, planes, n, destination, bytes);
+    if (result != RAD_OK) return result;
+    return r3d_w2::header(static_cast<const RadPlanesHeader*>(destination),
+                          planes[0].shape[0], planes[0].shape[1] * 128, bytes);
 }

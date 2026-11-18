@@ -1,0 +1,117 @@
+Scoped native vision axial RoPE, gfx1100
+
+Actual checkout: /home/zihaomu/bigssd2/radiance_workspace/libr3d-iqr-dev
+Owned source names: libr3d/r3dh_vision_rope* and libr3d/r3d_vision_registry.cpp.
+No CMake, rows, core, architecture, existing strict-vision, or MTP source edits.
+No Python, Markdown artifact, commit, push, CPU fallback, or F16 implementation.
+
+Production translation units to integrate:
+  libr3d/r3dh_vision_rope.hip
+  libr3d/r3d_vision_registry.cpp
+Existing dependencies (read and linked, not modified here):
+  libr3d/r3dh_vision_strict.hip
+  libr3d/r3dh_vision_strict_shapes.cpp
+  libr3d/r3dh_vision_strict_registry.cpp
+Private API: libr3d/r3dh_vision_rope.h
+Standalone verification: libr3d/r3dh_vision_rope_check.hip
+Test-only matcher probe: libr3d/r3dh_vision_rope_registry_check.cpp, linked
+against unmodified core/util/rad_util.cpp; neither is a production dependency.
+Runner: bash libr3d/r3dh_vision_rope_test.sh --host or --all
+
+Compiler: /opt/rocm/llvm/bin/clang++ in radiance-r3d-dev:rocm10.1-ffmpeg.
+Flags: -std=c++17 -O2 -fPIC -ffp-contract=off -fno-fast-math
+       --offload-arch=gfx1100 -Iabi -Ilibr3d
+The HIP unit must retain strict floating point and contraction disabled.
+The private header refuses fast-math and finite-math-only compilation.
+The checker links -ldl to call the real CPU libref oracle; production does not.
+
+Exports (C linkage):
+  r3d_vision_schema_count() -> 4
+  r3d_vision_schema_at(index) -> borrowed schema pointer, null outside [0,4)
+  r3d_vision_kernel_count() -> 16
+  r3d_vision_kernel_at(index) -> borrowed row pointer, null outside [0,16)
+  r3dh_vision_rope(const RadArgs*, RadStream)
+  r3dh_vision_rope_qk(const RadArgs*, RadStream)
+  r3dh_vision_rope_shape(const RadParam*, int, int, RadOpdDesc*)
+  r3dh_vision_rope_kernel()
+  r3dh_vision_rope_schema()
+The aggregate preserves the existing three schemas and fifteen kernel pointers
+in their original order, appending one rope schema and one DEVICE candidate:
+  r3dh_vision_axial_rope72, priority 200.
+Only the canonical fused rope launcher is registered, not the Q/K helper.
+
+Canonical two operands, no separate output:
+  qkv: BF16 [M,3456], element strides [3456,1], INOUT.
+       Each row is Q[16,72], K[16,72], V[16,72], in that order.
+  positions: I32 [2,M], element strides [M,1], read-only.
+             Plane 0 is row; plane 1 is column.
+An extra contiguous [3,M] position view is accepted; plane 2 is ignored.
+F32/F16 positions, [M], [4,M], and arbitrary strides are not supported.
+The schema shape hook returns [2,M], matching the actual ViT issue path.
+
+Unregistered Q/K helper takes three operands in order: Q, K, positions.
+Q and K are BF16 [M,1152], stride [1152,1] for separate allocations, or
+stride [3456,1] for views into a fused row, K.data = Q.data + 1152 BF16.
+Both are mutated in place; there is no output operand or copy-back fallback.
+Overlapping Q/K storage is refused except the exact canonical fused views.
+
+Required parameters:
+  M: integer 1..256
+  head_dim: integer 72
+  n_head: integer 16
+  mode: string axial
+  sections: string 18 18 (two positive 18s, no trailing non-whitespace)
+Optional parameters, with defaults:
+  n_head_kv: integer 16
+  rotary_dim: integer 72
+  theta: finite F64 converted to finite positive F32, default 10000
+  scale: finite F64 converted to finite positive F32, default 1
+  dtype: bf16 only
+  ladder: rotary only
+  yarn_factor / llama3_factor: zero only
+Unknown/duplicate keys, wrong parameter kinds and malformed descriptors reject.
+Shape queries accept a valid M range whose high endpoint is at most 256;
+launches require a resolved integer M and exactly matching active tensor rows.
+Dispatch constraints require explicitly resolved n_head_kv=16, rotary_dim=72
+as the actual architecture supplies both. Section validation lives in the
+shape hook and launcher: RAD_C_IN tokenizes a string set and cannot represent
+the multiword value 18 18. The real engine matcher is regression-tested.
+
+Semantics verified from arch/common/rad_block_vit.h and libref/ref_attn.cpp:
+  The ViT declaration sets section widths to head_dim/4 = 18 each.
+  Its issue path passes a dense [2,M] row/column view of enc_coord to rope;
+  the separate grid_embed issue receives [4,M] from the same buffer.
+  Each head uses NeoX pairs (pair,pair+36).
+  Pairs 0..17 use row, pairs 18..35 use column.
+  Both sections restart the frequency ladder at theta^0.
+  inv[j] = 1 / F32(pow(F64(F32(theta)), F64(F32(2*j)/F32(36)))).
+  angle = (F32(position)/F32(scale))*inv[j].
+  sin/cos are evaluated in double and rounded to F32, as libref does.
+  Separate F32 products and sum/subtraction are rounded BF16 nearest-even.
+  V storage, positions and allocation guards are unchanged.
+The implementation launches native HIP asynchronously on the supplied stream;
+only parameter/frequency preparation is performed on the host.
+
+Validation fixture is architecture-shaped, not captured model activations.
+RoPE has no weight operands. M=1/3/8/16/256 are checked exhaustively for
+five coordinate patterns (zero, actual 16x16 patch grid, row-only, column-only,
+signed large independent axes with theta500000 and scale1.25), both [2,M] and
+[3,M] positions, fused rows, canonical Q/K views and separate Q/K allocations.
+Two changed inputs per case, two nonblocking streams, untouched positions/V,
+allocation guards, independent CPU arithmetic, and actual libref_rope are used.
+Five further cases change only the unused third plane and require bit identity.
+Host tests cover exact error statuses, reject-before-mutation, BF16 RNE,
+aggregate pointer identity and counts, shapes and ranges, and unsupported M.
+
+GPU selection: physical GPU5, gfx1100, PCI bus a3 (W7900D), only when idle.
+Read-open nonblocking production lock: gpu-renderD133.lock.
+No other GPU is used; lock or idle contention exits 75 without waiting.
+Logs: ../results/r3d-iqr/implementation/logs/r3dh_vision_rope-{build,host,gpu}.log
+Additional logs reject forbidden fast-math and finite-math-only compilation.
+
+Explicit limits: M > 256 is unsupported, including audit M2048.
+A 256px image yielding 256 patches fits this RoPE and current strict vision cap.
+The separate grid_embed M2048 qualification does not enlarge these limits.
+No larger-image, whole vision tower, preprocessing, performance, or full-model
+inference qualification is implied. Existing 15-row strict vision results and
+the grid_embed qualification are independent prior evidence, not rerun here.

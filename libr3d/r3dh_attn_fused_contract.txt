@@ -1,0 +1,205 @@
+r3dh_attn_fused candidate handoff, 2026-11-17
+
+Scope and integration
+Only libr3d/r3dh_attn_fused* is owned by this task. No shared CMake,
+registry, architecture, core, branch, commit, image push or release changes.
+These are same-stream native compositions, not a single fused GPU kernel.
+Production source units: r3dh_attn_fused.cpp, r3dh_attn_fused_registry.cpp,
+r3dh_attn_fused_native.hip. Public header: r3dh_attn_fused.h.
+The registry source here is owned; integration into the plugin is main-owned.
+
+Required strict-native production dependencies
+r3dh_attn_qsa_device.hip, r3dh_attn_qsa_rope.hip, r3dh_attn_qsa_state.hip;
+r3dh_sparse_qsa_host.cpp, r3dh_sparse_qsa_index.hip, r3dh_sparse_qsa_device.hip;
+r3dh_qwen_ops_quant.hip, and their existing headers. Compile each once.
+The standalone runner builds these afresh into a private directory.
+libref/ref_attn.cpp, ref_qsa.cpp, ref_quant.cpp are CHECKER ONLY.
+
+Exports
+int r3dh_attn_fused_prepare_store(const RadArgs*, RadStream)
+int r3dh_attn_fused_paged_gate(const RadArgs*, RadStream)
+int r3dh_attn_fused_workspace_bytes(const RadArgs*, int paged, uint64_t*)
+int r3dh_attn_fused_kernel_count(); const RadKernelInfo* kernel_at(int)
+int r3dh_attn_fused_schema_count(); const RadOpSchema* schema_at(int)
+The actual at-symbols have the full r3dh_attn_fused_ prefix.
+There are two schemas and two RAD_DOMAIN_DEVICE kernel rows. Integrate both.
+RadScratchFn requires int64_t(const RadArgs*), NOT the uint64 query API.
+Each registered row uses its private adapter, with compile-time exact-type
+assertions; adapters return bytes or -1. Never cast the query to RadScratchFn.
+
+Common admission
+gfx1100 candidate, strict floating point: C++17 -O2 -fPIC -fno-fast-math
+-ffp-contract=off -fdenormal-fp-math=ieee --offload-arch=gfx1100.
+Fast-math and finite-only builds are rejected by the public header.
+head_dim=256, n_head=12, KV heads=1, q_dtype=bf16, kv_dtype=i8,
+block_size=4. Head 192 is explicitly unsupported, not claimed.
+All operands are device-domain, including I32 metadata and F32 weights/table.
+No CPU fallback, device-to-host copies, host dereference of device contents,
+device synchronization or stream synchronization in production.
+The supplied stream is forwarded to every native launch and D2D copy.
+
+qk_norm_rope_gate_kv_store operand order
+0 q_gate BF16 [M,6144]; 1 k BF16 [M,256]; 2 cos_sin F32 [positions,64];
+3 positions I32 [M]; 4 q_w F32 [256]; 5 k_w F32 [256];
+6 q_out optional BF16 [M,3072]; 7 k_out required BF16 [M,256];
+8 gate_out optional BF16 [M,3072]; 9 v BF16 [M,256];
+10 slot_mapping I32 [M]; 11 kv_cache INOUT I8 [pages,1,4,516].
+Q/gate inputs and both weights are required for fixed n_head=12.
+Q output and gate output are INDEPENDENTLY optional; all four combinations
+are checked. K output is mandatory. M=1..2048, rot=64, cs_f32=1,
+pos_i64 absent/0, eps positive finite, wadd finite, k/v scales absent/1.
+Native prepare then native kv_store; V is preserved in scratch before writes.
+Rank-2 pitched or contiguous-head rank-3 views are normalized without reads.
+
+attn_paged_gate_had_quant operand order
+0 q BF16 [R,3072]; 1 kv_cache I8 [pages,1,4,516];
+2 block_table I32 [S,width]; 3 seqused I32 [S];
+4 k_descale absent; 5 v_descale absent; 6 cu_seqlens optional I32 [S+1];
+7 out BF16 [R,3072]; 8 gate BF16; 9 q8 I8 [R,3072];
+10 q8_scale F32 [R,24]. All three outputs are required.
+q_len=1..32; 1<=R<=min(2048,q_len_upper*256); 1<=S<=256;
+max_seqs=256, max_ctx=1..200000 ADMISSION, causal=1, window=0, group=128,
+act=sigmoid, scale absent/default0.0625 or positive finite.
+Without cu_seqlens, R must divide into S equal query groups.
+When cu_seqlens is absent and S=R, calls strict selected sparse QSA.
+Selected width is bounded to 513: topk<=512 COMPLETE pages plus at most
+one partial trailing page, not 513 complete selected pages. Caller provides
+valid selected seqused<=2051. Wider selected tables return RAD_E_UNSUPPORTED
+before enqueue; they NEVER fall through to ordinary/dense attention.
+Otherwise calls strict ordinary paged attention, including shared union
+tables; width<=50000. This is an explicitly ordinary call, not sparse overflow
+fallback. Then calls strict sigmoid gate/BF16 product/Hadamard-I8 quant.
+Selected tables can come directly from native QSA selection. Prior GPU4
+qualification covered signed-score modes 0/1 at context67 and2052 only.
+Packed gate forms: [R,256] row stride>=6144; [R,12,256] head stride512
+and row stride>=6144; or [R*12,256] row stride512. Ordinary [R,3072]
+pitched and contiguous-head rank3 views are also accepted.
+
+Memory and scratch
+Cache pages=1..50000 ADMISSION; exact contiguous strides 2064,2064,516,1.
+Each cache token is K[256],V[256],FP16 Kscale,FP16 Vscale, byte516.
+Caller supplies valid device contents: positions/table indices/prefix sums,
+seqused>=its query-group length, physical page bounds, finite numerical
+inputs, and unique nonnegative store slots. No host inspection or sync.
+Scratch depends ONLY on declared geometry, not tensors or device data.
+Prepare: M_upper*6656*2 bytes, maximum27262976 bytes (26MiB at M2048).
+Paged: min(2048,q_len_upper*256)*6144*2, maximum25165824 bytes.
+16-byte aligned, full query size required; distinct from every operand.
+Range upper bounds drive scratch/capacity; forwarded native params become
+concrete integers. Output/output overlaps are rejected before enqueue.
+Output/input aliases are staged: tested Qout=q_gate, Kout=K or V,
+paged out=Q, with separately allocated quant outputs. Disjointness uses
+conservative full-stride envelopes, so arbitrary interleaved output aliases
+are not promised. Scratch may be reused on the same stream after completion.
+
+Qualification and reproduction
+bash libr3d/r3dh_attn_fused_test.sh --build
+Then --prepare-host, --prepare-gpu, --host, or --regression-gpu.
+--all and --gpu also run the separate, not-yet-qualified 200K matrix.
+SDK: radiance-r3d-dev:rocm10.1-ffmpeg, C++17,
+same-path workspace mount, uid/gid1001. Current runner ONLY read-opens
+production renderD134 with nonblocking flock, verifies idle, <=64MiB VRAM,
+no fuser, and PCIc3:00 GPU6. No fallback to GPU3/4/5 or any other GPU.
+Legacy tests: 298 fused cases (73 prepare,141 selected,84 ordinary/union),
+40 additional native selector checks, 64 geometry/adapter ABI cases,
+3874 exact-error launch rejections. M1/3/8/16/32 plus all1..16, selected
+R256 and ranged R2048/S256; nonblocking stream, changed inputs on reused
+allocations, full input/output and scratch guards; no numerical tolerance.
+GPU4 final numerical run:354749840 byte comparisons,338 device calls.
+Legacy host check count9672; legacy GPU check count48118. These counts
+precede this context extension and must not be presented as long-context runs.
+
+Artifacts and limits
+Private build: ../build-r3d-bootstrap/r3dh_attn_fused-build/ contains
+r3dh_attn_fused.so and r3dh_attn_fused_check. Evidence under
+../results/r3d-iqr/implementation/logs/r3dh_attn_fused-*.
+Independent oracles: qualified CPU prepare, libref KV store, paged
+attention, QSA selection and Hadamard quantization. No libref in candidate.
+Pending main-owned integration into plugin build/schema/row lists and full
+model execution. No head192, full-model execution, q_len>32, or performance claim.
+
+200K extension status: IMPLEMENTED, HOST-VALIDATED, NOT YET GPU-QUALIFIED
+The GPU6 production lock was held on both qualification attempts. No device
+run started for this revision, and no service was paused, stopped or changed.
+Old GPU4 results remain historical <=4096-context/<=1024-cache-page evidence,
+not evidence for the changed source or for 200K support. Do not treat this
+candidate's enlarged registry constraints as a completed 200K qualification.
+
+Verified source limits and math
+r3dh_attn_fused.cpp: workspace validation admits max_ctx<=200000, q_len<=32.
+r3dh_attn_fused_registry.cpp: the SAME max_ctx bound is advertised in the
+private row and shape callback; context200000 describes 50000 physical pages.
+r3dh_attn_fused_native.hip: cache<=50000, selected width<=513, ordinary<=50000;
+selected calls remain strict sparse, with no CPU or dense overflow fallback.
+r3dh_sparse_qsa_host.cpp: qsa_score/qsa_select width<=50000, topk<=512;
+direct shape admission tests passed for score width50000, signs0/1, R3;
+width50001 is rejected. This dependency was READ ONLY, not modified.
+r3dh_sparse_qsa_index.hip: selection streams the full candidate width using
+a fixed float heap[512], then emits deterministic threshold/tie passes and
+an optional current partial page. No full-width device scratch is required.
+r3dh_sparse_qsa_device.hip and r3dh_attn_qsa_device.hip use 64-bit physical
+cache offsets; ordinary paged attention already permits 50000 pages and has
+no 4096-token local array. Dependencies were READ ONLY, not modified.
+50000*4*516 = 103200000 bytes (98.42MiB) for the single KV-head I8 cache,
+not 200MB; Q heads12 reuse that one KV head. Scratch formula is unchanged.
+Registry prepare M upper is now2048; paged q_len upper remains32 and physical
+R cap remains2048. Long-context fixtures target R1/R3 only, not a long-context
+R2048 certification. Prepare qualification does not qualify 200K attention.
+
+New tests and remaining gate
+r3dh_attn_fused_check_long.h adds 12 host geometries,19 exact-error rejects,
+and direct underlying selector-width50000 admission. Before the prefill change,
+full --host passed 298 legacy cases and 9753 checks; zero GPU launches in that mode.
+The compiled but NOT RUN long GPU matrix is 64 fused launches: contexts
+8192/32768/131072/200000, R1/R3, signed/ReLU selection with ties, shared
+union, explicit ordinary dense, and two changed inputs on reused buffers.
+It also runs32 native selectors against an independent sort-based CPU oracle.
+For attention, one group128 per row samples BF16 output, I8 codes and F32
+scale against a two-nonzero-query independent CPU oracle; no full long CPU
+attention recompute. Allocation/scratch guards and sampled input immutability
+are checked. Both positive/negative and all-negative tie scores are included.
+Remaining action: rerun --gpu only when idle GPU6/D134 can be locked, inspect
+the LONG_PASS counts and source hashes, then update qualification honestly.
+All 200K device numerics and long-context performance remain UNQUALIFIED.
+
+Prepare prefill qualification: GPU6 PASS, 2026-11-17
+Actual dev worktree only; changed production r3dh_attn_fused.cpp and
+r3dh_attn_fused_registry.cpp. Native prepare/store implementation, paged
+constraints, shared main/rows/CMake/core and all other owners are unchanged.
+Qualified prepare upper M=2048: hd256, qh12, kvh1, rot64, BF16, I8 page4.
+This is actual M2048 prepare/store execution, not the historical ranged
+paged R2048 staging case. It does not execute full weights or the model graph.
+
+180 added prepare cases, each with a fresh CPU prepare + libref KV-store oracle:
+every integer M1..64 with two changed inputs on reused allocations;
+M64/128/512/2048 each with five output/alias variants and two changed inputs;
+each of those four sizes also has two real ranged-M runs and one registry
+shape-generated run. All output bytes, full KV cache including untouched
+pages, all input bytes and allocation/pitch guards are checked exhaustively.
+Large M is NOT sampled. Both scratch guards are checked on every launch.
+Two independently optional outputs, Qout=input, Kout=K/V and pitched views
+retain the original fixture coverage. Nonblocking stream throughout.
+M2048 KV fixture has514 pages,1060896 bytes, checked in full.
+M64 scratch851968 bytes; M2048 scratch27262976 bytes; both exact-query sized.
+
+ABI suite:2080 geometries (prepare all1..2048; paged all1..32), exact registry
+bounds, all prepare operand shapes, upper-range scratch/shape, oversized/zero
+integer and range rejection before tensor dereference, pointer/scratch wrap,
+row/pitch mismatch, alias and short/alignment checks. Prepare M2049 rejected;
+paged admission stays q_len<=32. No q_len64 admission or performance claim.
+Focused host:180 cases,83740 checks, zero device calls.
+Focused GPU:180 cases,106964 checks,1258969216 byte comparisons,180 calls.
+Combined regression:482 cases,153901 checks,1621363504 byte comparisons,
+522 device calls including40 native selector checks; zero mismatches.
+That is298 historical cases +180 prepare cases +4 M64 paged cases.
+M64 paged tests both selected S64 and ordinary S1 with q_len=1, context128,
+packed gate/output alias, two changed inputs and exhaustive CPU comparisons.
+The regression mode deliberately does NOT run the unrelated 200K matrix.
+
+Evidence: implementation/logs/r3dh_attn_fused-{build,prepare-host,
+prepare-gpu,regression-gpu}.log and inputs.sha256/hashes.log.
+Build is fresh strict C++17 in the requested SDK, production --no-undefined,
+7 exports, no CPU reference or host synchronization in production symbols.
+GPU6 PCI0000:c3:00.0 only, production D134 read-open flock-n, idle<=64MiB;
+GPU exits0, exact guards, lock reacquire PASS. No other GPU was used.
+Full-model/MTP end-to-end execution and performance remain main-owned.

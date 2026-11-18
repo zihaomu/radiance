@@ -1,0 +1,121 @@
+R3DH VISION STRICT DEVICE CONTRACT
+
+Ownership: only new libr3d/r3dh_vision_strict* files. No shared CMake,
+registry, architecture, existing kernel, commit or push changes.
+
+Integration API (r3dh_vision_strict.h)
+r3dh_vision_strict_kernels(int*) returns 15 RadKernelInfo rows, all DEVICE:
+seven exact N/K rows for gemm_nt, seven for gemm_nt_bias, one attn_dense.
+r3dh_vision_strict_schemas(int*) returns three RadOpSchema descriptors.
+Copy returned descriptors into the owning plugin's tables; do not register
+these as HOST kernels. Returned tables have static lifetime. No scratch,
+initialization, relayout, tuning, host compute fallback or external BLAS.
+r3dh_vision_strict_shape(op, params, count, operand, description) is the
+common shape hook; row-specific RadShapeFn adapters are supplied.
+
+gemm_nt(a,b,y), gemm_nt_bias(a,b,bias,res?,y)
+Parameters: M,N,K integer, dtype=bf16; bias version act=none|gelu|gelu_tanh.
+M range 1..256. N/K pairs and actual architecture calls:
+1152/1536 patch, v.patch.weight [1152,3,2,16,16] flattened without reorder;
+3456/1152 attention QKV, v.blk.L.qkv.weight [3456,1152];
+1152/1152 attention output, v.blk.L.proj.weight [1152,1152], residual;
+4304/1152 FF up, v.blk.L.fc1.weight [4304,1152], gelu_tanh;
+1152/4304 FF down, v.blk.L.fc2.weight [1152,4304], residual;
+4608/4608 merger FC1, v.merger.fc1.weight [4608,4608], exact gelu;
+2560/4608 merger FC2, v.merger.fc2.weight [2560,4608].
+All weights and biases plain BF16; matrices rank2 with positive row pitch
+>= columns, unit inner stride. Bias rank1 [N], positive element stride.
+Output BF16. FP32 sum starts at +0, K strictly ascending, separate multiply
+and add, bias only after final K. Round BF16 RNE, then optional double-libm
+GELU cast F32 and BF16 round, then residual add and BF16 round. Exact same
+residual/output view is supported, partial overlap is rejected. Output may
+not overlap a,b,bias. Every nonnull operand must be current-device HIP memory.
+
+attn_dense(q,k,v,cu_seqlens,out)
+BF16 q/k/v/out [M,1152] or [M,16,72], dimension contiguous, positive
+nonoverlapping head/row pitches; fused QKV column views have row pitch3456.
+cu_seqlens contiguous DEVICE I32 [S+1], starts0, endsM, monotone within [0,M];
+empty segments allowed. Invalid boundaries safely leave output untouched;
+they do not synchronously report a host error. Caller must supply valid CU.
+M1..256; head_dim72, gqa1, causal0, window0, window_right0, block0, cu_div1.
+scale finite F64 parameter cast F32, defaults 1.0f/sqrt(72.0f), matching
+libref's FP32 default; rounding a double-precision reciprocal is not identical.
+max_seqlen is an ignored capacity parameter, never permission to exceed M256.
+Dots ascend dimension0..71. Two score passes with FP32 max, FP32 sum of
+float(exp(double(score-max))), FP32 ascending-key value sums, BF16 RNE output.
+No BF16 probability rounding, no head padding to128/256, no FMA contraction.
+Output may not overlap q/k/v/cu. Strict scalar baseline, not a tuned kernel.
+
+Graph evidence
+arch/common/rad_block_vit.h declare and issue use gemm_nt_bias for the patch
+projection: no conv3d_strided symbol on this architecture's actual path.
+Patch rows are flattened channel,temporal,y,x: 3*2*16*16=1536.
+qwen4exp_fp8 declares media only with tower metadata and max_enc_patches>0;
+VisionTower also gates on the actual patch weight. No media means no ViT issue.
+Current metadata: depth27, hidden1152, FF4304, 16 heads, dimension72,
+patch16, temporal2, merge2, position table2304 (side48), output2560,
+gelu_pytorch_tanh, empty deepstack list.
+Audit count222 gemm_nt_bias = 111 per TP rank: patch1+27*4+merger2.
+attn_dense54 = 27 per rank. These are conditional declared graph counts,
+not evidence of executed image inference or mandatory text-only operations.
+
+Build and reproduce
+SDK image freetoken:rocm10.1.0-transformers518-final-gh-proxy-20261026,
+same-path workspace mount, uid/gid1001. /opt/rocm/llvm/bin/clang++ flags:
+-std=c++17 -O2 -fPIC -ffp-contract=off -fno-fast-math
+--offload-arch=gfx1100 -Iabi -Ilibr3d
+Compile r3dh_vision_strict.hip, _shapes.cpp, _registry.cpp into libr3d.
+Host x86intrin forced include is NOT needed for these standalone units.
+bash libr3d/r3dh_vision_strict_test.sh --host
+bash libr3d/r3dh_vision_strict_test.sh --all
+Binary ../build-r3d-bootstrap/r3dh_vision_strict_check.
+Logs ../results/r3d-iqr/implementation/logs/r3dh_vision_strict-*.log.
+--all uses physicalGPU5 only, PCIa3/gfx1100 asserted; ROCR5/HIP0; read-open
+nonblocking production gpu-renderD133.lock; busy or VRAM>=1GiB exits75.
+Both reference library and SDK must exist locally; no download or Python.
+CPU and libref are test oracles only. Production compute stays on GPU.
+M1/3 GEMM compared exhaustively; M8/16/256 compare2048 evenly spaced outputs
+of full native GPU tensors, both changed inputs. Attention exhaustive at
+M1/3/8/16/256, whole and split segments including an empty segment, both
+changed inputs, fused pitch3456. Direct libref GEMM full M1; attention full.
+Actual planes: patch, block0 QKV/proj/FFup/FFdown, merger1/2 and seven biases;
+not all27 layers' individual planes. Plane offsets/bytes/FNV1a64 logged.
+Model header/version/size and bounds checked; full file SHA not recomputed.
+Reference model previously pinned SHA256:
+25aff8c950f4b823bc8b77c8184ed48827cb47058ffce08ae2c83b12e021fea0.
+
+Final qualification 2026-11-17, physical GPU5 gfx1100 PCI a3
+Current sources rebuilt in the existing SDK. Host PASS checks=65616;
+-ffast-math and -ffinite-math-only both rejected. Synthetic GPU PASS:
+83 cases, 1795584 independent BF16 comparisons, 1592508 checks, zero
+mismatches, plus 1382208 direct libref comparisons. Current-model GPU PASS:
+70 cases, 466176 independent BF16 comparisons, 680740 checks, zero
+mismatches, plus 73536 direct libref comparisons. Both passes use two
+changed inputs, nondefault stream, guarded buffers and row-padding checks.
+Final logs under ../results/r3d-iqr/implementation/logs/:
+r3dh_vision_strict-host.log, r3dh_vision_strict-synthetic.log,
+r3dh_vision_strict-final-model.log. The --all run returned75 between the
+successful synthetic and model stages; the separately locked model rerun
+returned0. Earlier final-synthetic.log is an INVALID pre-fix failure record:
+default scale now matches libref's FP32 sqrt/reciprocal, with no tolerance
+relaxation. All seven shapes exercised both as plain gemm_nt and as
+gemm_nt_bias at M1/3/8/16/256, with synthetic and actual-model weights.
+No full-M256 exhaustive GEMM claim.
+
+Explicit exclusions and integration gates
+M>256 (audit uses2048 patches/512 merger rows), other N/K, F32 output,
+quantized weights, causal/window/block/GQA attention and head128/256 are not
+supported by this port. Parameter/stride/device guards remain authoritative.
+This port does NOT provide grid_embed, layernorm, axial rope(head72,
+sections18+18), scatter_rows, preprocessing/FFmpeg or separate conv3d_strided.
+Grid width1152/side48 is now separately qualified by the MTP owner through
+registered r3d_grid_embed_1152_s48_bf16, including exhaustive M2048 checks
+with three changed inputs and guarded inputs/outputs/scratch. Evidence:
+../results/r3d-iqr/implementation/mtp-ple-batch-z1hpR919/gpu.log,
+MTP_PLE_BATCH_PASS cases=43 compared_bytes=1324229520 sampled_not_full=1.
+The sampled_not_full marker concerns that whole MTP suite, not its exhaustive
+grid_actual cases. Grid is NOT implemented or registered by this vision port;
+main must link/register the MTP sources. Axial RoPE72 sections18+18 is still
+missing here. Main owns FFmpeg/media preprocessing and whole-graph integration.
+No full vision tower, image API/encoder, full TP2 execution, latency,
+throughput or performance claim. Owner must integrate and test remaining ops.

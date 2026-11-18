@@ -404,6 +404,7 @@ struct DeviceBackend {
      * packet. Null on a backend that keeps none. */
     void    (*stream_counts)(int device, int* open, int* idle);
     int     (*stream_trim)(int device, int keep);
+    int     (*stream_device_access)(RadStream s, int device, const void* address);
 };
 
 

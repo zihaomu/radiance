@@ -1,0 +1,60 @@
+Scoped native sample_merge_topk
+
+Ownership: only new libr3d/r3dh_sample_merge* files. Main owns integration.
+No CMake, existing registry, core or other port files changed by this task.
+
+Production build list:
+  libr3d/r3dh_sample_merge.hip
+  libr3d/r3dh_sample_merge_registry.cpp
+Public private-port API: libr3d/r3dh_sample_merge.h
+  r3dh_sample_merge_topk(args, stream)
+  r3dh_sample_merge_shape(params, count, operand, descriptor)
+  r3dh_sample_merge_kernels(count), kernel_count(), kernel_at(index)
+  r3dh_sample_merge_schemas(count), schema_count(), schema_at(index)
+The count/at shorthand uses the r3dh_sample_merge_ prefix on every function.
+One DEVICE row: r3dh_sample_merge_topk_f32, canonical op sample_merge_topk.
+Schema exactly M,n_cand; gathered,params,cand_idx,cand_val, in that order.
+Main must append the row and, only if missing, the compatible schema.
+
+Strict build: SDK freetoken:rocm10.1.0-transformers518-final-gh-proxy-20261026,
+user 1001:1001, same absolute workspace mount, C++17, gfx1100,
+-O2 -fno-fast-math -ffp-contract=off -Iabi -Ilibr3d.
+No init, scratch, allocation, synchronization, input copies or CPU fallback
+in the production entry. Exactly one native HIP block/row on supplied stream.
+Full bitonic sort uses 256 threads and 256/512/1024/2048/4096 LDS entries.
+Maximum static LDS 49152 bytes. Serial final distinct-pair compaction in block.
+Not the sorted-run shortcut in libr4d/libhalo; arbitrary input order accepted.
+
+Runtime limits: declared M=1..8, live rows=1..declared M from output tensor;
+n_cand=1..2048; input pairs=1..4096. Rank2 inputs and outputs, inner stride1,
+row pitch >= logical width and <= INT32_MAX. Outputs cannot alias any input
+or each other. Four-byte alignment, eight-byte params alignment. Params packed
+[live_M,24] words (RadSampleParams96); dtype u32/i32/f32 is a raw-byte view.
+Gathered u32/i32 [live_M,2*input_pairs]; i32 ids and f32 values [live_M,n_cand].
+Actual TP2 n_cand1024 input is [M,4096] WORDS = 2048 candidate pairs.
+Optional world_size parameter cross-checks width; not added to canonical schema.
+Shape helper declines gathered without explicit world_size: no guessed TP size.
+
+Reference semantics: libref/ref_sample.cpp ref_sample_merge_topk.
+Each pair is global token id followed by f32 LOGIT BITS, not numeric conversion.
+Signed-negative IDs (including ffffffff) skipped. NaNs skipped, both infinities
+eligible. Descending numeric values then lower signed-nonnegative ID. Exact
+(numeric-value,id) duplicates emitted once; signed-zero variants compare equal
+and preserve earliest input bits. Same ID at a different value remains eligible.
+Per-row top_k>0 clamps width; <=0 uses full width. GREEDY emits zero candidates.
+Tail is i32 -1 / f32 negative infinity. No token sampled; no softmax or RNG here.
+
+Standalone validation:
+  bash libr3d/r3dh_sample_merge_test.sh --host
+  bash libr3d/r3dh_sample_merge_test.sh --all
+  bash libr3d/r3dh_sample_merge_test.sh --sanitize
+Checker links separately compiled libref/ref_sample.cpp plus independent stable
+CPU sort oracle. TP2 batch1/2/4/8 width256/1024/2048, dispatch boundaries,
+top_k1/17/0/negative/oversized, GREEDY and mixed flags, invalid IDs, NaN/Inf,
+signed zeros/subnormals, duplicate pairs, dtype variants and bucketed M.
+Two CPU libref shard sample_topk outputs supply logical TP2 producer fixtures
+at width1024; no two-device communication is claimed. Native tests compare all
+words including both guards, padding and immutable inputs, two changed inputs,
+nondefault nonblocking stream and two replays of each captured launch.
+GPU5 production renderD133 flock-n + idle gate first; GPU4/D132 fallback only.
+No production startup, full-model execution or formal performance claim.

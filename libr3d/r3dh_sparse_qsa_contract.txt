@@ -1,0 +1,146 @@
+R3DH SPARSE QSA RAW CONTRACT, 2026-11-17
+Actual checkout: /home/zihaomu/bigssd2/radiance_workspace/libr3d-iqr-dev
+Public declarations: libr3d/r3dh_sparse_qsa.h. This report describes that header
+and its current host/index/device implementations, not a future shared port.
+Only libr3d/r3dh_sparse_qsa* files belong to this handoff. No main, rows,
+CMake, core, other port, reference source, branch, commit or push was changed.
+
+APIs, 11 C exports
+r3dh_sparse_qsa_block_key(const RadArgs*, RadStream)
+r3dh_sparse_qsa_score(const RadArgs*, RadStream)
+r3dh_sparse_qsa_select(const RadArgs*, RadStream)
+r3dh_sparse_qsa_paged(const RadArgs*, RadStream)
+r3dh_sparse_qsa_shape(const char*, const RadArgs*)
+r3dh_sparse_qsa_schema_at(int), r3dh_sparse_qsa_schema_count()
+r3dh_sparse_qsa_block_key_shape(const RadParam*, int, int, RadOpdDesc*)
+r3dh_sparse_qsa_score_shape(const RadParam*, int, int, RadOpdDesc*)
+r3dh_sparse_qsa_select_shape(const RadParam*, int, int, RadOpdDesc*)
+r3dh_sparse_qsa_paged_shape(const RadParam*, int, int, RadOpdDesc*)
+Schema order: qsa_block_key, qsa_score, qsa_select, attn_paged.
+schema_at outside 0..3 returns null. schema_count returns 4.
+Launch APIs validate descriptors and enqueue native HIP on the supplied stream;
+RAD_OK is enqueue success, not completion. The caller synchronizes for errors.
+No scratch or CPU/libref fallback is used by these four production kernels.
+
+Operand mapping, zero-based; all runtime pointers are device pointers
+qsa_block_key: 0 k BF16 [4B,128], 1 w F32 [128], 2 page I32 [B]
+optional, 3 pos I32 [B], [B,1] or [B,3] optional, 4 out BF16 [P,128]
+or [P,a,b,c] with contiguous a*b*c=128. Page absent means page=block.
+Position absent requires pos0 and uses pos0+block*4. Negative/out-of-range
+output page IDs leave the destination untouched. Pool four keys ascending,
+round pool to BF16 RNE, double sum of squares, F32 RMSNorm and weight+wadd,
+NeoX/M-RoPE/interleaved M-RoPE, final BF16 RNE. No fused contraction.
+Required n=128, ratio=4; block_size=4, dtype=bf16. B=1..2048.
+rotary_dim even 0..128; eps>0, theta>0, scale>0, finite wadd.
+Modes neox/mrope/imrope. Explicit 3-coordinate M-RoPE sections must sum
+to rotary_dim/2. Current geometry uses rotary_dim=64, sections=11 11 10.
+Nonzero yarn_factor is refused. No YaRN extension is implemented.
+
+qsa_score: 0 q BF16 [M,512], 1 bk BF16 [P,128] or page form above,
+2 bt I32 [S,W], 3 cu I32 [S+1], 4 nc I32 [S], 5 score F32 [M,Wout].
+n=128, heads=4, dtype=bf16. M=1..2048, S=1..2048, Wout<=50000.
+Ascending 128-lane F32 dot for each head, ReLU each dot, ascending four-head
+sum, divide by sqrtf(128). Invalid physical bk page writes negative infinity.
+Columns beyond table width/nc and rows outside cu remain untouched.
+bk page IDs and attention bt page IDs are separate physical namespaces.
+
+qsa_select: 0 score F32 [M,W], 1 bt I32 [S,Wtable], 2 nc I32 [S],
+3 pos I32 [M], 4 cu I32 [S+1], 5 sel I32 [M,topk+1],
+6 nsel I32 [M], 7 seqused I32 [M]. M,S=1..2048, W<=50000,
+ratio=4, topk=1..512, signed=0 or 1. Complete candidates are bounded by
+nc, both widths and floor((pos+1)/4). Negative physical IDs are excluded.
+Unsigned mode rejects values not greater than -1e30, then clamps negatives
+to zero. Signed mode accepts finite values only and preserves negatives.
+At most topk complete pages: values above threshold in source-column order,
+then threshold ties in source-column order; not score-sorted output.
+A valid partial page follows when (pos+1)%4!=0. Pad through topk with -1.
+nsel counts pages; seqused=nsel ? (nsel-1)*4+pos%4+1 : 0.
+A row not covered by cu uses sequence zero, matching libref.
+Selection emits physical attention cache IDs, not logical index-block IDs.
+
+attn_paged: 0 q BF16 [M,H*D] or [M,H,D], 1 kv_cache BF16 or I8
+[P,Hkv,4,2D] or I8 [P,Hkv,4,2D+4], 2 block_table I32 [S,W],
+3 seqused I32 [S], 4 k_descale absent, 5 v_descale absent,
+6 cu_seqlens I32 [S+1] optional, 7 out BF16 shaped like q.
+D=128 or 256, gqa=1..16, H=Hkv*gqa<=128; M,S=1..2048.
+block_size=4, causal=1, window=0, q_dtype=bf16; matching kv_dtype.
+I8 token row is signed K[D], signed V[D], little-endian FP16 K scale,
+little-endian FP16 V scale. No external scale tensor or compressed layout.
+Last tensor axis unit-stride; nonoverlapping padded outer pitches accepted.
+Rank-3 query/output head stride equals D. BF16 bk inner page contiguous.
+Selected mode uses sel as [M,topk+1], seqused [M], absent cu: one sequence
+per query row. General/union mode uses real S-row tables and optional cu;
+without cu, M must divide by S. Negative/out-of-range cache pages skipped.
+Visible tokens=min(seqused-(query_count)+query_offset+1,4*table_width).
+Ascending F32 dot, two-pass max/softmax, double exp rounded F32,
+ascending F32 value accumulation and denominator, final BF16 RNE.
+No dense replacement above the selection bound is permitted or implemented.
+
+Caller invariants and unsupported cases
+Device index contents are not downloaded or validated by shape(). cu must
+be monotone/in-range, counts nonnegative/in-range, positions nonnegative
+and representable in signed 32-bit arithmetic; no racing duplicate output
+pages. Shapes do not prove these device-content invariants.
+Unknown params, wrong param kinds, duplicate keys, wrong operand count,
+missing required pointers, bad dtype/strides and output overlap are refused.
+Explicitly unsupported: other QSA n/ratio/index head counts; topk>512;
+other attention D, page sizes, noncausal/windowed attention; external
+descale tensors, FP8/quantized queries, non-BF16 block keys, nonzero YaRN.
+Shape helpers synthesize benchmark descriptors, not complete model allocation.
+Ring7 work/tail APIs are another port; only their existing test dependency
+is exercised here. This handoff does not register or modify those APIs.
+
+Production build list
+libr3d/r3dh_sparse_qsa_host.cpp
+libr3d/r3dh_sparse_qsa_index.hip
+libr3d/r3dh_sparse_qsa_device.hip
+Private headers: r3dh_sparse_qsa.h, r3dh_sparse_qsa_internal.h; ABI include.
+Flags: -std=c++17 -O2 -fPIC -ffp-contract=off -fno-fast-math
+HIP: --offload-arch=gfx1100; shared link --hip-link -shared -lamdhip64.
+Strict header rejects -ffast-math and -ffinite-math-only, verified by build.
+Test-only list additionally links libref/ref_attn.cpp, libref/ref_qsa.cpp,
+libr3d/r3dh_attn_qsa_state.hip and libr3d/r3dh_sparse_qsa_check.hip.
+SDK image: freetoken:rocm10.1.0-transformers518-final-gh-proxy-20261026.
+Docker user 1001:1001; workspace mounted at identical absolute path.
+Build script: bash libr3d/r3dh_sparse_qsa_test.sh --build|--host|--gpu|--all.
+Artifacts: ../build-r3d-bootstrap/r3dh_sparse_qsa.so and _check.
+
+GPU safety and finished validation
+R3DH_SPARSE_QSA_GPU=1 default or 4 only. GPU3 rejected before access.
+GPU1 PCI 0000:23:00.0, renderD129; GPU4 PCI 0000:83:00.0, renderD132.
+Read-open flock -n production locks under /home/zihaomu/bigssd/oj_system/
+var/locks/gpu-renderD129.lock or gpu-renderD132.lock. Busy returns 75.
+ROCR_VISIBLE_DEVICES=physical, HIP_VISIBLE_DEVICES=0. One visible gfx1100,
+expected PCI BDF, free-memory gate and render-node-user gate required.
+GPU execution timeout 50s; bounded cleanup removes only the named own
+container while lock FD remains open. Locks released on process exit.
+Both physical GPU1 and GPU4 W7900D passed: cases=82, checks=35114,
+comparisons=64360704, nonbitexact=0, device_calls=82 per GPU.
+Host passed: cases=82, checks=35028; no device calls.
+Comparison count includes byte checks of inputs/guards/padding and typed
+output comparisons, not 64 million independent output tensor elements.
+Ten block-key, ten score, thirty-four selection, twenty-four attention,
+two ring7 work and two ring7 tail device calls per GPU. Changed inputs twice,
+nondefault stream, exact leading/trailing guards and untouched bytes.
+Independent libref operators are separately compiled, not production-linked;
+selection additionally checked against a CPU stable-sort oracle.
+Block-key output remains device-resident for score; selected page table and
+lengths remain device-resident for attention. No host-restaged intermediate.
+Selection widths 5/516/50000, topk2/512, signed/unsigned, NaN/infinity,
+zero ties, invalid pages, gapped/empty cu and positions through 199999.
+Index heads4 x dim128; ratio4; RoPE positions near 200K, NeoX/M/IM-RoPE.
+Attention GQA12 D256 BF16/I8, padded rows; D128 rank-3 BF16/I8; union
+ragged table; ring7 rollback verify9..12 then work10..13 preserves keys8/9.
+Context7/2050/2051 selected output equals full dense exactly; context2052
+uses 512/513 pages and differs from full dense for BF16/I8 and signed mode.
+All device checks bit-exact; no epsilon acceptance remains.
+Busy-lock exit75 and forbidden-GPU3 exit2 verified without device access.
+Logs: ../results/r3d-iqr/implementation/logs/r3dh_sparse_qsa-build.log,
+r3dh_sparse_qsa-host.log, r3dh_sparse_qsa-gpu1.log, r3dh_sparse_qsa-gpu4.log,
+r3dh_sparse_qsa-gpu.log, r3dh_sparse_qsa-exports.log,
+r3dh_sparse_qsa-fast-math-reject.log, r3dh_sparse_qsa-finite-math-only-reject.log,
+r3dh_sparse_qsa-hashes.log. Final script generates current hashes at build.
+Fixtures use actual geometry but synthetic values, not model tensor extraction.
+Not certified: full-model execution, TP integration, every allowed shape,
+attention200K numerical/performance sweep, throughput, tuning or graph closure.
+Shared row registration and CMake integration remain the main owner's work.

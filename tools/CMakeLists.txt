@@ -38,6 +38,7 @@ function(rad_add_tool name src)
 endfunction()
 
 rad_add_tool(rad-info     rad_info.cpp)
+rad_add_tool(rad-audit    rad_audit.cpp)
 
 # The tokeniser's independent reference encoder (tokref.h), which core/text's pre-tokeniser is
 # checked against. A library because tests/tokenizer_test uses it too; core/ does not link it.

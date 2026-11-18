@@ -677,7 +677,176 @@ TEST(a_device_hole_is_decided_per_instance) {
     CHECK_EQ(p.device_holes(true)[0]->index, 2);
 }
 
+TEST(abandoned_optional_candidates_do_not_make_device_holes) {
+    NEED_PLUGIN(reg)
+    for (const char* name : { "ar_hc_write", "router_gemm_topk_scatter", "prefetch" })
+    for (bool entirely_missing : { false, true }) {
+        Builder builder(reg, make_meta(), make_ctx());
+        const rad_weight weight = decl_w(builder, "w");
+        const RadParam params[] = {
+            RAD_RANGE("M", 1, 8192), RAD_INT("N", 4096), RAD_INT("K", 4096),
+            RAD_STR("dtype", "bf16")
+        };
+        CHECK_EQ(builder.decl_op("t_skinny", params, 4, &weight, 1), RAD_NULL_HANDLE);
+        Program& program = builder.program();
+        REQUIRE(!program.device_holes(false).empty());
+        program.ops[1].op = name;
+        for (auto& miss : program.misses) miss.op = name;
+        if (entirely_missing)
+            for (Band& band : program.ops[1].bands)
+                for (Resolved& resolved : band.dom) resolved = Resolved{};
+        CHECK_OK(builder.finish());
+        CHECK(program.device_holes(false).empty());
+        CHECK(program.ops[1].optional_retired);
+        CHECK_EQ(rad_reference_ops(program, nullptr), 0);
+        CHECK_OK(rad_gate_reference_kernels(program, false, "optional retirement regression"));
+        CHECK(program.misses.empty());
+        CHECK(program.ops[1].weights.empty());
+        CHECK(program.ops[1].weight_opd.empty());
+        CHECK_EQ(builder.op_resolved(1), 0);
+        REQUIRE(program.ops[1].bands.size() >= 3);
+        CHECK(!program.ops[1].bands[1].miss[RAD_DOMAIN_DEVICE].empty());
+        CHECK_EQ(program.ops.size(), 2u);
+        CHECK_OK(builder.finish());
+        CHECK(program.misses.empty());
+    }
+}
+
+TEST(optional_candidate_retirement_keeps_required_and_active_holes) {
+    NEED_PLUGIN(reg)
+    for (int mode = 0; mode < 8; ++mode) {
+        Builder builder(reg, make_meta(), make_ctx());
+        builder.set_instances(false);
+        const rad_weight weight = decl_w(builder, "w");
+        const RadParam params[] = {
+            RAD_RANGE("M", 1, 8192), RAD_INT("N", 4096), RAD_INT("K", 4096),
+            RAD_STR("dtype", "bf16")
+        };
+        CHECK_EQ(builder.decl_op("t_skinny", params, 4, &weight, 1), RAD_NULL_HANDLE);
+        Program& program = builder.program();
+        const size_t misses = program.misses.size();
+        const size_t holes = program.device_holes(false).size();
+        REQUIRE(holes > 0);
+        if (mode != 0 && mode != 7) {
+            program.ops[1].op = "ar_hc_write";
+            for (auto& miss : program.misses) miss.op = "ar_hc_write";
+        }
+        RadBufDecl buffer_decl{};
+        buffer_decl.dtype = RAD_BF16;
+        buffer_decl.rank = 1;
+        buffer_decl.shape[0] = 4096;
+        buffer_decl.kind = RAD_BUF_PERSIST;
+        buffer_decl.domain = RAD_DOMAIN_DEVICE;
+        if (mode == 1 || mode == 2) {
+            const rad_buf buffer = builder.decl_buffer("active", &buffer_decl);
+            REQUIRE(buffer != 0);
+            if (mode == 1) CHECK_OK(builder.op_reads(1, &buffer, 1));
+            else CHECK_OK(builder.op_writes(1, &buffer, 1));
+        }
+        if (mode == 3) program.ops[1].issued = true;
+        if (mode == 7) {
+            program.ops[1].weights.clear();
+            program.ops[1].weight_opd.clear();
+        }
+        if (mode == 4) {
+            program.ops[1].weights.clear();
+            program.ops[1].weight_opd.clear();
+            const Resolved host = program.ops[1].bands[0].dom[RAD_DOMAIN_DEVICE];
+            for (Band& band : program.ops[1].bands)
+                if (!band.dom[RAD_DOMAIN_DEVICE]) band.dom[RAD_DOMAIN_HOST] = host;
+        }
+        if (mode == 5) {
+            builder.set_audit_only(true);
+            CHECK_EQ(builder.finish(), RAD_E_STATE);
+        } else {
+            if (mode == 6) program.ops[1].op = "ar_hc_write_required";
+            CHECK_OK(builder.finish());
+        }
+        CHECK_EQ(program.misses.size(), misses);
+        CHECK_EQ(program.device_holes(false).size(), holes);
+    }
+}
+
+TEST(optional_candidate_retirement_preserves_structural_errors_and_fallback) {
+    NEED_PLUGIN(reg)
+    Builder builder(reg, make_meta(), make_ctx());
+    const rad_weight weight = decl_w(builder, "w");
+    const RadParam params[] = {
+        RAD_RANGE("M", 1, 8192), RAD_INT("N", 4096), RAD_INT("K", 4096),
+        RAD_STR("dtype", "bf16")
+    };
+    CHECK_EQ(builder.decl_op("t_skinny", params, 4, &weight, 1), RAD_NULL_HANDLE);
+    builder.program().ops[1].op = "router_gemm_topk_scatter";
+    for (auto& miss : builder.program().misses) miss.op = "router_gemm_topk_scatter";
+    const rad_op fallback = decl_gemm(builder, weight);
+    REQUIRE(fallback != 0);
+    CHECK_EQ(builder.op_reads(0, nullptr, 0), RAD_E_INVAL);
+    CHECK_EQ(builder.op_writes(0, nullptr, 0), RAD_E_INVAL);
+    CHECK_OK(builder.finish());
+    CHECK_EQ(builder.op_resolved(fallback), 1);
+    CHECK_EQ(builder.program().weight(weight)->first_use_op, (int32_t)fallback);
+    CHECK_EQ(builder.program().weight(weight)->last_use_op, (int32_t)fallback);
+    CHECK(builder.program().device_holes(false).empty());
+
+    Builder invalid(reg, make_meta(), make_ctx());
+    CHECK_EQ(invalid.decl_op("prefetch_without_schema", nullptr, 0, nullptr, 0), 0u);
+    CHECK_EQ(invalid.status(), RAD_E_NOSCHEMA);
+    CHECK_EQ(invalid.finish(), RAD_E_NOSCHEMA);
+    CHECK(!invalid.errors().empty());
+}
+
 /* ================================================================== init, after the whole graph */
+TEST(optional_candidate_retirement_preserves_audit_and_sizing) {
+    NEED_PLUGIN(reg)
+    const RadParam params[] = {
+        RAD_RANGE("M", 1, 8192), RAD_INT("N", 4096), RAD_INT("K", 4096),
+        RAD_STR("dtype", "bf16")
+    };
+    Builder audit(reg, make_meta(), make_ctx());
+    audit.set_audit_only(true);
+    const rad_weight audit_weight = decl_w(audit, "w");
+    const rad_op audit_op = audit.decl_op("t_skinny", params, 4, &audit_weight, 1);
+    REQUIRE(audit_op != 0);
+    CHECK_EQ(audit.op_resolved(audit_op), 0);
+    audit.program().ops[audit_op].op = "prefetch";
+    const size_t audit_misses = audit.program().misses.size();
+    CHECK_EQ(audit.finish(), RAD_E_STATE);
+    CHECK_EQ(audit.program().misses.size(), audit_misses);
+    CHECK_EQ(audit.program().ops[audit_op].weights.size(), 1u);
+
+    Builder real(reg, make_meta(), make_ctx());
+    const rad_weight real_weight = decl_w(real, "w");
+    CHECK_EQ(real.decl_op("t_skinny", params, 4, &real_weight, 1), 0u);
+    real.program().ops[1].op = "prefetch";
+    CHECK_OK(real.finish());
+    Program reference = real.program();
+    reference.ops[1].op = "t_skinny";
+    Builder probe(reg, make_meta(), make_ctx());
+    probe.set_reference(&reference);
+    const rad_weight probe_weight = decl_w(probe, "w");
+    CHECK_EQ(probe.decl_op("t_skinny", params, 4, &probe_weight, 1), 0u);
+    probe.program().ops[1].op = "prefetch";
+    CHECK_OK(probe.finish());
+    CHECK(probe.program().device_holes(false).empty());
+    CHECK_EQ(probe.op_resolved(1), 0);
+    CHECK(probe.program().ops[1].weights.empty());
+    CHECK_EQ(probe.program().ops.size(), real.program().ops.size());
+}
+
+TEST(optional_candidate_retirement_does_not_hide_init_failure) {
+    NEED_PLUGIN(reg)
+    Builder builder(reg, make_meta(), make_ctx());
+    const rad_weight weight = decl_w(builder, "w");
+    const RadParam params[] = { RAD_INT("M", 32), RAD_INT("n", 4096) };
+    const rad_op operation = builder.decl_op("t_eq", params, 2, &weight, 1);
+    REQUIRE(operation != 0);
+    builder.program().ops[operation].op = "ar_hc_write";
+    CHECK(builder.finish() < 0);
+    CHECK_EQ(builder.op_resolved(operation), 0);
+    CHECK(!builder.program().device_holes(false).empty());
+    CHECK(!builder.errors().empty());
+}
+
 TEST(a_refusing_init_becomes_a_miss_and_not_an_abort) {
     NEED_PLUGIN(reg)
     Builder b(reg, make_meta(), make_ctx());
@@ -2387,6 +2556,19 @@ TEST(the_architecture_plugin_is_picked_by_id_and_quantisation) {
     CHECK_OK(pick(plain_w8, "quark-mxfp4", true, &lp, &log));
     CHECK_EQ(lp.arch_plugin, std::string("radtest_archq_plain"));
     rad_tools_registry().close();
+}
+
+TEST(audit_only_builder_cannot_finalize_an_executable_program) {
+    NEED_PLUGIN(reg)
+    Builder builder(reg, make_meta(), make_ctx());
+    builder.set_audit_only(true);
+    builder.set_instances(false);
+    const rad_weight weight = decl_w(builder, "blk.0.ffn_gate.weight");
+    const rad_op operation = decl_gemm(builder, weight);
+    CHECK(operation != 0);
+    CHECK_EQ(builder.finish(), RAD_E_STATE);
+    builder.set_audit_only(false);
+    CHECK_EQ(builder.op_resolved(operation), 1);
 }
 
 RAD_TEST_MAIN()

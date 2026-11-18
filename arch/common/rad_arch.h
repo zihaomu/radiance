@@ -345,7 +345,7 @@ private:
 };
 
 /* Returns the first negative status from a declare step. */
-#define RAD_ARCH_TRY(expr)  do { int _s = (expr); if (_s < 0) return _s; } while (0)
+#define RAD_ARCH_TRY(expr)  do { int _s = (expr); if (_s < 0) { fprintf(stderr, "architecture declare %s:%d: %s -> %d\n", __FILE__, __LINE__, #expr, _s); return _s; } } while (0)
 
 /* ================================================================== C++-side decl helpers */
 /* C++ forms of rad_group_layer() and friends, which are C compound literals (a GNU extension in

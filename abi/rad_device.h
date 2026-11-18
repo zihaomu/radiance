@@ -63,6 +63,12 @@ int  rad_stream_create(RadStream* out, int high_priority);
 void rad_stream_destroy(RadStream s);
 int  rad_stream_sync(RadStream s);
 
+/* RAD_OK only for a live native stream on `device` and an address usable there
+ * without translation. A null address queries the stream alone. Pageable and peer
+ * memory are refused. RAD_E_INVAL means an unowned stream; RAD_E_UNSUPPORTED means
+ * the backend has no query. Unowned handles are never dereferenced. No work is issued. */
+int  rad_stream_device_access(RadStream s, int device, const void* address);
+
 int  rad_event_create(RadEvent* out);
 void rad_event_destroy(RadEvent e);
 int  rad_event_record(RadEvent e, RadStream s);
