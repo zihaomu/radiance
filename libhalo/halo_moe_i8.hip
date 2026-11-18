@@ -52,6 +52,22 @@ struct Cls {
     uint64_t w_s0, s_s0;
     uint32_t n, k, w_ld, s_ld, run_tiles;
 };
+/* An expert's class, chosen field by field: indexing a Cls[2] by the expert's parity puts both
+ * in scratch, and every field read in the loops then goes to memory. */
+__device__ __forceinline__ Cls pick(const Cls (&cl)[2], uint32_t ex) {
+    const bool o = (ex & 1u) != 0u;
+    Cls c;
+    c.w = o ? cl[1].w : cl[0].w;
+    c.s = o ? cl[1].s : cl[0].s;
+    c.w_s0 = o ? cl[1].w_s0 : cl[0].w_s0;
+    c.s_s0 = o ? cl[1].s_s0 : cl[0].s_s0;
+    c.n = o ? cl[1].n : cl[0].n;
+    c.k = o ? cl[1].k : cl[0].k;
+    c.w_ld = o ? cl[1].w_ld : cl[0].w_ld;
+    c.s_ld = o ? cl[1].s_ld : cl[0].s_ld;
+    c.run_tiles = o ? cl[1].run_tiles : cl[0].run_tiles;
+    return c;
+}
 __device__ __forceinline__ const uint8_t* tab_at(const void* const* t, uint64_t s0, uint32_t i) {
     return s0 == 0 ? (const uint8_t*)t[i] : (const uint8_t*)t + (size_t)i * s0;
 }
@@ -196,7 +212,7 @@ __device__ void tile(const Route& R, const Cls (&cl)[2], uint32_t r0, uint32_t n
         if (ex == 0xFFFFFFFFu) break;
         done = ex + 1u;
         if (rank % zn != zj) continue;
-        const Cls& c = cl[ex & 1u];
+        const Cls c = pick(cl, ex);
         const uint32_t idx = ex >> 1;
         if (n0 >= c.n) continue;   /* a narrower class: its columns past n are zero */
         const auto W = make(c, idx, tab);
@@ -331,76 +347,101 @@ constexpr uint32_t kDecW = 8;
 /* The lanes' 16 int32 values, halved across lanes by xor mask M: each lane keeps the half its
  * bit M selects and adds its partner's copy of that half. */
 template <uint32_t N>
-__device__ __forceinline__ void halve(int32_t* v, uint32_t lane, uint32_t m) {
+__device__ __forceinline__ void halve(int32_t (&v)[16], uint32_t lane, uint32_t m) {
     const bool hi = (lane & m) != 0u;
 #pragma unroll
     for (uint32_t i = 0; i < N / 2u; ++i) {
-        const int32_t send = hi ? v[i] : v[i + N / 2u], mine = hi ? v[i + N / 2u] : v[i];
-        v[i] = mine + __shfl_xor(send, (int)m, (int)kWave);
+        /* select on the values, never on the array, or the array goes to scratch */
+        const int32_t a = v[i], b = v[i + N / 2u];
+        const int32_t send = hi ? a : b;
+        v[i] = (hi ? b : a) + __shfl_xor(send, (int)m, (int)kWave);
     }
 }
 
 /* The decode GEMV, an expert's rows <= RMAX (the decode and verify case, about one row an
  * expert): lane l's decoded dword of weight row q is K 4l..4l+3, so each row's partial is one
- * sudot4 against the activation's dword, no LDS and no WMMA. A unit's 16 column sums close by
- * halving across the lanes (16 shuffles); they are the exact int32 sums the WMMA forms, folded
- * in the same order with the same factors, so the output is theirs byte for byte. */
+ * sudot4 against the activation's dword, no WMMA. The block stages the rows' activations and
+ * scales in LDS once, so a wave's loop waits only on its prefetched codes; the weight scales are
+ * read a unit ahead. A unit's 16 column sums close by halving across the lanes (16 shuffles):
+ * the exact int32 sums the WMMA forms, folded in the same order with the same factors, so the
+ * output is theirs byte for byte. */
 template <uint32_t RMAX, uint32_t SUB, class MAKE>
 __device__ void gemv_expert(const Route& R, const Cls& c, uint32_t ex, uint32_t y, uint32_t r1,
-                            uint32_t n0, int8_t* tab, MAKE make) {
-    const uint32_t lane = threadIdx.x & (kWave - 1u);
+                            uint8_t* lds, int8_t* tab, MAKE make) {
+    const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1u);
+    const uint32_t n0 = blockIdx.x * (16u * kDecW) + (tid / kWave) * 16u;
     constexpr uint32_t SUBS = 128u / SUB;
-    const uint32_t cnt = r1 - y;
-    const int8_t* ap[RMAX];
-    int32_t at[RMAX];
-#pragma unroll
-    for (uint32_t r = 0; r < RMAX; ++r) {
-        const int32_t f = r < cnt ? R.sorted[y + r] : -1;
-        at[r] = f < 0 ? -1 : (int32_t)(R.a_sorted ? y + r : (uint32_t)f / R.top_k);
-        ap[r] = f < 0 ? nullptr : R.A + (size_t)at[r] * R.a_ld + 4u * lane;
+    const uint32_t cnt = r1 - y, K = c.k, nsc = (K + R.a_group - 1u) / R.a_group;
+    int8_t* sa = (int8_t*)lds;
+    float* ss = (float*)(lds + RMAX * K);
+    for (uint32_t i = tid; i < cnt * (K / 16u); i += kDecW * kWave) {
+        const uint32_t r = i / (K / 16u), o = i % (K / 16u);
+        const int32_t f = R.sorted[y + r];
+        uint4 v = make_uint4(0u, 0u, 0u, 0u);
+        if (f >= 0)
+            v = *(const uint4*)(R.A + (size_t)(R.a_sorted ? y + r : (uint32_t)f / R.top_k) * R.a_ld + o * 16u);
+        *(uint4*)(sa + r * K + o * 16u) = v;
     }
+    for (uint32_t i = tid; i < cnt * nsc; i += kDecW * kWave) {
+        const uint32_t r = i / nsc, j = i % nsc;
+        const int32_t f = R.sorted[y + r];
+        ss[i] = f >= 0 ? R.As[(size_t)(R.a_sorted ? y + r : (uint32_t)f / R.top_k) * R.as_ld + j] : 0.f;
+    }
+    __syncthreads();
+    if (n0 >= R.N) return;
+    if (n0 >= c.n) {   /* a narrower class: its columns past n are zero */
+        for (uint32_t i = y + (lane >> 4); i < r1; i += 2u) R.Y[(size_t)i * R.y_ld + n0 + (lane & 15u)] = 0;
+        return;
+    }
+    bool vr[RMAX];
+#pragma unroll
+    for (uint32_t r = 0; r < RMAX; ++r) vr[r] = r < cnt && R.sorted[y + r] >= 0;
     /* SUBS 1: the column of lanes 2j, 2j + 1 after five steps; SUBS 2: four steps keep the halves
      * apart (lanes 0-15 hold K 0-63, the first scale's) and lane l, l ^ 16 hold one column. */
     const uint32_t col = SUBS == 1u
         ? ((lane >> 4) & 1u) * 8u + ((lane >> 3) & 1u) * 4u + ((lane >> 2) & 1u) * 2u + ((lane >> 1) & 1u)
         : ((lane >> 3) & 1u) * 8u + ((lane >> 2) & 1u) * 4u + ((lane >> 1) & 1u) * 2u + (lane & 1u);
     const auto W = make(c, ex >> 1, tab);
-    const uint32_t nkb = c.k / 128u;
+    const uint32_t nkb = K / 128u;
     float acc[RMAX];
 #pragma unroll
     for (uint32_t r = 0; r < RMAX; ++r) acc[r] = 0.f;
     auto cur = W.fetch(n0, 0, lane);
-    for (uint32_t kb = 0; kb < nkb; ++kb) {
-        const auto nxt = W.fetch(n0, kb + 1u < nkb ? kb + 1u : kb, lane);
-        uint32_t av[RMAX];
+    float ws[SUBS];
 #pragma unroll
-        for (uint32_t r = 0; r < RMAX; ++r) av[r] = ap[r] ? *(const uint32_t*)(ap[r] + kb * 128u) : 0u;
+    for (uint32_t sg = 0; sg < SUBS; ++sg) ws[sg] = W.fold(n0 + col, sg);
+    for (uint32_t kb = 0; kb < nkb; ++kb) {
+        const uint32_t kn = kb + 1u < nkb ? kb + 1u : kb;
+        const auto nxt = W.fetch(n0, kn, lane);
+        float wn[SUBS];
+#pragma unroll
+        for (uint32_t sg = 0; sg < SUBS; ++sg) wn[sg] = W.fold(n0 + col, kn * SUBS + sg);
         uint32_t w[16];
         W.make(cur, n0, kb, lane, w);
-        float ws[SUBS];
-#pragma unroll
-        for (uint32_t sg = 0; sg < SUBS; ++sg) ws[sg] = W.fold(n0 + col, kb * SUBS + sg);
 #pragma unroll
         for (uint32_t r = 0; r < RMAX; ++r) {
-            if (at[r] < 0) continue;
+            if (!vr[r]) continue;
+            const uint32_t av = *(const uint32_t*)(sa + r * K + kb * 128u + 4u * lane);
+            const float* as = ss + r * nsc;
             int32_t v[16];
 #pragma unroll
             for (uint32_t q = 0; q < 16; ++q)
-                v[q] = __builtin_amdgcn_sudot4(true, (int)w[q], true, (int)av[r], 0, false);
+                v[q] = __builtin_amdgcn_sudot4(true, (int)w[q], true, (int)av, 0, false);
             if constexpr (SUBS == 1u) {
                 halve<16>(v, lane, 16u); halve<8>(v, lane, 8u); halve<4>(v, lane, 4u); halve<2>(v, lane, 2u);
                 v[0] += __shfl_xor(v[0], 1, (int)kWave);
-                acc[r] = fmaf((float)v[0], R.As[(size_t)at[r] * R.as_ld + kb * 128u / R.a_group] * ws[0], acc[r]);
+                acc[r] = fmaf((float)v[0], as[kb * 128u / R.a_group] * ws[0], acc[r]);
             } else {
                 halve<16>(v, lane, 8u); halve<8>(v, lane, 4u); halve<4>(v, lane, 2u); halve<2>(v, lane, 1u);
                 const int32_t o = __shfl_xor(v[0], 16, (int)kWave);
                 const int32_t s0 = (lane & 16u) ? o : v[0], s1 = (lane & 16u) ? v[0] : o;
-                const float* as = R.As + (size_t)at[r] * R.as_ld;
                 acc[r] = fmaf((float)s0, as[(kb * 128u) / R.a_group] * ws[0], acc[r]);
                 acc[r] = fmaf((float)s1, as[(kb * 128u + 64u) / R.a_group] * ws[SUBS - 1u], acc[r]);
             }
         }
         cur = nxt;
+#pragma unroll
+        for (uint32_t sg = 0; sg < SUBS; ++sg) ws[sg] = wn[sg];
     }
     /* ws[] above is the scale of this lane's own column for each sub-group: under SUBS 2 the
      * lane's half only selects which partial it holds first, both halves fold both. */
@@ -412,26 +453,28 @@ __device__ void gemv_expert(const Route& R, const Cls& c, uint32_t ex, uint32_t 
 }
 
 template <uint32_t MT, uint32_t SUB, class MAKE>
-__device__ void dec_expert(const Route& R, const Cls (&cl)[2], uint8_t* tr, int8_t* tab, MAKE make) {
+__device__ void dec_expert(const Route& R, const Cls (&cl)[2], uint8_t* lds, int8_t* tab, MAKE make) {
     const uint32_t lane = threadIdx.x & (kWave - 1u), half = lane >> 4, slot = lane & 15u;
     const uint32_t y = blockIdx.y, n0 = blockIdx.x * (16u * kDecW) + (threadIdx.x / kWave) * 16u;
     const uint32_t live = (uint32_t)R.off[R.n_expert];
-    if (n0 >= R.N) return;
+    /* Block-uniform exits only until the GEMV's barrier. */
     if (y >= live) {
-        if (y == live)
+        if (y == live && n0 < R.N)
             for (uint32_t i = live + half; i < R.T; i += 2u) R.Y[(size_t)i * R.y_ld + n0 + slot] = 0;
         return;
     }
     const uint32_t ex = expert_of(R.off, R.n_expert, y);
     if ((uint32_t)R.off[ex] != y) return;
     const uint32_t r1 = (uint32_t)R.off[ex + 1u];
-    const Cls& c = cl[ex & 1u];
-    if (n0 >= c.n) {   /* a narrower class: its columns past n are zero */
-        for (uint32_t i = y + half; i < r1; i += 2u) R.Y[(size_t)i * R.y_ld + n0 + slot] = 0;
+    const Cls c = pick(cl, ex);
+    if (r1 - y <= 4u) {
+        gemv_expert<4, SUB>(R, c, ex, y, r1, lds, tab, make);
         return;
     }
-    if (r1 - y <= 4u) {
-        gemv_expert<4, SUB>(R, c, ex, y, r1, n0, tab, make);
+    uint8_t* tr = lds + (threadIdx.x / kWave) * (16u * kPitch);
+    if (n0 >= R.N) return;
+    if (n0 >= c.n) {   /* a narrower class: its columns past n are zero */
+        for (uint32_t i = y + half; i < r1; i += 2u) R.Y[(size_t)i * R.y_ld + n0 + slot] = 0;
         return;
     }
     const int8_t* ap[MT];
@@ -515,7 +558,7 @@ template <uint32_t MT>
 __global__ __launch_bounds__(kDecW * kWave) void moe_w4nl_dec_kernel(Route R, Cls c0, Cls c1) {
     __shared__ __attribute__((aligned(16))) uint8_t s_tr[kDecW][16 * kPitch];
     const Cls cl[2] = { c0, c1 };
-    dec_expert<MT, W4nl::kSub>(R, cl, s_tr[threadIdx.x / kWave], nullptr, W4Make{});
+    dec_expert<MT, W4nl::kSub>(R, cl, &s_tr[0][0], nullptr, W4Make{});
 }
 
 template <class F, uint32_t MT>
@@ -523,7 +566,7 @@ __global__ __launch_bounds__(kDecW * kWave) void moe_iqr_dec_kernel(Route R, Cls
     __shared__ __attribute__((aligned(16))) uint8_t s_tr[kDecW][16 * kPitch];
     __shared__ __attribute__((aligned(16))) int8_t s_tab[Dec<F>::kTab];
     const Cls cl[2] = { c0, c1 };
-    dec_expert<MT, Iqr<F>::kSub>(R, cl, s_tr[threadIdx.x / kWave], s_tab, IqrMake<F>{});
+    dec_expert<MT, Iqr<F>::kSub>(R, cl, &s_tr[0][0], s_tab, IqrMake<F>{});
 }
 
 /* The routing and output operands shared by both rows, checked as halo_moe_gemm_q.hip's launcher
@@ -617,6 +660,10 @@ dim3 grid_of(const Ops& o) {
 
 bool dec_form(const Ops& o) {
     if (o.T > 64) return false;
+    /* gemv_expert stages four rows of activations and scales in the transpose LDS */
+    const long long kmax = o.Kc[0] > o.Kc[1] ? o.Kc[0] : o.Kc[1];
+    if (4 * kmax + 4 * 4 * ((kmax + o.a_group - 1) / o.a_group) > (long long)kDecW * 16 * kPitch) return false;
+    if (o.a_ld % 16) return false;
     const char* e = std::getenv("HALO_MOE_DEC");
     return !(e && *e == '0');
 }
