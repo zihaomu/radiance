@@ -355,6 +355,48 @@ __global__ void strict_inject_serial(const uint16_t* normalized, const uint16_t*
         narrow_bf16(2.0f * sigmoid_exact(sum / float(streams)));
 }
 // Same per-(row, stream) sequential sum as the serial form, with operands staged through LDS in chunks.
+__global__ __launch_bounds__(256) void strict_inject_parallel(const uint16_t* normalized,
+    const uint16_t* weights, uint16_t* output) {
+    __shared__ float products[wide];
+    __shared__ double sums[8], magnitudes[8];
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const int row = blockIdx.y, channel_stream = blockIdx.x;
+    double sum = 0, magnitude = 0;
+    for (int position = tid; position < wide; position += 256) {
+        const float product = __fmul_rn(widen_bf16(normalized[size_t(row) * wide + position]),
+            widen_bf16(weights[size_t(channel_stream) * wide + position]));
+        products[position] = product;
+        sum += double(product);
+        magnitude += fabs(double(product));
+    }
+    for (int distance = 16; distance; distance >>= 1) {
+        sum += __shfl_xor(sum, distance, 32);
+        magnitude += __shfl_xor(magnitude, distance, 32);
+    }
+    if (lane == 0) { sums[wave] = sum; magnitudes[wave] = magnitude; }
+    __syncthreads();
+    if (tid == 0) {
+        double center = 0, absolute_sum = 0;
+        for (int index = 0; index < 8; ++index) {
+            center += sums[index];
+            absolute_sum += magnitudes[index];
+        }
+        const double error = absolute_sum * 0x1.5p-11 + 0x1p-108;
+        const float lower = nextafterf(float(center - error), -INFINITY);
+        const float upper = nextafterf(float(center + error), INFINITY);
+        const uint16_t low_gate = narrow_bf16(2.0f * sigmoid_exact(lower / float(streams)));
+        const uint16_t high_gate = narrow_bf16(2.0f * sigmoid_exact(upper / float(streams)));
+        uint16_t result = low_gate;
+        if (!(absolute_sum < 0x1p120) || low_gate != high_gate) {
+            float ordered = 0;
+            for (int position = 0; position < wide; ++position)
+                ordered = __fadd_rn(ordered, products[position]);
+            result = narrow_bf16(2.0f * sigmoid_exact(ordered / float(streams)));
+        }
+        output[size_t(row) * streams + channel_stream] = result;
+    }
+}
+
 template <int KC, int TM, int THREADS>
 __global__ __launch_bounds__(THREADS) void strict_inject(const uint16_t* normalized, const uint16_t* weights,
                                                          uint16_t* output, int rows) {
@@ -591,7 +633,10 @@ int strict_launch(const RadArgs* args, RadStream stream, const R3dhHcTrace* trac
     if (inject_weights) {
         const auto* inject_data = static_cast<const uint16_t*>(inject_weights->data);
         auto* inject_out = static_cast<uint16_t*>(inject->data);
-        if (uintptr_t(inject_data) & 3)
+        const char* parallel_inject = std::getenv("RAD_HC_INJECT_PARALLEL");
+        if (rows <= 16 && parallel_inject && std::strcmp(parallel_inject, "0") != 0)
+            strict_inject_parallel<<<dim3(streams, rows), 256, 0, device_stream>>>(normalized, inject_data, inject_out);
+        else if (uintptr_t(inject_data) & 3)
             strict_inject_serial<<<dim3(rows), 4, 0, device_stream>>>(normalized, inject_data, inject_out, count);
         else
             strict_inject<256, 16, 128><<<dim3((rows + 15) / 16), 128, 0, device_stream>>>(normalized,

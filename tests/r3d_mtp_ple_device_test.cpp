@@ -564,10 +564,11 @@ TEST(r3d_i8_quick_dot4_exact_bench) {
 }
 
 TEST(r3d_hc_quick_wmma_candidate) {
+    const bool inject_parallel = std::getenv("RAD_HC_INJECT_BENCH") != nullptr;
     const bool norm_parallel = std::getenv("RAD_HC_NORM_BENCH") != nullptr;
     const bool exact_tile = std::getenv("RAD_HC_EXACT_BENCH") != nullptr;
-    if (!std::getenv("RAD_HC_BENCH") && !exact_tile && !norm_parallel) SKIP("optional HC matrix candidate");
-    const char* switch_name = norm_parallel ? "RAD_HC_NORM_PARALLEL"
+    if (!std::getenv("RAD_HC_BENCH") && !exact_tile && !norm_parallel && !inject_parallel) SKIP("optional HC matrix candidate");
+    const char* switch_name = inject_parallel ? "RAD_HC_INJECT_PARALLEL" : norm_parallel ? "RAD_HC_NORM_PARALLEL"
         : exact_tile ? "RAD_HC_EXACT_TILE" : "RAD_HC_WMMA";
     Library native("libr3d");
     using Launch = int (*)(const RadArgs*, RadStream, const R3dhHcTrace*);
@@ -598,8 +599,9 @@ TEST(r3d_hc_quick_wmma_candidate) {
     const char* previous = std::getenv(switch_name);
     const bool present = previous != nullptr;
     const std::string saved = previous ? previous : "";
-    for (int pattern = 0; pattern < (norm_parallel ? 9 : 1); ++pattern)
-    for (int rows : {1, 4, 16}) {
+    for (int pattern = 0; pattern < (inject_parallel ? 15 : norm_parallel ? 9 : 1); ++pattern)
+    for (int rows : {1, 4, 16, 17}) {
+        if (rows == 17 && (!inject_parallel || pattern)) continue;
         Buffer hidden(RAD_BF16, {rows, 10240}, RAD_MEM_DEVICE);
         Buffer gain(RAD_F32, {10240}, RAD_MEM_DEVICE);
         Buffer output(RAD_BF16, {rows, 2560}, RAD_MEM_DEVICE);
@@ -629,12 +631,31 @@ TEST(r3d_hc_quick_wmma_candidate) {
                     bits = position < 5 ? 0x3f80 : position < 10 ? 0x3980 : 0;
                     if (position == 10) bits = pattern == 7 ? 0x2b80 : 0x3780;
                 }
+                if (inject_parallel && pattern >= 9) bits = 0x3f80;
                 hidden.data<uint16_t>()[index] = bits;
             }
         }
         for (int index = 0; index < 10240; ++index) gain.data<float>()[index] = 0.75f + float(index % 17) / 32.0f;
         for (int index = 0; index < 40960; ++index)
             inject_weights.data<uint16_t>()[index] = uint16_t(0x3900u | ((uint32_t(index) * 37u) & 0x807fu));
+        if (inject_parallel && pattern >= 9) {
+            for (int index = 0; index < 10240; ++index) gain.data<float>()[index] = 1.0f;
+            for (int channel_stream = 0; channel_stream < 4; ++channel_stream) {
+                for (int position = 0; position < 10240; ++position) {
+                    uint16_t bits = 0;
+                    if (pattern == 9) bits = position % 3 == 0 ? 0x4b80 : position % 3 == 1 ? 0x3f80 : 0xcb80;
+                    if (pattern == 10) bits = channel_stream & 1 ? 0xbf80 : 0x3f80;
+                    if (pattern == 11) {
+                        if (position == 0) bits = 0x3d00;
+                        if (position == 1) bits = channel_stream & 1 ? 0xb500 : 0x3500;
+                    }
+                    if (pattern == 12) bits = uint16_t((position % 127 + 1) | ((position & 1) << 15));
+                    if (pattern == 13 && position == 0) bits = channel_stream & 1 ? 0x7fc1 : 0x7f80;
+                    if (pattern == 14) bits = position & 1 ? 0x8000 : 0;
+                    inject_weights.data<uint16_t>()[channel_stream * 10240 + position] = bits;
+                }
+            }
+        }
         for (Buffer* buffer : {&hidden, &gain, &output, &traced_down, &traced_logits, &traced_gates,
                 &inject_weights, &inject_output, &quantized, &quant_scales, &rotated, &rotated_scales})
             buffer->push(queue.stream);
@@ -646,7 +667,7 @@ TEST(r3d_hc_quick_wmma_candidate) {
         tensors[4] = inject_weights.device; tensors[6] = inject_output.device;
         tensors[7] = quantized.device; tensors[8] = quant_scales.device;
         tensors[9] = rotated.device; tensors[10] = rotated_scales.device;
-        RadParam params[]{RAD_INT("M", 16), RAD_INT("n", 2560), RAD_INT("hc", 4),
+        RadParam params[]{RAD_INT("M", std::max(rows, 16)), RAD_INT("n", 2560), RAD_INT("hc", 4),
             RAD_INT("lowrank", 320), RAD_STR("dtype", "bf16"), RAD_STR("mix", "e4m3"),
             RAD_INT("inject", 1), RAD_INT("group", 128), RAD_INT("rotate", 1)};
         RadArgs args{}; args.t = tensors; args.n_t = 11; args.p = params; args.n_p = 9;
@@ -662,12 +683,12 @@ TEST(r3d_hc_quick_wmma_candidate) {
         for (int variant = 0; variant < 2; ++variant) {
             setenv(switch_name, variant ? "1" : "0", 1);
             REQUIRE_EQ(launch(&args, queue.stream, &trace), RAD_OK);
-            if (norm_parallel) {
+            if (norm_parallel || inject_parallel) {
                 auto actual = scratch.read(queue.stream);
                 actual.resize(size_t(rows) * 10240 * 2);
                 if (variant) CHECK(actual == normalized_baseline); else normalized_baseline = std::move(actual);
             }
-            if (!pattern && (!variant || norm_parallel) && std::getenv("RAD_HC_STAGE_BENCH")) {
+            if (!pattern && (!variant || norm_parallel || inject_parallel) && std::getenv("RAD_HC_STAGE_BENCH")) {
                 REQUIRE(profile);
                 float stages[6]{};
                 REQUIRE_EQ(profile(&args, queue.stream, stages), RAD_OK);
@@ -684,7 +705,7 @@ TEST(r3d_hc_quick_wmma_candidate) {
                 CHECK(std::equal(actual.begin() + end, actual.end(), buffer->expected.begin() + end));
                 if (!variant) baseline.push_back(actual);
                 else {
-                    if (exact_tile || norm_parallel) CHECK(actual == baseline[stage]);
+                    if (exact_tile || norm_parallel || inject_parallel) CHECK(actual == baseline[stage]);
                     float maximum = 0, reference_max = 0;
                     const int elements = int(buffer->host.shape[0] * buffer->host.shape[1]);
                     for (int index = 0; index < elements; ++index) {
@@ -702,7 +723,7 @@ TEST(r3d_hc_quick_wmma_candidate) {
                             std::memcpy(&bits, baseline[stage].data() + 64 + index * 2, 2);
                             wide_bits = uint32_t(bits) << 16; std::memcpy(&expected, &wide_bits, 4);
                         }
-                        if (norm_parallel && pattern == 6 && !std::isfinite(expected)) continue;
+                        if ((norm_parallel || inject_parallel) && (pattern == 6 || pattern == 13) && !std::isfinite(expected)) continue;
                         REQUIRE(std::isfinite(value));
                         maximum = std::max(maximum, std::abs(value - expected));
                         reference_max = std::max(reference_max, std::abs(expected));
@@ -722,10 +743,11 @@ TEST(r3d_hc_quick_wmma_candidate) {
             REQUIRE_EQ(rad_event_elapsed_ms(start, finish, &timings[variant]), RAD_OK);
             rad_event_destroy(start); rad_event_destroy(finish);
         }
-        if (pattern) std::printf("HC_NORM_BOUNDARY M=%d pattern=%d exact=1\n", rows, pattern);
+        if (pattern) std::printf("HC_%s_BOUNDARY M=%d pattern=%d exact=1\n",
+            inject_parallel ? "INJECT" : "NORM", rows, pattern);
         else std::printf("HC_%s_BENCH M=%d strict_us=%.3f candidate_us=%.3f speedup=%.3f exact=%d\n",
-            norm_parallel ? "NORM_PARALLEL" : exact_tile ? "EXACT_TILE" : "WMMA", rows,
-            timings[0] * 50.0f, timings[1] * 50.0f, timings[0] / timings[1], int(exact_tile || norm_parallel));
+            inject_parallel ? "INJECT_PARALLEL" : norm_parallel ? "NORM_PARALLEL" : exact_tile ? "EXACT_TILE" : "WMMA", rows,
+            timings[0] * 50.0f, timings[1] * 50.0f, timings[0] / timings[1], int(exact_tile || norm_parallel || inject_parallel));
     }
     if (present) setenv(switch_name, saved.c_str(), 1); else unsetenv(switch_name);
 }

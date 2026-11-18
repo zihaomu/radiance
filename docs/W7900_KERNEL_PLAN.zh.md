@@ -1,7 +1,7 @@
 # Qwen3.8 Flash Next 算子快速实现计划
 
 - 日期：2026-11-18。
-- 状态：首批实现及后续实验已完成；最新完成 HC 分阶段计时和带舍入证书的并行 norm，轻量对照保持逐 bit 一致。结果见第 10 至 12 节；所有新路径仍为 opt-in。
+- 状态：最新完成 HC inject 独立并行路径及保守 BF16 gate 舍入检查，轻量对照逐 bit 一致；结果见第 10 至 13 节。新路径仍为 opt-in，未融合 norm。
 - 工作目录：`../libr3d-iqr-dev`。
 - 目标硬件：两张 W7900D，gfx1100，TP2。
 - 参考实现：`fork/halo_qwen3.8_flash_next@5d2b950`。
@@ -354,3 +354,79 @@ QUICK_OPERATOR_VARIANTS='previous:1:1:0 norm:1:1:0:0:0:0:0:1' \
 - `logs/hcnorm-profile.log`：开启 norm 后的真实模型最终算子表；只取最后一张每 rank 表。
 
 本轮未提交或推送。临时测试容器已清理，GPU 锁已释放。下一步以 HC down 和 inject 为候选，各自先做一个局部假设，不继续改 norm，也不默认开启近似矩阵乘。
+
+## 13. HC inject 并行化：2026-11-18
+
+### 13.1 实现范围
+
+- 参考 HALO/RDNA4 的并行 inject 分工，但第一版是独立 kernel，不融合 norm，不改变 norm/down/up/mix/quant 的计算。
+- 开关：`RAD_HC_INJECT_PARALLEL=1`，默认关闭；仅作用于当前 HC 形状且实际行数不超过 16 的 decode/verify。大于 16 行保持原路径。
+- 每个 (row, inject output stream) 一个 256-thread workgroup。并行生成与原 strict 路径相同的 FP32 乘积，并在 LDS 保存 10240 个乘积。
+- 用 FP64 并行计算有符号和 S 与绝对值和 A，为原 FP32 顺序和构造保守区间。区间两端经过原 sigmoid 和 BF16 RNE 后相同才采用；否则逐项从 LDS 按原顺序执行 FP32 加法。
+- 未修改服务默认配置，不涉及权重 relayout、原量化格式或近似矩阵乘。
+
+源码入口：`../libr3d-iqr-dev/libr3d/r3dh_hc_strict.hip` 的 strict_inject_parallel。
+
+### 13.2 与 norm 不同的误差界
+
+这里约束的是已经按 FP32 舍入的乘积之和，不是直接把 BF16 实数点积替代旧路径。由于有正负抵消，不能使用 norm 的正数 FP64 相对误差界，也不能仅检查指数跨度。
+
+设 n=10240，FP32 单次舍入单位为 u：
+
+$$
+u=2^{-24},\qquad \gamma_n=\frac{nu}{1-nu}\approx6.1073\times10^{-4},\qquad
+c=\mathtt{0x1.5p{-11}}=6.40869140625\times10^{-4}>\gamma_n.
+$$
+
+使用 `error = A*c + 2^-108`，从 FP64 的 `S-error`、`S+error` 转为 FP32 后再通过 nextafterf 向外扩一格，检查两端最终 BF16 gate。c 的裕量覆盖 FP64 reduction 的误差；绝对裕量保守覆盖很小乘积/加法的下溢影响。
+
+要求 A 小于 2^120，否则强制顺序回退，避免有符号 FP32 累加中间溢出的情况。NaN/Inf 也会走回退。原 FP32 乘法、除以 hc、sigmoid 和 BF16 舍入的表达式保持一致。该检查按单个 gate 决定，不声称中间 FP32 点积本身与并行中心 S 相等。
+
+初版使用更宽的 `A*2^-9` 区间，后续只收紧一次到上述仍保守的 c；两版服务结果分别保存，不混合计分。
+
+### 13.3 轻量验收
+
+- 1/4/16 行、15 类输入，新增 inject 强抵消、sigmoid 正负饱和、gate 临界附近、subnormal 权重、NaN/Inf 权重和正负零权重。
+- normalized scratch、down、up logits、gates、最终输出、inject、普通/旋转 int8 codes 及 scales 逐 bit 对照通过，前后 guard 正常。
+- 另测一个 17 行普通输入，确认大行数回退及全部输出一致。
+- 合成小样例中，inject 约 88 -> 18 至 21 us。norm 固定开启时，完整 HC 调用：M=1 260.93 -> 189.65 us，M=4 263.03 -> 192.75 us，M=16 304.34 -> 233.77 us；17 行回退基本持平。
+- 不要求完整模型 accuracy、长上下文或高并发；以上为小样例证据，不把它当作全面精度认证。
+
+### 13.4 服务及 profile
+
+TP2、GPU4/5、相同构建、profile 关闭，IQR dot4、logits staging 和并行 norm 固定开启，仅切换 inject。每配置一个短请求预热，再测试三类请求，每项一次测量；最终轮先跑 inject=1 再跑 0，以核对顺序漂移。
+
+| 模式/工作负载 | norm 组合 tok/s | 再加并行 inject tok/s |
+| --- | ---: | ---: |
+| MTP0 短问答 | 10.70 | 10.96 |
+| MTP0 算术请求 | 10.18 | 10.42 |
+| MTP0 decode128 | 10.66 | 10.91 |
+| MTP3 短问答 | 12.95 | 13.10 |
+| MTP3 算术请求 | 15.88 | 16.08 |
+| MTP3 decode128 | 12.09 | 12.24 |
+
+最终 decode128 增幅约 2.3%/1.2%。早期更宽区间版本的同方向短测约 10.67 -> 10.89、12.10 -> 12.25 tok/s，属于辅助证据，不是多轮统计结论。
+
+最终轮两种 MTP、三类请求的完整 message、completion token 数和 finish reason 与同轮对照一致；算术答案仍为 4/391，算术请求生成 57 token，长请求生成 128 token。
+
+真实模型 MTP0 profile 的最终 rank-0 表中，HC 约 25.42 -> 23.23 ms/token，占比约 24.90% -> 23.22%；dense gemm_nt_q 仍约 17.82 ms/token，其他主要算子基本未变。Profile 仅作热点验证，不将其吞吐与无 profile 服务直接比较，也不把微测的 1.3 倍当作整机加速比。
+
+### 13.5 使用、证据及后续
+
+测试组合：`RAD_IQR_DOT4=1 RAD_LOGITS_STAGED=1 RAD_HC_NORM_PARALLEL=1 RAD_HC_INJECT_PARALLEL=1 RAD_HC_WMMA=0`。其他实验开关继续保持 0；inject 默认仍关闭。
+
+服务脚本在第 12 节 norm 字段之后追加 inject 字段，兼容旧 variant：
+
+```bash
+QUICK_OPERATOR_VARIANTS='inject:1:1:0:0:0:0:0:1:1 norm:1:1:0:0:0:0:0:1' \
+  bash libr3d-iqr-dev/scripts/quick-operators.sh results/r3d-iqr/implementation/quick-inject-new
+```
+
+轻量算子检查用 `RAD_HC_INJECT_BENCH=1 RAD_HC_STAGE_BENCH=1 RAD_HC_NORM_PARALLEL=1` 启用已有 `r3d_hc_quick_wmma_candidate` 测试；仍需使用容器和 GPU 锁。证据相对 `../results/r3d-iqr/implementation/`：
+
+- `quick-operators-20261118-hcinject/`：初版宽误差区间的服务结果。
+- `quick-operators-20261118-hcinject-final/`：最终反向顺序服务 A/B，12 条记录、库 SHA256 和原始响应。
+- `logs/hcinject-final-check.log`：最终 15 类边界、完整输出、17 行回退及微测。
+- `logs/hcinject-profile.log`：实际模型最终算子表；`hcinject-profile-response.json` 为对应响应，与上一版 profile 响应完整消息一致。
+
+本轮未 commit 或 push；上一次提交为 0b63a9b。独立 inject 实现和验证先到此为止，不直接融合 norm。下一项可针对 HC down 的 scale 加载和 barrier 提出局部假设；norm+inject 融合需单独测量资源占用与回退成本，不能假设必然获益。

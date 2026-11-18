@@ -23,19 +23,20 @@ read -r -a variants <<< "${QUICK_OPERATOR_VARIANTS:-base:0:0:0 exact:1:1:0}"
 for mode in "${modes[@]}"; do
     [[ "$mode" == mtp0 || "$mode" == mtp3 ]] || exit 2
     for variant in "${variants[@]}"; do
-        IFS=: read -r label iqr logits hc prefetch hc_tile dense iqr_dense norm extra <<< "$variant"
+        IFS=: read -r label iqr logits hc prefetch hc_tile dense iqr_dense norm inject extra <<< "$variant"
         prefetch=${prefetch:-0}
         hc_tile=${hc_tile:-0}
         dense=${dense:-0}
         iqr_dense=${iqr_dense:-0}
         norm=${norm:-0}
+        inject=${inject:-0}
         [[ "$label" =~ ^[a-zA-Z0-9_-]+$ && "$iqr" =~ ^[01]$ && "$logits" =~ ^[01]$ && "$hc" =~ ^[01]$ \
             && "$prefetch" =~ ^[01]$ && "$hc_tile" =~ ^[01]$ && "$dense" =~ ^[01]$ \
-            && "$iqr_dense" =~ ^[01]$ && "$norm" =~ ^[01]$ && -z "$extra" ]] || exit 2
+            && "$iqr_dense" =~ ^[01]$ && "$norm" =~ ^[01]$ && "$inject" =~ ^[01]$ && -z "$extra" ]] || exit 2
         tag=$mode-$label
         amd-smi process --gpu 4 5 --json | jq -e 'all(.[].process_list[]; .process_info == "No running processes detected")' >/dev/null
-        printf 'Serving options: mode=%s IQR_DOT4=%s LOGITS_STAGED=%s HC_WMMA=%s IQR_PREFETCH=%s HC_EXACT_TILE=%s I8_DOT4=%s IQR_DENSE_WAVE=%s HC_NORM_PARALLEL=%s profile=off GPU=4,5\n' \
-            "$mode" "$iqr" "$logits" "$hc" "$prefetch" "$hc_tile" "$dense" "$iqr_dense" "$norm"
+        printf 'Serving options: mode=%s IQR_DOT4=%s LOGITS_STAGED=%s HC_WMMA=%s IQR_PREFETCH=%s HC_EXACT_TILE=%s I8_DOT4=%s IQR_DENSE_WAVE=%s HC_NORM_PARALLEL=%s HC_INJECT_PARALLEL=%s profile=off GPU=4,5\n' \
+            "$mode" "$iqr" "$logits" "$hc" "$prefetch" "$hc_tile" "$dense" "$iqr_dense" "$norm" "$inject"
         docker run -d --rm --name "$name" --user 1001:1001 --device /dev/kfd --device /dev/dri \
             --group-add 993 --group-add 44 --security-opt seccomp=unconfined --ulimit memlock=-1 --ipc=host \
             -e ROCR_VISIBLE_DEVICES=4,5 -e HIP_VISIBLE_DEVICES=0,1 -e HSA_FORCE_FINE_GRAIN_PCIE=1 \
@@ -43,6 +44,7 @@ for mode in "${modes[@]}"; do
             -e RAD_IQR_PREFETCH="$prefetch" -e RAD_HC_EXACT_TILE="$hc_tile" -e RAD_I8_DOT4="$dense" \
             -e RAD_IQR_DENSE_WAVE="$iqr_dense" \
             -e RAD_HC_NORM_PARALLEL="$norm" \
+            -e RAD_HC_INJECT_PARALLEL="$inject" \
             -v "$ws:$ws" -w "$ws" -p 127.0.0.1:18103:8000 \
             --entrypoint "$ws/build-r3d-gfx1100/bin/radiance" radiance-r3d-dev:rocm10.1-ffmpeg \
             --config "$ws/run/bench-tp2-$mode.yaml" > "$out/$tag-container.txt"
