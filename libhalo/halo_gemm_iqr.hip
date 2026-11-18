@@ -216,21 +216,18 @@ __global__ __launch_bounds__(256) void iqr_tiled_gemm_kernel(
     const int ar = tid >> 2, ae = (tid & 3) * 16;
     const int8_t* asrc = A + (size_t)(m0 + ar < M ? m0 + ar : M - 1) * a_ld + ae;
     int8_t* adst = sA + ar * kTPitch + ae;
-    const int8_t* wsrc[2];
-    int8_t* wdst[2];
-#pragma unroll
-    for (int i = 0; i < 2; ++i) {
-        const int c = tid + 256 * i, r = c >> 2, e = (c & 3) * 16;
-        wsrc[i] = P + (size_t)(n0 + r) * K + e;
-        wdst[i] = sW + r * kTPitch + e;
-    }
+    const int c0 = tid, r0 = c0 >> 2, e0 = (c0 & 3) * 16;
+    const int c1 = tid + 256, r1 = c1 >> 2, e1 = (c1 & 3) * 16;
+    const int8_t* wsrc0 = P + (size_t)(n0 + r0) * K + e0;
+    const int8_t* wsrc1 = P + (size_t)(n0 + r1) * K + e1;
+    int8_t* wdst0 = sW + r0 * kTPitch + e0;
+    int8_t* wdst1 = sW + r1 * kTPitch + e1;
     const int srow = tid < kTBM ? (m0 + tid < M ? m0 + tid : M - 1) : 0;
     const float* sp = As + (size_t)srow * sa_ld;
     const int8_t* fa = sA + (wm * kTTM * 16 + (lane & 15)) * kTPitch;
     const int8_t* fw = sW + (wn * kTTN * 16 + (lane & 15)) * kTPitch;
-    int ncol[kTTN];
-#pragma unroll
-    for (int j = 0; j < kTTN; ++j) ncol[j] = n0 + (wn * kTTN + j) * 16 + (lane & 15);
+    const int ncol0 = n0 + (wn * kTTN) * 16 + (lane & 15);
+    const int ncol1 = ncol0 + 16;
 
     v8f acc[kTTM][kTTN];
     v8i tmp[kTTM][kTTN];
@@ -239,12 +236,12 @@ __global__ __launch_bounds__(256) void iqr_tiled_gemm_kernel(
 #pragma unroll
         for (int j = 0; j < kTTN; ++j) { acc[i][j] = (v8f)0.f; tmp[i][j] = (v8i)0; }
 
-    uint4 ra, rw[2];
+    uint4 ra, rw0, rw1;
     float rs = 0.f;
     auto fetch = [&](int kt) {
         ra = *(const uint4*)(asrc + kt * kTBK);
-#pragma unroll
-        for (int i = 0; i < 2; ++i) rw[i] = *(const uint4*)(wsrc[i] + kt * kTBK);
+        rw0 = *(const uint4*)(wsrc0 + kt * kTBK);
+        rw1 = *(const uint4*)(wsrc1 + kt * kTBK);
         if (!(kt & 1) && tid < kTBM) rs = sp[kt >> 1];
     };
     fetch(0);
@@ -252,54 +249,56 @@ __global__ __launch_bounds__(256) void iqr_tiled_gemm_kernel(
     for (int kt = 0; kt < nk; ++kt) {
         __syncthreads();
         *(uint4*)adst = ra;
-#pragma unroll
-        for (int i = 0; i < 2; ++i) *(uint4*)wdst[i] = rw[i];
+        *(uint4*)wdst0 = rw0;
+        *(uint4*)wdst1 = rw1;
         if (!(kt & 1) && tid < kTBM) sS[tid] = rs;
         __syncthreads();
         if (kt + 1 < nk) fetch(kt + 1);
 #pragma unroll
         for (int s = 0; s < kTBK / 16; ++s) {
-            v4i af[kTTM], bf[kTTN];
-#pragma unroll
-            for (int i = 0; i < kTTM; ++i) af[i] = *(const v4i*)(fa + i * 16 * kTPitch + s * 16);
-#pragma unroll
-            for (int j = 0; j < kTTN; ++j) bf[j] = *(const v4i*)(fw + j * 16 * kTPitch + s * 16);
-#pragma unroll
-            for (int i = 0; i < kTTM; ++i)
-#pragma unroll
-                for (int j = 0; j < kTTN; ++j)
-                    tmp[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, af[i], true, bf[j],
-                                                                           tmp[i][j], false);
+            const v4i af0 = *(const v4i*)(fa + 0 * 16 * kTPitch + s * 16);
+            const v4i af1 = *(const v4i*)(fa + 1 * 16 * kTPitch + s * 16);
+            const v4i bf0 = *(const v4i*)(fw + 0 * 16 * kTPitch + s * 16);
+            const v4i bf1 = *(const v4i*)(fw + 1 * 16 * kTPitch + s * 16);
+            tmp[0][0] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, af0, true, bf0, tmp[0][0], false);
+            tmp[0][1] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, af0, true, bf1, tmp[0][1], false);
+            tmp[1][0] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, af1, true, bf0, tmp[1][0], false);
+            tmp[1][1] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, af1, true, bf1, tmp[1][1], false);
         }
         if (kt & 1) {
             const int g = kt >> 1;
-            float ws[kTTN];
-#pragma unroll
-            for (int j = 0; j < kTTN; ++j) ws[j] = FS[(size_t)ncol[j] * nkb + g];
-#pragma unroll
-            for (int i = 0; i < kTTM; ++i)
-#pragma unroll
-                for (int e = 0; e < 8; ++e) {
-                    const float as = sS[(wm * kTTM + i) * 16 + 2 * e + (lane >> 4)];
-#pragma unroll
-                    for (int j = 0; j < kTTN; ++j) {
-                        acc[i][j][e] = fmaf((float)tmp[i][j][e], as * ws[j], acc[i][j][e]);
-                        tmp[i][j][e] = 0;
-                    }
-                }
-        }
-    }
-#pragma unroll
-    for (int j = 0; j < kTTN; ++j) {
-        const float r = RS[ncol[j]];
-#pragma unroll
-        for (int i = 0; i < kTTM; ++i) {
-            const int mb = m0 + (wm * kTTM + i) * 16;
+            const float ws0 = FS[(size_t)ncol0 * nkb + g];
+            const float ws1 = FS[(size_t)ncol1 * nkb + g];
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                const int m = mb + 2 * e + (lane >> 4);
-                if (m < M) Y[(size_t)m * N + ncol[j]] = (__hip_bfloat16)(acc[i][j][e] * r);
+                const float as0 = sS[(wm * kTTM + 0) * 16 + 2 * e + (lane >> 4)];
+                const float as1 = sS[(wm * kTTM + 1) * 16 + 2 * e + (lane >> 4)];
+                acc[0][0][e] = fmaf((float)tmp[0][0][e], as0 * ws0, acc[0][0][e]);
+                acc[0][1][e] = fmaf((float)tmp[0][1][e], as0 * ws1, acc[0][1][e]);
+                acc[1][0][e] = fmaf((float)tmp[1][0][e], as1 * ws0, acc[1][0][e]);
+                acc[1][1][e] = fmaf((float)tmp[1][1][e], as1 * ws1, acc[1][1][e]);
+                tmp[0][0][e] = 0;
+                tmp[0][1][e] = 0;
+                tmp[1][0][e] = 0;
+                tmp[1][1][e] = 0;
             }
+        }
+    }
+    const float r0s = RS[ncol0];
+    const float r1s = RS[ncol1];
+    const int mb0 = m0 + (wm * kTTM + 0) * 16;
+    const int mb1 = m0 + (wm * kTTM + 1) * 16;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const int mo0 = mb0 + 2 * e + (lane >> 4);
+        const int mo1 = mb1 + 2 * e + (lane >> 4);
+        if (mo0 < M) {
+            Y[(size_t)mo0 * N + ncol0] = (__hip_bfloat16)(acc[0][0][e] * r0s);
+            Y[(size_t)mo0 * N + ncol1] = (__hip_bfloat16)(acc[0][1][e] * r1s);
+        }
+        if (mo1 < M) {
+            Y[(size_t)mo1 * N + ncol0] = (__hip_bfloat16)(acc[1][0][e] * r0s);
+            Y[(size_t)mo1 * N + ncol1] = (__hip_bfloat16)(acc[1][1][e] * r1s);
         }
     }
 }
