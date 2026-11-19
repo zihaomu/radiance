@@ -37,13 +37,10 @@ constexpr uint32_t kWave = 32, kWaves = 4, kPitch = 136;
 typedef int v4i __attribute__((ext_vector_type(4)));
 typedef int v8i __attribute__((ext_vector_type(8)));
 
-/* libr4d's w4nl int8 levels (r4d_args.h kW4nlI8: the magnitudes, then their negatives) and their
- * unit, and the fixed second scale level of w4nl64a8h (kW4G64Scale). */
+/* The unit of libr4d's w4nl int8 levels (r4d_args.h kW4nlI8, which w4nl_i8x4 holds), and the
+ * fixed second scale level of w4nl64a8h (kW4G64Scale). */
 constexpr float kW4nlI8Unit = 0.18965f;
 constexpr float kW4G64Scale = 0x1p-13f;
-__constant__ int8_t c_w4nl_i8[16] = { 6, 17, 29, 42, 58, 74, 95, 116,
-                                      -6, -17, -29, -42, -58, -74, -95, -116 };
-
 /* One class of experts: entry `i` of a weight-table operand (a device pointer array when the
  * stacked stride is 0). */
 struct Cls {
@@ -93,6 +90,17 @@ __device__ __forceinline__ float e4m3f(uint32_t b) {
     return __uint_as_float(__float_as_uint(ex ? nrm : sub) | sign);
 }
 
+/* kW4nlI8 at four nibbles (one a byte), by a byte permute in registers: a constant-memory
+ * table is a vector memory load a byte. Codes 8-15 are 0-7 negated; no level is 0, so each
+ * byte's two's complement stays in its byte. */
+__device__ __forceinline__ uint32_t w4nl_i8x4(uint32_t nib) {
+    constexpr uint32_t lo = 6u | 17u << 8 | 29u << 16 | 42u << 24;
+    constexpr uint32_t hi = 58u | 74u << 8 | 95u << 16 | 116u << 24;
+    const uint32_t mag = __builtin_amdgcn_perm(hi, lo, nib & 0x07070707u);
+    const uint32_t neg = ((nib >> 3) & 0x01010101u) * 0xFFu;
+    return (mag ^ neg) + (neg & 0x01010101u);
+}
+
 /* The w4nl expert: a unit's 16 rows of lane l's four columns, as the IQR decoders give them. */
 struct W4nl {
     static constexpr uint32_t kSub = 64;   /* K per weight scale */
@@ -112,11 +120,7 @@ struct W4nl {
         for (uint32_t q = 0; q < 16; ++q) {
             const uint32_t d = r.d[q];
             const uint32_t nib = (lane & 1u) ? (d >> 4) & 0x0F0F0F0Fu : d & 0x0F0F0F0Fu;
-            uint32_t v = 0;
-#pragma unroll
-            for (uint32_t b = 0; b < 4; ++b)
-                v |= (uint32_t)(uint8_t)c_w4nl_i8[(nib >> (8u * b)) & 0xFu] << (8u * b);
-            o[q] = v;
+            o[q] = w4nl_i8x4(nib);
         }
     }
     __device__ void unit(uint32_t row0, uint32_t kb, uint32_t lane, uint32_t (&o)[16]) const {
@@ -344,17 +348,28 @@ __global__ __launch_bounds__(kWaves * kWave) void moe_iqr_i8_kernel(Route R, Cls
  * tile()'s: the same unit, iu8 WMMA and per-group f32 fold. */
 constexpr uint32_t kDecW = 8;
 
+/* The lane-xor exchange in registers (DPP within a row of 16, permlanex16 across the rows)
+ * rather than __shfl_xor's LDS-path bpermute. */
+template <uint32_t M>
+__device__ __forceinline__ int32_t xor_lane(int32_t x) {
+    static_assert(M == 1u || M == 2u || M == 4u || M == 8u || M == 16u, "a lane bit of a wave");
+    if constexpr (M == 16u)
+        return __builtin_amdgcn_permlanex16(x, x, 0x76543210u, 0xFEDCBA98u, false, false);
+    else
+        return __builtin_amdgcn_update_dpp(x, x, 0x160 | (int)M, 0xF, 0xF, false);
+}
+
 /* The lanes' 16 int32 values, halved across lanes by xor mask M: each lane keeps the half its
  * bit M selects and adds its partner's copy of that half. */
-template <uint32_t N>
-__device__ __forceinline__ void halve(int32_t (&v)[16], uint32_t lane, uint32_t m) {
-    const bool hi = (lane & m) != 0u;
+template <uint32_t N, uint32_t M>
+__device__ __forceinline__ void halve(int32_t (&v)[16], uint32_t lane) {
+    const bool hi = (lane & M) != 0u;
 #pragma unroll
     for (uint32_t i = 0; i < N / 2u; ++i) {
         /* select on the values, never on the array, or the array goes to scratch */
         const int32_t a = v[i], b = v[i + N / 2u];
         const int32_t send = hi ? a : b;
-        v[i] = (hi ? b : a) + __shfl_xor(send, (int)m, (int)kWave);
+        v[i] = (hi ? b : a) + xor_lane<M>(send);
     }
 }
 
@@ -428,12 +443,12 @@ __device__ void gemv_expert(const Route& R, const Cls& c, uint32_t ex, uint32_t 
             for (uint32_t q = 0; q < 16; ++q)
                 v[q] = __builtin_amdgcn_sudot4(true, (int)w[q], true, (int)av, 0, false);
             if constexpr (SUBS == 1u) {
-                halve<16>(v, lane, 16u); halve<8>(v, lane, 8u); halve<4>(v, lane, 4u); halve<2>(v, lane, 2u);
-                v[0] += __shfl_xor(v[0], 1, (int)kWave);
+                halve<16, 16>(v, lane); halve<8, 8>(v, lane); halve<4, 4>(v, lane); halve<2, 2>(v, lane);
+                v[0] += xor_lane<1>(v[0]);
                 acc[r] = fmaf((float)v[0], as[kb * 128u / R.a_group] * ws[0], acc[r]);
             } else {
-                halve<16>(v, lane, 8u); halve<8>(v, lane, 4u); halve<4>(v, lane, 2u); halve<2>(v, lane, 1u);
-                const int32_t o = __shfl_xor(v[0], 16, (int)kWave);
+                halve<16, 8>(v, lane); halve<8, 4>(v, lane); halve<4, 2>(v, lane); halve<2, 1>(v, lane);
+                const int32_t o = xor_lane<16>(v[0]);
                 const int32_t s0 = (lane & 16u) ? o : v[0], s1 = (lane & 16u) ? v[0] : o;
                 acc[r] = fmaf((float)s0, as[(kb * 128u) / R.a_group] * ws[0], acc[r]);
                 acc[r] = fmaf((float)s1, as[(kb * 128u + 64u) / R.a_group] * ws[SUBS - 1u], acc[r]);
