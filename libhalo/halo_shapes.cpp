@@ -489,6 +489,15 @@ extern "C" int halo_shape_mtp_enter(const RadParam* p, int n_p, int operand, Rad
     HALO_PICK(l);
 }
 
+extern "C" int halo_shape_hc_write_read(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    if (operand < 11) return halo_shape_hc_read(p, n_p, operand, out);
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, n), in_unit(opd(D, M, hc)) };
+    operand -= 11;
+    HALO_PICK(l);
+}
+
 extern "C" int halo_shape_hc_write(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
     const uint32_t D = dt_act(p, n_p, "dtype");

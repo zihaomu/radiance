@@ -419,6 +419,7 @@ int halo_rad_mhc_contract(const RadArgs*, RadStream);
 int     halo_rad_mtp_enter      (const RadArgs*, RadStream);
 int64_t halo_rad_mtp_enter_scratch(const RadArgs*);
 int     halo_rad_hc_read        (const RadArgs*, RadStream);
+int     halo_rad_hc_write_read  (const RadArgs*, RadStream);
 int64_t halo_rad_hc_read_scratch(const RadArgs*);
 int     halo_rad_hc_write       (const RadArgs*, RadStream);
 
@@ -866,6 +867,7 @@ int halo_shape_mhc_post(const RadParam*, int, int, RadOpdDesc*);
 int halo_shape_mhc_contract(const RadParam*, int, int, RadOpdDesc*);
 int halo_shape_mtp_enter      (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_hc_read        (const RadParam*, int, int operand, RadOpdDesc*);
+int halo_shape_hc_write_read  (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_hc_write       (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_hc_project     (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_binary         (const RadParam*, int, int operand, RadOpdDesc*);

@@ -680,6 +680,23 @@ static const RadOperandSpec oHcRead[] = {
     { "rscale",   RAD_OPD_OUT,    1 },
 };
 
+/* hc_write then hc_read over the same stream: the write's y and inj after hc_read's list. */
+static const RadOperandSpec oHcWriteRead[] = {
+    { "h",        RAD_OPD_INOUT,  0 },
+    { "w",        RAD_OPD_WEIGHT, 0 },
+    { "mix_down", RAD_OPD_WEIGHT, 0 },
+    { "mix_up",   RAD_OPD_WEIGHT, 0 },
+    { "inject_w", RAD_OPD_WEIGHT, 1 },
+    { "x",        RAD_OPD_OUT,    0 },
+    { "inj",      RAD_OPD_OUT,    1 },
+    { "q",        RAD_OPD_OUT,    1 },
+    { "scale",    RAD_OPD_OUT,    1 },
+    { "rq",       RAD_OPD_OUT,    1 },
+    { "rscale",   RAD_OPD_OUT,    1 },
+    { "y",        RAD_OPD_IN,     0 },
+    { "inj_in",   RAD_OPD_IN,     0 },
+};
+
 static const RadParamSpec pGdnGatedRmsNorm[] = {
     P_INT("M"),
     P_INT("channels"),
@@ -3260,6 +3277,9 @@ static const RadOpSchema kSchemas[] = {
            "the read half of a gated residual: a grouped rmsnorm, a low-rank sigmoid gate, and "
            "the mean of the gated streams -- plus the per-branch write gains and, optionally, "
            "the block-scaled fp8 form of the block input and its Hadamard-rotated twin."),
+    SCHEMA("hc_write_read", pHcRead, oHcWriteRead,
+           "hc_write (h[s] += inj_in[s] * y) then hc_read of the updated stream, as one op; "
+           "the same bytes as the pair."),
     SCHEMA("hc_project", pHcProject, oHcProject,
            "the control vector's projection (llama.cpp's `--cvec-mode project`): for each of the "
            "hc streams of a row whose `on` flag is 1, h[s] -= scale * (h[s] . v) * v, v that "
@@ -7439,6 +7459,17 @@ HALO_WIN_PAIR(512, 1) HALO_WIN_PAIR(512, 2) HALO_WIN_PAIR(512, 4) HALO_WIN_PAIR(
   nullptr, nullptr, halo_rad_hc_read, halo_rad_hc_read_scratch,
   halo_rad_layout_hc_e4m3, halo_rad_relayout_hc_e4m3,
   halo_shape_hc_read, halo_rad_unrelayout_hc_e4m3 },
+
+{ "hc_write_read_e4m3", "hc_write_read", "norm",
+  "hc_write folded into hc_read_e4m3: at decode the write runs in the norm blocks of the one "
+  "norm-and-down launch; elsewhere hc_write's kernel runs first",
+  "as hc_read_e4m3",
+  "as hc_read_e4m3, with hc_write's bf16 y and inj",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cHcReadE4m3), NOTUNE,
+  nullptr, nullptr, halo_rad_hc_write_read, halo_rad_hc_read_scratch,
+  halo_rad_layout_hc_e4m3, halo_rad_relayout_hc_e4m3,
+  halo_shape_hc_write_read, halo_rad_unrelayout_hc_e4m3 },
 
 { "gdn_gated_rmsnorm_h128_bf16", "gdn_gated_rmsnorm", "gdn",
   "gated rms norm over a row: out = rms(x) . w . act(z), for the prefill path only",

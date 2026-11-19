@@ -116,6 +116,10 @@ struct HyperConn {
      * `mix`), read from their encoding at declare. */
     bool       mix_e4m3 = false;
     rad_op     op_read = 0, op_write = 0;
+    /* The read with the write of the connection before it folded in front (hc_write_read, the
+     * two sharing this Wire), up to `wread_rows` rows; 0 when not served. */
+    rad_op     op_wread = 0;
+    int64_t    wread_rows = 0;
     /* The block input's own int8 pair is the rotated one (ActFP8::q8_rot, a trunk stored rotated):
      * the read writes its rotated codes there and its plain ones into `pq` / `ps`, a pair of this
      * connection's that nothing reads. */
@@ -175,6 +179,9 @@ struct HyperConn {
         if (piece <= 0 || T <= piece) { read(c_, T, 0, T); return; }
         for (int64_t r0 = 0; r0 < T; r0 += piece) read(c_, T, r0, T - r0 < piece ? T - r0 : piece);
     }
+    /* `prev`'s write over rows [0, T), then this read_pieces: one op where hc_write_read serves
+     * the step and the write is the plain one over this connection's own stream. */
+    void read_after(RadCtx* c_, int64_t T, const HyperConn& prev) const;
 };
 
 inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const char* name,
@@ -293,6 +300,28 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
         rad_op_reads (b, op_read, rd, 1);
         rad_op_writes(b, op_read, wr, n_wr);
     }
+    if (c.inject) {
+        const int64_t band = c.read_rows > 0 && c.read_rows < g.max_tok ? c.read_rows : g.max_tok;
+        const int64_t wrows = band < 16 ? band : 16;
+        op_wread = RAD_OP(b, "hc_write_read",
+                  RAD_PARAMS(RAD_RANGE("M", 1, wrows),
+                             RAD_INT("n", g.n_embd),
+                             RAD_INT("hc", c.hc), RAD_INT("lowrank", c.lowrank),
+                             RAD_F64("eps", g.eps), RAD_STR("dtype", g.dtype),
+                             RAD_F64("wadd", g.wadd), RAD_INT("inject", 1),
+                             RAD_INT("group", c.quant ? RAD_FP8_BLOCK : 0),
+                             RAD_INT("rotate", (c.rotate || xrot) ? 1 : 0),
+                             RAD_STR("mix", mix_e4m3 ? "e4m3" : "bf16")),
+                  wts, n_wts);
+        if (op_wread) {
+            const rad_buf rd[3] = { w.h, w.x.x, w.inj };
+            rad_buf wr2[7] = { w.h };
+            for (int i = 0; i < n_wr; ++i) wr2[i + 1] = wr[i];
+            RAD_ARCH_TRY(rad_op_reads (b, op_wread, rd, 3));
+            RAD_ARCH_TRY(rad_op_writes(b, op_wread, wr2, n_wr + 1));
+            wread_rows = wrows;
+        }
+    }
 
     if (c.inject) {
         op_write = rw(b, RAD_OP(b, "hc_write",
@@ -391,6 +420,31 @@ inline void HyperConn::read(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) con
                                    : RAD_NONE,
                 (c.rotate || xrot) ? brow_slice(xrot ? w.x.s8 : w.rs, r0, rows,
                                                 fp8_blocks(g.n_embd)) : RAD_NONE);
+}
+
+inline void HyperConn::read_after(RadCtx* c_, int64_t T, const HyperConn& prev) const {
+    if (!(op_wread && T <= wread_rows && prev.op_write && prev.w.h == w.h && prev.w.x.x == w.x.x &&
+          prev.w.inj == w.inj && prev.c.hc == c.hc && !prev.takes_ar(T))) {
+        prev.write(c_, T, 0, T);
+        read_pieces(c_, T);
+        return;
+    }
+    const int64_t HN = hn();
+    RAD_ISSUE_N(c_, op_wread, T,
+                brow_slice(w.h, 0, T, HN), RAD_W(w_norm), RAD_W(w_down), RAD_W(w_up),
+                RAD_W(w_inj),
+                brow_slice(w.x.x, 0, T, g.n_embd),
+                brow_slice(w.inj, 0, T, c.hc),
+                c.quant  ? brow_slice(xrot ? pq : c.codes_i8 ? w.x.q8 : w.x.q, 0, T,
+                                      g.n_embd) : RAD_NONE,
+                c.quant  ? brow_slice(xrot ? ps : c.codes_i8 ? w.x.s8 : w.x.s, 0, T,
+                                      fp8_blocks(g.n_embd)) : RAD_NONE,
+                (c.rotate || xrot) ? brow_slice(xrot ? w.x.q8 : w.rq, 0, T, g.n_embd)
+                                   : RAD_NONE,
+                (c.rotate || xrot) ? brow_slice(xrot ? w.x.s8 : w.rs, 0, T,
+                                                fp8_blocks(g.n_embd)) : RAD_NONE,
+                brow_slice(w.x.x, 0, T, g.n_embd),
+                brow_slice(w.inj, 0, T, c.hc));
 }
 
 /* ================================================================== the control-vector projection

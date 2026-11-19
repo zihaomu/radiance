@@ -29,6 +29,7 @@
 #include <hip/hip_bf16.h>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 
@@ -384,7 +385,8 @@ __global__ __launch_bounds__(256) void hcf_stats_kernel(const uint16_t* __restri
 #define HCF_EXP_NOH 0
 #endif
 constexpr int kHcfSub = 128;       /* k a staged group: one scale group, a k step a wave */
-constexpr int kHcfSubMax = 8;      /* groups a slice at most */
+constexpr int kHcfSubMax = 8;
+constexpr long long kHcfDec1Rows = 16;   /* the one-tile decode form's rows */      /* groups a slice at most */
 
 template <int RT>
 __global__ __launch_bounds__(256) void hcf_down_dec_kernel(
@@ -626,28 +628,38 @@ __global__ __launch_bounds__(HC * 256) void hcf_normdec_kernel(
 }
 
 template <int SPS>
-__global__ __launch_bounds__(256) void hcf_down_dec1_kernel(
-    const uint16_t* __restrict__ Nf, const uint8_t* __restrict__ down, long dld,
-    float* __restrict__ P, long pslice, int pw, int rows, int HN) {
-    __shared__ __attribute__((aligned(16))) float red[8 * 8 * 32];
-    const int ct = blockIdx.x, s = blockIdx.y;
-    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, col = lane & 15;
-    const int sub0 = s * SPS;
+__device__ __forceinline__ void hcf_down_dec1_load(int ct, int s, int tid, const uint8_t* __restrict__ down,
+                                                   long dld, int HN, uint4 (&cw)[SPS], float (&cs)[SPS]) {
+    const int wave = tid >> 5, col = tid & 15;
     const uint8_t* wrow = down + (long)(ct * 16 + col) * dld;
     const float* wsc = (const float*)(wrow + HN);
-    const bool live = col < rows;
-    const uint16_t* np = Nf + (long)(live ? col : 0) * HN + wave * 16;
-
-    uint4 cw[SPS], a0[SPS], a1[SPS];
-    float cs[SPS];
 #pragma unroll
     for (int i = 0; i < SPS; ++i) {
-        const long k = (long)(sub0 + i) * kHcfSub;
-        cw[i] = *(const uint4*)(wrow + k + wave * 16);
-        cs[i] = wsc[sub0 + i] * 256.0f;
+        cw[i] = *(const uint4*)(wrow + (long)(s * SPS + i) * kHcfSub + wave * 16);
+        cs[i] = wsc[s * SPS + i] * 256.0f;
+    }
+}
+
+template <int SPS>
+__device__ __forceinline__ void hcf_down_dec1_aload(int s, int tid, const uint16_t* __restrict__ Nf, int rows,
+                                                    int HN, uint4 (&a0)[SPS], uint4 (&a1)[SPS]) {
+    const int wave = tid >> 5, col = tid & 15;
+    const uint16_t* np = Nf + (long)(col < rows ? col : 0) * HN + wave * 16;
+#pragma unroll
+    for (int i = 0; i < SPS; ++i) {
+        const long k = (long)(s * SPS + i) * kHcfSub;
         a0[i] = *(const uint4*)(np + k);
         a1[i] = *(const uint4*)(np + k + 8);
     }
+}
+
+template <int SPS>
+__device__ __forceinline__ void hcf_down_dec1_mul(int ct, int s, int tid, float* __restrict__ red,
+                                                  const uint4 (&cw)[SPS], const float (&cs)[SPS],
+                                                  const uint4 (&a0)[SPS], const uint4 (&a1)[SPS],
+                                                  float* __restrict__ P, long pslice, int pw, int rows) {
+    const int wave = tid >> 5, lane = tid & 31, col = lane & 15;
+    const bool live = col < rows;
     v8f acc = (v8f)(0.0f);
 #pragma unroll
     for (int i = 0; i < SPS; ++i) {
@@ -672,6 +684,190 @@ __global__ __launch_bounds__(256) void hcf_down_dec1_kernel(
         for (int w = 1; w < 8; ++w) v += red[(w * 8 + e) * 32 + ln];
         const int m = accRow(ln, e);
         if (m < rows) Ps[(long)m * pw + ct * 16 + (ln & 15)] = v;
+    }
+}
+
+template <int SPS>
+__global__ __launch_bounds__(256) void hcf_down_dec1_kernel(
+    const uint16_t* __restrict__ Nf, const uint8_t* __restrict__ down, long dld,
+    float* __restrict__ P, long pslice, int pw, int rows, int HN) {
+    __shared__ __attribute__((aligned(16))) float red[8 * 8 * 32];
+    uint4 cw[SPS], a0[SPS], a1[SPS];
+    float cs[SPS];
+    hcf_down_dec1_load<SPS>(blockIdx.x, blockIdx.y, threadIdx.x, down, dld, HN, cw, cs);
+    hcf_down_dec1_aload<SPS>(blockIdx.y, threadIdx.x, Nf, rows, HN, a0, a1);
+    hcf_down_dec1_mul<SPS>(blockIdx.x, blockIdx.y, threadIdx.x, red, cw, cs, a0, a1, P, pslice, pw, rows);
+}
+
+/* ---- decode at up to sixteen rows, the norm and the down product in one launch -------------
+ * hcf_normdec_kernel's work as four blocks a row (stream c is block 4m + c, each thread its
+ * thread (c, v): the same loads, sums and wave order), then hcf_down_dec1_kernel's blocks. A
+ * block's role is its arrival ticket, the norm blocks' first, so a down block waits only on
+ * blocks already running: it issues its codes, waits for every row's N, then reads it. The
+ * inject dots close in whichever of a row's four blocks arrives last, over its siblings' wave
+ * sums in hcf_normdec_kernel's order. The last down block to leave zeroes the counters. */
+__device__ unsigned g_hcf_nd[3 + kHcfDec1Rows];   /* ticket, norm done, down done, a row's */
+
+template <int SPS>
+__global__ __launch_bounds__(256) void hcf_normdown_kernel(
+    const uint16_t* __restrict__ h, long hrow, const float* __restrict__ gain, float wadd,
+    const uint16_t* __restrict__ injw, float* __restrict__ sc, uint16_t* __restrict__ Nf,
+    float* __restrict__ ipart, uint16_t* __restrict__ inj, long irow, int n, float eps,
+    const uint8_t* __restrict__ down, long dld, float* __restrict__ P, long pslice, int pw,
+    int rows, int nct, const uint16_t* __restrict__ wy, long wyrow,
+    const uint16_t* __restrict__ winj, long wirow) {
+    constexpr int HC = 4, HN_CH = 2;
+    __shared__ __attribute__((aligned(16))) float dred[8 * 8 * 32];
+    __shared__ float red[8], ired[HC][8];
+    __shared__ int tk;
+    const int tid = threadIdx.x, lane = tid & 31, wv = tid >> 5;
+    if (tid == 0) tk = (int)__hip_atomic_fetch_add(g_hcf_nd, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __syncthreads();
+    const int nnorm = HC * rows, HN = HC * n;
+    const int t = tk;
+    if (t < nnorm) {
+        const int m = t / HC, c = t % HC, v = tid, nch = n / 8;
+        uint16_t* hr = const_cast<uint16_t*>(h) + (long)m * hrow + (long)c * n;
+        uint4 hv[HN_CH];
+        float4 g0[HN_CH], g1[HN_CH];
+        uint4 iv[HN_CH][HC];
+#pragma unroll
+        for (int j = 0; j < HN_CH; ++j) {
+            const int i = v + 256 * j;
+            const int ic = i < nch ? i : 0;
+            const long k0 = (long)c * n + ic * 8;
+            hv[j] = *(const uint4*)(hr + ic * 8);
+            g0[j] = *(const float4*)(gain + k0);
+            g1[j] = *(const float4*)(gain + k0 + 4);
+            if (injw)
+#pragma unroll
+                for (int cc = 0; cc < HC; ++cc) iv[j][cc] = *(const uint4*)(injw + (long)cc * HN + k0);
+        }
+        if (wy) {
+            /* hc_write's h[c][i] += inj[c] * y[i] (halo_hc_bf16.hip: f2bf of an unfused
+             * multiply-add), on the chunks this thread owns, before they are normalised. */
+            const float gw = bf16_to_f32(winj[(long)m * wirow + c]);
+#pragma unroll
+            for (int j = 0; j < HN_CH; ++j) {
+                const int i = v + 256 * j;
+                if (i >= nch) break;
+                const uint4 yv = *(const uint4*)(wy + (long)m * wyrow + i * 8);
+                const uint32_t yw[4] = { yv.x, yv.y, yv.z, yv.w };
+                uint32_t hw[4] = { hv[j].x, hv[j].y, hv[j].z, hv[j].w };
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const float lo = bf16_to_f32((uint16_t)hw[e]) + gw * bf16_to_f32((uint16_t)yw[e]);
+                    const float hi = bf16_to_f32((uint16_t)(hw[e] >> 16)) + gw * bf16_to_f32((uint16_t)(yw[e] >> 16));
+                    hw[e] = ((__float_as_uint(lo) + 0x8000u) >> 16) | ((__float_as_uint(hi) + 0x8000u) & 0xffff0000u);
+                }
+                hv[j] = make_uint4(hw[0], hw[1], hw[2], hw[3]);
+                *(uint4*)(hr + i * 8) = hv[j];
+            }
+        }
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < HN_CH; ++j) {
+            if (v + 256 * j >= nch) break;
+            const uint32_t d[4] = { hv[j].x, hv[j].y, hv[j].z, hv[j].w };
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float a = bf16_to_f32((uint16_t)d[e]), b = bf16_to_f32((uint16_t)(d[e] >> 16));
+                ss += a * a;
+                ss += b * b;
+            }
+        }
+#pragma unroll
+        for (int mask = 16; mask; mask >>= 1) ss += __shfl_xor(ss, mask);
+        if (lane == 0) red[wv] = ss;
+        __syncthreads();
+        float tt = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) tt += red[i];
+        const float sm = 1.0f / sqrtf(tt / (float)n + eps);
+        if (v == 0) sc[m * kHcfMaxHc + c] = sm;
+        float ip[HC];
+#pragma unroll
+        for (int cc = 0; cc < HC; ++cc) ip[cc] = 0.0f;
+#pragma unroll
+        for (int j = 0; j < HN_CH; ++j) {
+            const int i = v + 256 * j;
+            if (i >= nch) break;
+            const long k0 = (long)c * n + i * 8;
+            const uint32_t hw[4] = { hv[j].x, hv[j].y, hv[j].z, hv[j].w };
+            const float gg[8] = { g0[j].x + wadd, g0[j].y + wadd, g0[j].z + wadd, g0[j].w + wadd,
+                                  g1[j].x + wadd, g1[j].y + wadd, g1[j].z + wadd, g1[j].w + wadd };
+            float nv[8];
+            uint32_t ad[4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                nv[2 * e]     = hcf_n(hw[e] & 0xffffu, sm, gg[2 * e]);
+                nv[2 * e + 1] = hcf_n(hw[e] >> 16, sm, gg[2 * e + 1]);
+                ad[e] = hcf_pk16(nv[2 * e], nv[2 * e + 1]);
+            }
+            *(uint4*)(Nf + (long)m * HN + k0) = make_uint4(ad[0], ad[1], ad[2], ad[3]);
+            if (injw)
+#pragma unroll
+                for (int cc = 0; cc < HC; ++cc) {
+                    const uint32_t iw[4] = { iv[j][cc].x, iv[j][cc].y, iv[j][cc].z, iv[j][cc].w };
+                    float u = ip[cc];
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        u += nv[2 * e] * bf16_to_f32((uint16_t)iw[e]);
+                        u += nv[2 * e + 1] * bf16_to_f32((uint16_t)(iw[e] >> 16));
+                    }
+                    ip[cc] = u;
+                }
+        }
+        if (inj) {
+#pragma unroll
+            for (int cc = 0; cc < HC; ++cc) {
+                float u = ip[cc];
+#pragma unroll
+                for (int mask = 16; mask; mask >>= 1) u += __shfl_xor(u, mask);
+                if (lane == 0) ired[cc][wv] = u;
+            }
+            __syncthreads();
+            /* ipart[m][cc][c][wv], hcf_normdec_kernel's ired[cc][c][wv] */
+            if (tid < HC * 8) ipart[((m * HC + tid / 8) * HC + c) * 8 + tid % 8] = ired[tid / 8][tid % 8];
+        }
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) {
+            __hip_atomic_fetch_add(g_hcf_nd + 1, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+            tk = inj ? (int)__hip_atomic_fetch_add(g_hcf_nd + 3 + m, 1u, __ATOMIC_ACQ_REL,
+                                                   __HIP_MEMORY_SCOPE_AGENT) : 0;
+        }
+        __syncthreads();
+        if (!inj || tk != HC - 1) return;
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+        if (tid < HC) {
+            float u = 0.0f;
+            for (int cs = 0; cs < HC; ++cs)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) u += __builtin_nontemporal_load(ipart + ((m * HC + tid) * HC + cs) * 8 + i);
+            inj[(long)m * irow + tid] = f32_to_bf16(2.0f * hcf_sigmoid(u * (1.0f / (float)HC)));
+        }
+        if (tid == 0) __hip_atomic_store(g_hcf_nd + 3 + m, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        return;
+    }
+    const int dt = t - nnorm, ct = dt % nct, s = dt / nct;
+    uint4 cw[SPS];
+    float cs[SPS];
+    hcf_down_dec1_load<SPS>(ct, s, tid, down, dld, HN, cw, cs);
+    if (tid == 0)
+        while (__hip_atomic_load(g_hcf_nd + 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < (unsigned)nnorm)
+            __builtin_amdgcn_s_sleep(1);
+    __syncthreads();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    uint4 a0[SPS], a1[SPS];
+    hcf_down_dec1_aload<SPS>(s, tid, Nf, rows, HN, a0, a1);
+    hcf_down_dec1_mul<SPS>(ct, s, tid, dred, cw, cs, a0, a1, P, pslice, pw, rows);
+    if (tid == 0 &&
+        __hip_atomic_fetch_add(g_hcf_nd + 2, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) ==
+            (unsigned)(gridDim.x - nnorm) - 1u) {
+        __hip_atomic_store(g_hcf_nd, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_store(g_hcf_nd + 1, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_store(g_hcf_nd + 2, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
 }
 
@@ -1190,8 +1386,9 @@ long long hcf_plane_off(long long M, long long hc, long long lr) {
 }
 /* The one-tile decode form's N (sixteen rows of hc*n halves), in the plane's place: a launch takes
  * one form or the other. */
-constexpr long long kHcfDec1Rows = 16;
-long long hcf_dec1_bytes(long long hc, long long n) { return kHcfDec1Rows * hc * n * 2; }
+long long hcf_dec1_bytes(long long hc, long long n) {
+    return kHcfDec1Rows * hc * n * 2 + kHcfDec1Rows * kHcfMaxHc * kHcfMaxHc * 8 * 4;
+}
 /* ... and past kHcfDecRows W_up's f16 plane (hc*n x lr halves). */
 long long hcf_bytes(long long M, long long hc, long long lr, long long n) {
     return hcf_plane_off(M, hc, lr) +
@@ -1246,6 +1443,21 @@ extern "C" void halo_hc_read_pin_prefill(int form) { g_hc_prefill_form = form; }
 
 /* The E4M3 fast path's launcher: 1 when the call is not its shape or alignment (the general path
  * takes it), else the launches' result. */
+/* hc_write_read's write half when not folded into the read: hc_write's own row over (y, inj, h). */
+extern "C" int halo_rad_hc_write(const RadArgs* a, RadStream stream);
+enum { HCR_Y = 11, HCR_INJI };
+static int hc_write_first(const RadArgs* a, RadStream s) {
+    const RadTensor* y = halo_opt(a, HCR_Y);
+    if (!y) return RAD_OK;
+    RadTensor t[3] = { *y, *halo_opt(a, HCR_INJI), *halo_opt(a, HCR_H) };
+    RadArgs w = *a;
+    w.t = t;
+    w.n_t = 3;
+    w.scratch = nullptr;
+    w.scratch_bytes = 0;
+    return halo_rad_hc_write(&w, s);
+}
+
 static int hcf_launch(const RadArgs* a, RadStream s, const HcPlan& p, float eps, float wadd) {
     const RadTensor* h    = halo_opt(a, HCR_H);
     const RadTensor* w    = halo_opt(a, HCR_W);
@@ -1329,7 +1541,10 @@ static int hcf_launch(const RadArgs* a, RadStream s, const HcPlan& p, float eps,
     const int i8 = (q && q->dtype == RAD_I8) ? 1 : 0;
     uint16_t* Dd = (uint16_t*)(P + (long)(dec ? S : hc) * pslice);
 
+    const RadTensor* wyt = halo_opt(a, HCR_Y);
+    const RadTensor* wit = halo_opt(a, HCR_INJI);
     if (!dec) {
+        if (const int wrc = hc_write_first(a, s); wrc != RAD_OK) return wrc;
         /* W_up decoded once to a scaled f16 plane for the up kernel. W_down stays coded: its
          * fragments decoded from LDS measured faster than f16 ones read from the plane in L2
          * (1.15 against 2.5 ms at 2048 rows).
@@ -1369,7 +1584,26 @@ static int hcf_launch(const RadArgs* a, RadStream s, const HcPlan& p, float eps,
     const bool dec1 = rows <= kHcfDec1Rows && HN / kHcfSub / S == 5 && n / 8 <= 512 &&
                       (ip != nullptr) == (injp != nullptr);
     uint16_t* Nf = (uint16_t*)Wup;
-    if (dec1) {
+    const char* ndz = std::getenv("HALO_HC_ND");
+    long long wyrow = 0, wirow = 0;
+    bool wfold = false;
+    if (wyt) {
+        long long r1 = 0, r2 = 0;
+        wyrow = halo_rows_pitch(wyt, n, &r1);
+        wirow = halo_rows_pitch(wit, hc, &r2);
+        wfold = wyrow >= 0 && wirow >= 0 && r1 >= rows && r2 >= rows && wyrow % 8 == 0 &&
+                al(wyt->data, 16) && wyt->dtype == RAD_BF16 && wit->dtype == RAD_BF16;
+    }
+    const bool nd = dec1 && hc == 4 && !(ndz && *ndz == '0');
+    if (!(nd && wfold))
+        if (const int wrc = hc_write_first(a, s); wrc != RAD_OK) return wrc;
+    if (nd) {
+        float* ipart = (float*)(Nf + kHcfDec1Rows * HN);
+        hcf_normdown_kernel<5><<<dim3((unsigned)(4 * rows + (lr / 16) * S)), 256, 0, st>>>(
+            hp, hrow, wp, wadd, ip, scs, Nf, ipart, injp, irow, (int)n, eps, dp, dld, P, pslice, pw,
+            (int)rows, (int)(lr / 16), wfold ? (const uint16_t*)halo_p(wyt) : nullptr, (long)wyrow,
+            wfold ? (const uint16_t*)halo_p(wit) : nullptr, (long)wirow);
+    } else if (dec1) {
         hcf_normdec_kernel<4><<<dim3((unsigned)rows), 4 * 256, 0, st>>>(
             hp, hrow, wp, wadd, ip, scs, Nf, injp, irow, (int)n, eps);
         hcf_down_dec1_kernel<5><<<dim3((unsigned)(lr / 16), (unsigned)S), 256, 0, st>>>(
@@ -1413,6 +1647,13 @@ static int hcf_launch(const RadArgs* a, RadStream s, const HcPlan& p, float eps,
     if (RTu == 1) HCF_UP(1); else HCF_UP(2);
 #undef HCF_UP
     return hipGetLastError() == hipSuccess ? RAD_OK : HALO_NO(RAD_E_DEVICE);
+}
+
+/* hc_write then hc_read as one op: operands 11 and 12 are the write's y and inj. */
+extern "C" int halo_rad_hc_read(const RadArgs* a, RadStream s);
+extern "C" int halo_rad_hc_write_read(const RadArgs* a, RadStream s) {
+    if (!halo_opt(a, HCR_Y) || !halo_opt(a, HCR_INJI)) return HALO_NO(RAD_E_INVAL);
+    return halo_rad_hc_read(a, s);
 }
 
 extern "C" int halo_rad_hc_read(const RadArgs* a, RadStream s) {
@@ -1467,6 +1708,7 @@ extern "C" int halo_rad_hc_read(const RadArgs* a, RadStream s) {
         const int frc = hcf_launch(a, s, p, eps, wadd);
         if (frc != 1) return frc;
     }
+    if (const int wrc = hc_write_first(a, s); wrc != RAD_OK) return wrc;
     /* The general path below reads h as contiguous rows, in its own scratch layout. */
     if (hrow != HN) return HALO_NO(RAD_E_STRIDE);
     if (!a->scratch || (size_t)a->scratch_bytes < p.bytes) return HALO_NO(RAD_E_SCRATCH);

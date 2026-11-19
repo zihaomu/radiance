@@ -1739,11 +1739,20 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
     if (m.op_rope_cs && T <= qk_fuse_rows(g) && !rope_mixed(batch))
         RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
 
+    /* A feed-forward's write is left to the next layer's read, which folds it in front of
+     * itself (HyperConn::read_after), unless something reads or changes the stream between. */
+    const bool fold = !dbg_resid_on();
+    const HyperConn* pend = nullptr;
     for (int64_t li = 0; li < (int64_t)m.layers.size(); ++li) {
         const Layer& l = m.layers[(size_t)li];
         /* Before the attention connection reads the stream, which is where the reference puts it. */
-        if (li == m.ple_layer) m.ple.step(c, batch);
-        l.hc_mix.read_pieces(c, T);
+        if (li == m.ple_layer) {
+            if (pend) { pend->write(c, T, 0, T); pend = nullptr; }
+            m.ple.step(c, batch);
+        }
+        if (pend) l.hc_mix.read_after(c, T, *pend);
+        else      l.hc_mix.read_pieces(c, T);
+        pend = nullptr;
         /* The calibration taps read the codes the mixer's GEMMs read: its input before it runs,
          * its output projection's input before the feed-forward's connection reuses the pair. */
         if (l.cs_in >= 0) m.calib.tap(c, (size_t)l.cs_in, T);
@@ -1752,15 +1761,21 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
         if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch); }
         else        l.gdn.step(c, batch);
         if (l.cs_o >= 0) m.calib.tap(c, (size_t)l.cs_o, T);
-        l.hc_mix.write(c, T, 0, T);
-        dbg_resid(c, (int)li, "mix", g.n_embd, m.b_h, m.a_x.x);
-        l.hc_ffn.read_pieces(c, T);
+        if (fold) {
+            l.hc_ffn.read_after(c, T, l.hc_mix);
+        } else {
+            l.hc_mix.write(c, T, 0, T);
+            dbg_resid(c, (int)li, "mix", g.n_embd, m.b_h, m.a_x.x);
+            l.hc_ffn.read_pieces(c, T);
+        }
         l.mlp.step(c, batch);
+        if (fold && !l.proj.op) { pend = &l.hc_ffn; continue; }
         l.hc_ffn.write(c, T, 0, T);
         /* The request's control vector, on the stream the write just finished. */
         l.proj.step(c, batch, 0, T);
         dbg_resid(c, (int)li, "ffn", g.n_embd, m.b_h, m.a_x.x);
     }
+    if (pend) pend->write(c, T, 0, T);
     m.calib.after_step(c, T);
 }
 
