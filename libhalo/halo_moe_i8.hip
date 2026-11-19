@@ -467,25 +467,12 @@ __device__ void gemv_expert(const Route& R, const Cls& c, uint32_t ex, uint32_t 
         if (r < cnt && writer) R.Y[(size_t)(y + r) * R.y_ld + n0 + col] = f32_to_bf16(0.f + acc[r] * rs);
 }
 
+/* Rows [y, r1) of expert `ex`, at most MT row tiles: dec_expert's WMMA form. */
 template <uint32_t MT, uint32_t SUB, class MAKE>
-__device__ void dec_expert(const Route& R, const Cls (&cl)[2], uint8_t* lds, int8_t* tab, MAKE make) {
+__device__ void rows_expert(const Route& R, const Cls& c, uint32_t ex, uint32_t y, uint32_t r1,
+                            uint8_t* lds, int8_t* tab, MAKE make) {
     const uint32_t lane = threadIdx.x & (kWave - 1u), half = lane >> 4, slot = lane & 15u;
-    const uint32_t y = blockIdx.y, n0 = blockIdx.x * (16u * kDecW) + (threadIdx.x / kWave) * 16u;
-    const uint32_t live = (uint32_t)R.off[R.n_expert];
-    /* Block-uniform exits only until the GEMV's barrier. */
-    if (y >= live) {
-        if (y == live && n0 < R.N)
-            for (uint32_t i = live + half; i < R.T; i += 2u) R.Y[(size_t)i * R.y_ld + n0 + slot] = 0;
-        return;
-    }
-    const uint32_t ex = expert_of(R.off, R.n_expert, y);
-    if ((uint32_t)R.off[ex] != y) return;
-    const uint32_t r1 = (uint32_t)R.off[ex + 1u];
-    const Cls c = pick(cl, ex);
-    if (r1 - y <= 4u) {
-        gemv_expert<4, SUB>(R, c, ex, y, r1, lds, tab, make);
-        return;
-    }
+    const uint32_t n0 = blockIdx.x * (16u * kDecW) + (threadIdx.x / kWave) * 16u;
     uint8_t* tr = lds + (threadIdx.x / kWave) * (16u * kPitch);
     if (n0 >= R.N) return;
     if (n0 >= c.n) {   /* a narrower class: its columns past n are zero */
@@ -569,11 +556,70 @@ __device__ void dec_expert(const Route& R, const Cls (&cl)[2], uint8_t* lds, int
         }
 }
 
+template <uint32_t MT, uint32_t SUB, class MAKE>
+__device__ void dec_expert(const Route& R, const Cls (&cl)[2], uint8_t* lds, int8_t* tab, MAKE make) {
+    const uint32_t lane = threadIdx.x & (kWave - 1u), half = lane >> 4, slot = lane & 15u;
+    const uint32_t y = blockIdx.y, n0 = blockIdx.x * (16u * kDecW) + (threadIdx.x / kWave) * 16u;
+    const uint32_t live = (uint32_t)R.off[R.n_expert];
+    /* Block-uniform exits only until the GEMV's barrier. */
+    if (y >= live) {
+        if (y == live && n0 < R.N)
+            for (uint32_t i = live + half; i < R.T; i += 2u) R.Y[(size_t)i * R.y_ld + n0 + slot] = 0;
+        return;
+    }
+    const uint32_t ex = expert_of(R.off, R.n_expert, y);
+    if ((uint32_t)R.off[ex] != y) return;
+    const uint32_t r1 = (uint32_t)R.off[ex + 1u];
+    const Cls c = pick(cl, ex);
+    if (r1 - y <= 4u) {
+        gemv_expert<4, SUB>(R, c, ex, y, r1, lds, tab, make);
+        return;
+    }
+    rows_expert<MT, SUB>(R, c, ex, y, r1, lds, tab, make);
+}
+
+/* The prefill form: a block per (expert, 128 output columns), the expert's rows in passes of
+ * MT row tiles, each pass decoding the expert's weights once for all its rows (tile() decodes
+ * them once a 16-row tile, and again in every tile an expert's run crosses). Block row
+ * n_expert zeroes the rows past the live ones. The arithmetic is dec_expert's, so the output
+ * is tile()'s byte for byte. */
+template <uint32_t MT, uint32_t SUB, class MAKE>
+__device__ void pf_expert(const Route& R, const Cls (&cl)[2], uint8_t* lds, int8_t* tab, MAKE make) {
+    const uint32_t lane = threadIdx.x & (kWave - 1u), half = lane >> 4, slot = lane & 15u;
+    const uint32_t ex = blockIdx.y, n0 = blockIdx.x * (16u * kDecW) + (threadIdx.x / kWave) * 16u;
+    if (ex == R.n_expert) {
+        const uint32_t live = (uint32_t)R.off[R.n_expert];
+        if (n0 < R.N)
+            for (uint32_t i = live + half; i < R.T; i += 2u) R.Y[(size_t)i * R.y_ld + n0 + slot] = 0;
+        return;
+    }
+    const uint32_t y0 = (uint32_t)R.off[ex], r1 = (uint32_t)R.off[ex + 1u];
+    if (y0 >= r1) return;
+    const Cls c = pick(cl, ex);
+    for (uint32_t y = y0; y < r1; y += MT * 16u)
+        rows_expert<MT, SUB>(R, c, ex, y, y + MT * 16u < r1 ? y + MT * 16u : r1, lds, tab, make);
+}
+
 template <uint32_t MT>
 __global__ __launch_bounds__(kDecW * kWave) void moe_w4nl_dec_kernel(Route R, Cls c0, Cls c1) {
     __shared__ __attribute__((aligned(16))) uint8_t s_tr[kDecW][16 * kPitch];
     const Cls cl[2] = { c0, c1 };
     dec_expert<MT, W4nl::kSub>(R, cl, &s_tr[0][0], nullptr, W4Make{});
+}
+
+template <uint32_t MT>
+__global__ __launch_bounds__(kDecW * kWave) void moe_w4nl_pf_kernel(Route R, Cls c0, Cls c1) {
+    __shared__ __attribute__((aligned(16))) uint8_t s_tr[kDecW][16 * kPitch];
+    const Cls cl[2] = { c0, c1 };
+    pf_expert<MT, W4nl::kSub>(R, cl, &s_tr[0][0], nullptr, W4Make{});
+}
+
+template <class F, uint32_t MT>
+__global__ __launch_bounds__(kDecW * kWave) void moe_iqr_pf_kernel(Route R, Cls c0, Cls c1) {
+    __shared__ __attribute__((aligned(16))) uint8_t s_tr[kDecW][16 * kPitch];
+    __shared__ __attribute__((aligned(16))) int8_t s_tab[Dec<F>::kTab];
+    const Cls cl[2] = { c0, c1 };
+    pf_expert<MT, Iqr<F>::kSub>(R, cl, &s_tr[0][0], s_tab, IqrMake<F>{});
 }
 
 template <class F, uint32_t MT>
@@ -682,6 +728,15 @@ bool dec_form(const Ops& o) {
     const char* e = std::getenv("HALO_MOE_DEC");
     return !(e && *e == '0');
 }
+/* The prefill form's pass depth (pf_expert), or 0 for tile(): HALO_MOE_PF overrides. */
+uint32_t pf_mt(const Ops& o) {
+    const char* e = std::getenv("HALO_MOE_PF");
+    const uint32_t mt = e && *e ? (uint32_t)std::atoi(e) : 2u;
+    return o.n_expert + 1 <= 65535 && (mt == 1u || mt == 2u || mt == 4u) ? mt : 0u;
+}
+dim3 pf_grid(const Ops& o) {
+    return dim3((unsigned)((o.N + 16 * kDecW - 1) / (16 * kDecW)), (unsigned)(o.n_expert + 1));
+}
 dim3 dec_grid(const Ops& o) {
     return dim3((unsigned)((o.N + 16 * kDecW - 1) / (16 * kDecW)), (unsigned)o.T);
 }
@@ -729,6 +784,14 @@ int w4nl_run(const RadArgs* a, RadStream s) {
         else hipLaunchKernelGGL(moe_w4nl_dec_kernel<4>, g, b, 0, st, route_of(o), cl[0], cl[1]);
         return hipGetLastError() == hipSuccess ? RAD_OK : HALO_NO(RAD_E_DEVICE);
     }
+    if (const uint32_t mt = pf_mt(o)) {
+        const dim3 g = pf_grid(o), b(kDecW * kWave);
+        hipStream_t st = (hipStream_t)s;
+        if (mt == 1) hipLaunchKernelGGL(moe_w4nl_pf_kernel<1>, g, b, 0, st, route_of(o), cl[0], cl[1]);
+        else if (mt == 2) hipLaunchKernelGGL(moe_w4nl_pf_kernel<2>, g, b, 0, st, route_of(o), cl[0], cl[1]);
+        else hipLaunchKernelGGL(moe_w4nl_pf_kernel<4>, g, b, 0, st, route_of(o), cl[0], cl[1]);
+        return hipGetLastError() == hipSuccess ? RAD_OK : HALO_NO(RAD_E_DEVICE);
+    }
     hipLaunchKernelGGL(moe_w4nl_i8_kernel, grid_of(o), dim3(kWaves * kWave), 0, (hipStream_t)s,
                        route_of(o), cl[0], cl[1]);
     return hipGetLastError() == hipSuccess ? RAD_OK : HALO_NO(RAD_E_DEVICE);
@@ -742,6 +805,15 @@ int iqr_dec_go(const Ops& o, const Cls (&cl)[2], hipStream_t st) {
     if (o.T <= 16) hipLaunchKernelGGL((moe_iqr_dec_kernel<F, 1>), g, b, 0, st, route_of(o), cl[0], cl[1]);
     else if (o.T <= 32) hipLaunchKernelGGL((moe_iqr_dec_kernel<F, 2>), g, b, 0, st, route_of(o), cl[0], cl[1]);
     else hipLaunchKernelGGL((moe_iqr_dec_kernel<F, 4>), g, b, 0, st, route_of(o), cl[0], cl[1]);
+    return hipGetLastError() == hipSuccess ? RAD_OK : HALO_NO(RAD_E_DEVICE);
+}
+
+template <class F>
+int iqr_pf_go(const Ops& o, const Cls (&cl)[2], hipStream_t st, uint32_t mt) {
+    const dim3 g = pf_grid(o), b(kDecW * kWave);
+    if (mt == 1) hipLaunchKernelGGL((moe_iqr_pf_kernel<F, 1>), g, b, 0, st, route_of(o), cl[0], cl[1]);
+    else if (mt == 2) hipLaunchKernelGGL((moe_iqr_pf_kernel<F, 2>), g, b, 0, st, route_of(o), cl[0], cl[1]);
+    else hipLaunchKernelGGL((moe_iqr_pf_kernel<F, 4>), g, b, 0, st, route_of(o), cl[0], cl[1]);
     return hipGetLastError() == hipSuccess ? RAD_OK : HALO_NO(RAD_E_DEVICE);
 }
 
@@ -787,6 +859,7 @@ int iqr_run(const RadArgs* a, RadStream s) {
     if (dec_form(o)) return iqr_dec_launch(kw, o, cl, st);
 #define HALO_MOE_IQR_GO(b, l)                                                                  \
     if (kw == HALO_MOE_IQR_T(b, l)::word()) {                                                  \
+        if (const uint32_t mt = pf_mt(o)) return iqr_pf_go<HALO_MOE_IQR_T(b, l)>(o, cl, st, mt);\
         hipLaunchKernelGGL(moe_iqr_i8_kernel<HALO_MOE_IQR_T(b, l)>, grid_of(o),                \
                            dim3(kWaves * kWave), 0, st, route_of(o), cl[0], cl[1]);            \
         return hipGetLastError() == hipSuccess ? RAD_OK : HALO_NO(RAD_E_DEVICE);               \
