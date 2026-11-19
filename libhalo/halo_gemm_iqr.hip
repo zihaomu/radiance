@@ -122,7 +122,7 @@ constexpr uint32_t kFusedWaves = 4, kPitch = 136;
 
 /* ONE (M == 1): the activation row and its scales are wave-uniform, read as scalar loads, so
  * the next unit's codes and fold scale, issued a unit ahead, are not waited on with them. */
-template <class F, uint32_t MT, bool ONE = false>
+template <class F, uint32_t MT, bool ONE = false, uint32_t KS = 1>
 __global__ __launch_bounds__(kFusedWaves * kWave) void iqr_fused_kernel(
         Ctx c, const int8_t* __restrict__ A, const float* __restrict__ As,
         __hip_bfloat16* __restrict__ Y, uint32_t M, uint32_t N, uint32_t a_ld, uint32_t sa_ld) {
@@ -133,8 +133,10 @@ __global__ __launch_bounds__(kFusedWaves * kWave) void iqr_fused_kernel(
     c.tab = s_tab;
     D::stage(s_tab, c, tid, kFusedWaves * kWave);
     __syncthreads();
-    const uint32_t rt = blockIdx.x * kFusedWaves + wave;
-    if (rt * 16u >= N) return;
+    static_assert(KS == 1 || MT == 1, "split K is the one-tile (M <= 16) form's");
+    const uint32_t rt = blockIdx.x * (kFusedWaves / KS) + wave / KS, ks = wave % KS;
+    const uint32_t kb0 = ks * c.nkb / KS, kb1 = (ks + 1u) * c.nkb / KS;
+    if (KS == 1 && rt * 16u >= N) return;
     const uint32_t slot = lane & 15u, half = lane >> 4, n = rt * 16u + slot;
     uint8_t* tr = s_tr[wave];
     const int8_t* ap[MT];
@@ -149,14 +151,14 @@ __global__ __launch_bounds__(kFusedWaves * kWave) void iqr_fused_kernel(
     typename D::Raw cur{};
     float ws_cur = 0.f;
     if constexpr (ONE) {
-        cur = D::fetch(c, rt, 0, lane, true);
-        ws_cur = fold_f32<F>(c, n, 0);
+        cur = D::fetch(c, rt, kb0, lane, true);
+        ws_cur = fold_f32<F>(c, n, kb0);
     }
-    for (uint32_t kb = 0; kb < c.nkb; ++kb) {
+    for (uint32_t kb = kb0; kb < kb1; ++kb) {
         typename D::Raw nxt{};
         float ws_nxt = 0.f;
         if constexpr (ONE) {
-            const uint32_t kn = kb + 1u < c.nkb ? kb + 1u : kb;
+            const uint32_t kn = kb + 1u < kb1 ? kb + 1u : kb;
             nxt = D::fetch(c, rt, kn, lane, true);
             ws_nxt = fold_f32<F>(c, n, kn);
         }
@@ -204,6 +206,18 @@ __global__ __launch_bounds__(kFusedWaves * kWave) void iqr_fused_kernel(
             cur = nxt;
             ws_cur = ws_nxt;
         }
+    }
+    if constexpr (KS > 1) {
+        /* The K slices of a tile meet in LDS; the first slice's wave sums them in slice order. */
+        __shared__ float s_red[kFusedWaves][8][kWave];
+#pragma unroll
+        for (uint32_t e = 0; e < 8; ++e) s_red[wave][e][lane] = acc[0][e];
+        __syncthreads();
+        if (ks) return;
+#pragma unroll
+        for (uint32_t j = 1; j < KS; ++j)
+#pragma unroll
+            for (uint32_t e = 0; e < 8; ++e) acc[0][e] += s_red[wave + j][e][lane];
     }
     const float rs = row_scale<F>(c, n);
 #pragma unroll
@@ -379,6 +393,20 @@ template <class F, uint32_t MT>
 int launch_fused(const Operands& g, hipStream_t st) {
     const uint32_t ntile = (uint32_t)(g.N / 16);
     const char* one = std::getenv("HALO_IQR_ONE");
+    const char* kse = std::getenv("HALO_IQR_KS");
+    const uint32_t ks = kse ? (uint32_t)std::atoi(kse) : 4u;
+    const bool m1 = g.M == 1 && !(one && *one == '0');
+    const char* kme = std::getenv("HALO_IQR_KS_M");
+    const long long ksm = kme ? std::atoll(kme) : 16;
+    if (MT == 1 && g.M <= ksm && (ks == 2 || ks == 4) && g.nkb >= ks && ntile % (kFusedWaves / ks) == 0) {
+        auto k = m1 ? (ks == 4 ? iqr_fused_kernel<F, 1, true, 4> : iqr_fused_kernel<F, 1, true, 2>)
+                    : (ks == 4 ? iqr_fused_kernel<F, 1, false, 4> : iqr_fused_kernel<F, 1, false, 2>);
+        hipLaunchKernelGGL(k, dim3(ntile / (kFusedWaves / ks)), dim3(kFusedWaves * kWave), 0, st,
+                           ctx_of(g), (const int8_t*)g.a->data, (const float*)g.as->data,
+                           (__hip_bfloat16*)g.y->data, (uint32_t)g.M, (uint32_t)g.N,
+                           (uint32_t)g.a_ld, (uint32_t)g.sa_ld);
+        return hipGetLastError() == hipSuccess ? RAD_OK : HALO_NO(RAD_E_DEVICE);
+    }
     if (MT == 1 && g.M == 1 && !(one && *one == '0')) {
         hipLaunchKernelGGL((iqr_fused_kernel<F, 1, true>), dim3((ntile + kFusedWaves - 1) / kFusedWaves),
                            dim3(kFusedWaves * kWave), 0, st, ctx_of(g), (const int8_t*)g.a->data,
