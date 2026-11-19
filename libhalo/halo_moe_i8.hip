@@ -380,11 +380,13 @@ __device__ __forceinline__ void halve(int32_t (&v)[16], uint32_t lane) {
  * read a unit ahead. A unit's 16 column sums close by halving across the lanes (16 shuffles):
  * the exact int32 sums the WMMA forms, folded in the same order with the same factors, so the
  * output is theirs byte for byte. */
-template <uint32_t RMAX, uint32_t SUB, class MAKE>
+/* KS > 1: a 16-column tile's K split over KS waves of the block, met in LDS (the launcher
+ * keeps every tile of the block live, so no wave leaves before that barrier). */
+template <uint32_t RMAX, uint32_t SUB, class MAKE, uint32_t KS = 1>
 __device__ void gemv_expert(const Route& R, const Cls& c, uint32_t ex, uint32_t y, uint32_t r1,
                             uint8_t* lds, int8_t* tab, MAKE make) {
-    const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1u);
-    const uint32_t n0 = blockIdx.x * (16u * kDecW) + (tid / kWave) * 16u;
+    const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1u), wv = tid / kWave, ks = wv % KS;
+    const uint32_t n0 = blockIdx.x * (16u * kDecW / KS) + (wv / KS) * 16u;
     constexpr uint32_t SUBS = 128u / SUB;
     const uint32_t cnt = r1 - y, K = c.k, nsc = (K + R.a_group - 1u) / R.a_group;
     int8_t* sa = (int8_t*)lds;
@@ -421,12 +423,13 @@ __device__ void gemv_expert(const Route& R, const Cls& c, uint32_t ex, uint32_t 
     float acc[RMAX];
 #pragma unroll
     for (uint32_t r = 0; r < RMAX; ++r) acc[r] = 0.f;
-    auto cur = W.fetch(n0, 0, lane);
+    const uint32_t kb0 = ks * nkb / KS, kb1 = (ks + 1u) * nkb / KS;
+    auto cur = W.fetch(n0, kb0, lane);
     float ws[SUBS];
 #pragma unroll
-    for (uint32_t sg = 0; sg < SUBS; ++sg) ws[sg] = W.fold(n0 + col, sg);
-    for (uint32_t kb = 0; kb < nkb; ++kb) {
-        const uint32_t kn = kb + 1u < nkb ? kb + 1u : kb;
+    for (uint32_t sg = 0; sg < SUBS; ++sg) ws[sg] = W.fold(n0 + col, kb0 * SUBS + sg);
+    for (uint32_t kb = kb0; kb < kb1; ++kb) {
+        const uint32_t kn = kb + 1u < kb1 ? kb + 1u : kb;
         const auto nxt = W.fetch(n0, kn, lane);
         float wn[SUBS];
 #pragma unroll
@@ -460,6 +463,17 @@ __device__ void gemv_expert(const Route& R, const Cls& c, uint32_t ex, uint32_t 
     }
     /* ws[] above is the scale of this lane's own column for each sub-group: under SUBS 2 the
      * lane's half only selects which partial it holds first, both halves fold both. */
+    if constexpr (KS > 1) {
+        __shared__ float s_red[kDecW][RMAX][kWave];
+#pragma unroll
+        for (uint32_t r = 0; r < RMAX; ++r) s_red[wv][r][lane] = acc[r];
+        __syncthreads();
+        if (ks) return;
+#pragma unroll
+        for (uint32_t j = 1; j < KS; ++j)
+#pragma unroll
+            for (uint32_t r = 0; r < RMAX; ++r) acc[r] += s_red[wv + j][r][lane];
+    }
     const float rs = W.row(n0 + col);
     const bool writer = SUBS == 1u ? (lane & 1u) == 0u : lane < 16u;
 #pragma unroll
@@ -556,10 +570,10 @@ __device__ void rows_expert(const Route& R, const Cls& c, uint32_t ex, uint32_t 
         }
 }
 
-template <uint32_t MT, uint32_t SUB, class MAKE>
+template <uint32_t MT, uint32_t SUB, class MAKE, uint32_t KS = 1>
 __device__ void dec_expert(const Route& R, const Cls (&cl)[2], uint8_t* lds, int8_t* tab, MAKE make) {
     const uint32_t lane = threadIdx.x & (kWave - 1u), half = lane >> 4, slot = lane & 15u;
-    const uint32_t y = blockIdx.y, n0 = blockIdx.x * (16u * kDecW) + (threadIdx.x / kWave) * 16u;
+    const uint32_t y = blockIdx.y, n0 = blockIdx.x * (16u * kDecW / KS) + (threadIdx.x / kWave / KS) * 16u;
     const uint32_t live = (uint32_t)R.off[R.n_expert];
     /* Block-uniform exits only until the GEMV's barrier. */
     if (y >= live) {
@@ -571,11 +585,11 @@ __device__ void dec_expert(const Route& R, const Cls (&cl)[2], uint8_t* lds, int
     if ((uint32_t)R.off[ex] != y) return;
     const uint32_t r1 = (uint32_t)R.off[ex + 1u];
     const Cls c = pick(cl, ex);
-    if (r1 - y <= 4u) {
-        gemv_expert<4, SUB>(R, c, ex, y, r1, lds, tab, make);
+    if (KS > 1 || r1 - y <= 4u) {
+        gemv_expert<4, SUB, MAKE, KS>(R, c, ex, y, r1, lds, tab, make);
         return;
     }
-    rows_expert<MT, SUB>(R, c, ex, y, r1, lds, tab, make);
+    if constexpr (KS == 1) rows_expert<MT, SUB>(R, c, ex, y, r1, lds, tab, make);
 }
 
 /* The prefill form: a block per (expert, 128 output columns), the expert's rows in passes of
@@ -622,12 +636,12 @@ __global__ __launch_bounds__(kDecW * kWave) void moe_iqr_pf_kernel(Route R, Cls 
     pf_expert<MT, Iqr<F>::kSub>(R, cl, &s_tr[0][0], s_tab, IqrMake<F>{});
 }
 
-template <class F, uint32_t MT>
+template <class F, uint32_t MT, uint32_t KS = 1>
 __global__ __launch_bounds__(kDecW * kWave) void moe_iqr_dec_kernel(Route R, Cls c0, Cls c1) {
     __shared__ __attribute__((aligned(16))) uint8_t s_tr[kDecW][16 * kPitch];
     __shared__ __attribute__((aligned(16))) int8_t s_tab[Dec<F>::kTab];
     const Cls cl[2] = { c0, c1 };
-    dec_expert<MT, Iqr<F>::kSub>(R, cl, &s_tr[0][0], s_tab, IqrMake<F>{});
+    dec_expert<MT, Iqr<F>::kSub, IqrMake<F>, KS>(R, cl, &s_tr[0][0], s_tab, IqrMake<F>{});
 }
 
 /* The routing and output operands shared by both rows, checked as halo_moe_gemm_q.hip's launcher
@@ -737,6 +751,19 @@ uint32_t pf_mt(const Ops& o) {
 dim3 pf_grid(const Ops& o) {
     return dim3((unsigned)((o.N + 16 * kDecW - 1) / (16 * kDecW)), (unsigned)(o.n_expert + 1));
 }
+
+/* The decode GEMV's K split (0: none): 4 for a single token's rows unless HALO_MOE_KS says
+ * 1, 2 or 4 (measured: gate_up 1 token cold 110 -> 90 us; 4 tokens no gain, down no gain).
+ * Every expert then has at most 4 rows (one a token) and every tile of a block is live. */
+uint32_t dec_ks(const Ops& o) {
+    const char* e = std::getenv("HALO_MOE_KS");
+    const long long ks = e ? std::atoll(e) : (o.T <= o.top_k ? 4 : 1);
+    if ((ks == 2 || ks == 4) && o.T <= 4 * o.top_k && o.Nc[0] == o.N && o.Nc[1] == o.N &&
+        o.N % (16 * kDecW / ks) == 0 && o.K / 128 >= ks)
+        return (uint32_t)ks;
+    return 0;
+}
+
 dim3 dec_grid(const Ops& o) {
     return dim3((unsigned)((o.N + 16 * kDecW - 1) / (16 * kDecW)), (unsigned)o.T);
 }
@@ -802,6 +829,12 @@ int w4nl_run(const RadArgs* a, RadStream s) {
 template <class F>
 int iqr_dec_go(const Ops& o, const Cls (&cl)[2], hipStream_t st) {
     const dim3 g = dec_grid(o), b(kDecW * kWave);
+    if (const uint32_t ks = dec_ks(o)) {
+        const dim3 gk((unsigned)(o.N / (16 * kDecW / ks)), (unsigned)o.T);
+        auto k = ks == 4 ? moe_iqr_dec_kernel<F, 1, 4> : moe_iqr_dec_kernel<F, 1, 2>;
+        hipLaunchKernelGGL(k, gk, b, 0, st, route_of(o), cl[0], cl[1]);
+        return hipGetLastError() == hipSuccess ? RAD_OK : HALO_NO(RAD_E_DEVICE);
+    }
     if (o.T <= 16) hipLaunchKernelGGL((moe_iqr_dec_kernel<F, 1>), g, b, 0, st, route_of(o), cl[0], cl[1]);
     else if (o.T <= 32) hipLaunchKernelGGL((moe_iqr_dec_kernel<F, 2>), g, b, 0, st, route_of(o), cl[0], cl[1]);
     else hipLaunchKernelGGL((moe_iqr_dec_kernel<F, 4>), g, b, 0, st, route_of(o), cl[0], cl[1]);
