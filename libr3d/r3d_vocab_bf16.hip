@@ -775,6 +775,82 @@ __global__ __launch_bounds__(128) void logits_joined_wave(const uint16_t* activa
     if (lane == 0) output[blockIdx.y * output_pitch + column] = accumulator;
 }
 
+// logits_joined_staged_strict's per-output chain (k ascending, fmul code*scale, fmul, fadd), with the
+// int8 codes streamed 16 bytes a load through a raw-byte LDS tile; the next group waits in registers.
+template<int Columns>
+__global__ __launch_bounds__(Columns) void logits_joined_stream(const uint16_t* activation,
+    const RadPlanesHeader* header, float* output, int columns, int64_t available) {
+    if (r3d_head::header(header, columns, 2560, available) != RAD_OK) return;
+    const auto* entries = reinterpret_cast<const RadPlanesEntry*>(header + 1);
+    const auto* base = reinterpret_cast<const uint8_t*>(header);
+    if (uint64_t(header->bytes) > UINTPTR_MAX - reinterpret_cast<uintptr_t>(base)) return;
+    const auto& codes = entries[0];
+    const auto& scales = entries[1];
+    constexpr int pitch = 144;
+    __shared__ float inputs[2560];
+    __shared__ __align__(16) uint8_t tile[Columns * pitch];
+    const int tid = threadIdx.x, first_column = blockIdx.x * Columns, column = first_column + tid;
+    for (int position = tid; position < 2560; position += Columns) inputs[position] = bf16_to_f32(activation[position]);
+    float accumulator = 0;
+    if (codes.dtype != RAD_I8 || scales.dtype != RAD_BF16 || scales.block[0] != 1 || scales.block[1] != 128) {
+        __syncthreads();
+        if (column >= columns) return;
+        for (int position = 0; position < 2560; ++position) {
+            const int64_t scale_row = scales.block[0] ? column / scales.block[0] : 0;
+            const int64_t scale_column = scales.block[1] ? position / scales.block[1] : 0;
+            const uint8_t* address = base + scales.offset + scale_row * scales.row_bytes
+                + scale_column * r3d_head::scale_bytes(scales.dtype);
+            const float multiplier = scales.dtype == RAD_F32 ? *reinterpret_cast<const float*>(address)
+                : scales.dtype == RAD_BF16 ? bf16_to_f32(*reinterpret_cast<const uint16_t*>(address))
+                : f16_to_f32(*reinterpret_cast<const uint16_t*>(address));
+            const uint8_t code = base[codes.offset + int64_t(column) * codes.row_bytes + position];
+            const float value = __fmul_rn(codes.dtype == RAD_I8 ? float(static_cast<int8_t>(code)) : e4m3_to_f32(code), multiplier);
+            accumulator = __fadd_rn(accumulator, __fmul_rn(inputs[position], value));
+        }
+        output[column] = accumulator;
+        return;
+    }
+    const uint8_t* code_base = base + codes.offset;
+    const uint8_t* scale_line = base + scales.offset + int64_t(column < columns ? column : 0) * scales.row_bytes;
+    uint32_t factor_words[10];
+#pragma unroll
+    for (int index = 0; index < 10; ++index) __builtin_memcpy(&factor_words[index], scale_line + index * 4, 4);
+    uint4 staged[8];
+    auto fetch = [&](int group) {
+#pragma unroll
+        for (int index = 0; index < 8; ++index) {
+            const int slot = index * Columns + tid, row = first_column + slot / 8;
+            uint4 packed{};
+            if (row < columns) __builtin_memcpy(&packed, code_base + int64_t(row) * codes.row_bytes + group * 128 + (slot % 8) * 16, 16);
+            staged[index] = packed;
+        }
+    };
+    fetch(0);
+    for (int group = 0; group < 20; ++group) {
+        __syncthreads();
+#pragma unroll
+        for (int index = 0; index < 8; ++index) {
+            const int slot = index * Columns + tid;
+            *reinterpret_cast<uint4*>(tile + (slot / 8) * pitch + (slot % 8) * 16) = staged[index];
+        }
+        __syncthreads();
+        if (group + 1 < 20) fetch(group + 1);
+        const float factor = bf16_to_f32(uint16_t(factor_words[group / 2] >> ((group & 1) * 16)));
+        const float* x = inputs + group * 128;
+#pragma unroll
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            const uint4 packed = *reinterpret_cast<const uint4*>(tile + tid * pitch + chunk * 16);
+            const uint32_t words[4]{packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+            for (int byte = 0; byte < 16; ++byte) {
+                const float value = __fmul_rn(float(int8_t(words[byte >> 2] >> ((byte & 3) * 8))), factor);
+                accumulator = __fadd_rn(accumulator, __fmul_rn(x[chunk * 16 + byte], value));
+            }
+        }
+    }
+    if (column < columns) output[column] = accumulator;
+}
+
 int joined_strict_run(const RadArgs* args, RadStream stream) {
     const RadTensor& activation = args->t[0];
     const RadTensor& weight = args->t[1];
@@ -820,6 +896,13 @@ int joined_strict_run(const RadArgs* args, RadStream stream) {
             reinterpret_cast<hipStream_t>(stream), static_cast<const uint16_t*>(activation.data),
             static_cast<const RadPlanesHeader*>(weight.data), static_cast<float*>(output.data),
             int(columns), activation.stride[0], output.stride[0], available);
+        return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    }
+    if (reduction == 2560 && activation.shape[0] == 1 && r3d_exact_path("RAD_LOGITS_STREAM")) {
+        R3D_KLAUNCH(R3D_KNAME(logits_joined_stream<64>), dim3((columns + 63) / 64), dim3(64),
+            reinterpret_cast<hipStream_t>(stream), static_cast<const uint16_t*>(activation.data),
+            static_cast<const RadPlanesHeader*>(weight.data), static_cast<float*>(output.data),
+            int(columns), available);
         return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
     }
     const bool staged = r3d_exact_path("RAD_LOGITS_STAGED");

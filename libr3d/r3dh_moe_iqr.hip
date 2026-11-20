@@ -446,6 +446,146 @@ int table(const RadTensor& tensor, bool weight, int rows, int entries, Table* ou
     *output = Table{static_cast<const uint8_t*>(tensor.data), static_cast<uint64_t>(tensor.stride[0])};
     return RAD_OK;
 }
+
+// Decode gate_up: the same integer group sums as gate_up_dot4, with K interleaved over four waves per row half.
+// weight = bytesum((state * multiplier + increment) & 0x3f3f3f3f) - 126, so a group's sum is
+// sum_k x_k * bytesum_k - 126 * sum_k x_k; the float chain over the 20 groups keeps its order.
+constexpr int split_columns = 64, split_pitch = 68;
+__global__ __launch_bounds__(256) void gate_up_split(Call call, const int2* map) {
+    const int2 task = map[blockIdx.y];
+    if (task.x == -2) return;
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, half = wave & 1, quarter = wave >> 1;
+    const int first = task.y, total = call.geometry.tokens * 10;
+    const bool routed = task.x >= 0;
+    const int boundary = routed ? call.offsets[task.x + 1] : total;
+    const int end = first + mapped_rows < boundary ? first + mapped_rows : boundary;
+    const int column_base = blockIdx.x * split_columns;
+    if (!routed) {
+        for (int index = tid; index < (end - first) * split_columns; index += 256) {
+            const int column = column_base + index % split_columns;
+            if (column < call.geometry.output_width)
+                call.output[(first + index / split_columns) * call.output_pitch + column] = 0;
+        }
+        return;
+    }
+    __shared__ uint32_t inputs[640];
+    __shared__ int group_inputs[20];
+    __shared__ float input_factors[20], group_factors[20];
+    __shared__ int sums[split_columns][21];
+    __shared__ uint32_t tiles[8][35 * split_pitch / 4];
+    const int parity = task.x & 1, width = call.geometry.width[parity];
+    const int part_width = call.geometry.output_width / 2;
+    const int first_row = (column_base / part_width) * (width / 2) + column_base % part_width;
+    const unsigned tile_row = unsigned(first_row + half * 32);
+    const auto* blob = entry(call.weight[parity], task.x / 2);
+    const auto* header = reinterpret_cast<const Header*>(blob);
+    const auto* codes = blob + sizeof(Header);
+    const auto* scales = reinterpret_cast<const float*>(entry(call.scale[parity], task.x / 2));
+    const uint32_t multiplier = header->multiplier & 0x00ffffffu, increment = header->increment;
+    uint32_t* tile = tiles[wave];
+    uint4 staged[5];
+    auto fetch = [&](int group) {
+#pragma unroll
+        for (int index = 0; index < 5; ++index) {
+            const int slot = index * 32 + lane, row = slot / 4;
+            uint4 packed{};
+            if (row < 35) {
+                const unsigned source_row = (tile_row & ~127u) | ((tile_row + unsigned(row) - 3u) & 127u);
+                __builtin_memcpy(&packed, codes + uint64_t(source_row) * 1280 + group * 64 + (slot % 4) * 16, 16);
+            }
+            staged[index] = packed;
+        }
+    };
+    for (int row = first; row < end; ++row) {
+        const int input_row = source(call, row, first, end);
+        __syncthreads();
+        if (tid < 160) {
+            uint4 packed{};
+            if (input_row >= 0) __builtin_memcpy(&packed, call.activation + input_row * call.activation_pitch + tid * 16, 16);
+            const uint32_t words[4]{packed.x, packed.y, packed.z, packed.w};
+            int partial = 0;
+#pragma unroll
+            for (int word = 0; word < 4; ++word) {
+                inputs[tid * 4 + word] = words[word];
+#pragma unroll
+                for (int byte = 0; byte < 4; ++byte) partial += int(int8_t(words[word] >> (byte * 8)));
+            }
+            partial += __shfl_xor(partial, 1, 8);
+            partial += __shfl_xor(partial, 2, 8);
+            partial += __shfl_xor(partial, 4, 8);
+            if ((tid & 7) == 0) group_inputs[tid / 8] = partial;
+        } else if (tid < 180) {
+            input_factors[tid - 160] = input_row >= 0 ? call.activation_scale[input_row * call.scale_pitch + tid - 160] : 0.0f;
+        } else if (tid < 200) {
+            group_factors[tid - 180] = scales[width + tid - 180];
+        }
+        fetch(quarter);
+        __syncthreads();
+        for (int step = 0; step < 5; ++step) {
+            const int group = quarter + 4 * step;
+#pragma unroll
+            for (int index = 0; index < 5; ++index) {
+                const int slot = index * 32 + lane, row_index = slot / 4;
+                if (row_index < 35) {
+                    uint32_t* target = tile + row_index * (split_pitch / 4) + (slot % 4) * 4;
+                    target[0] = staged[index].x; target[1] = staged[index].y;
+                    target[2] = staged[index].z; target[3] = staged[index].w;
+                }
+            }
+            __syncthreads();
+            if (step + 1 < 5) fetch(group + 4);
+            const uint32_t* xs = inputs + group * 32;
+            int sum = 0;
+#pragma unroll 4
+            for (int word = 0; word < 16; ++word) {
+                const uint32_t w0 = tile[(lane + 3) * (split_pitch / 4) + word];
+                const uint32_t w1 = tile[(lane + 2) * (split_pitch / 4) + word];
+                const uint32_t w2 = tile[(lane + 1) * (split_pitch / 4) + word];
+                const uint32_t w3 = tile[lane * (split_pitch / 4) + word];
+                constexpr uint32_t low = 0x0f0f0f0fu;
+                const uint32_t even_low = (w0 & low) | ((w1 & low) << 4);
+                const uint32_t even_high = (w2 & low) | ((w3 & low) << 4);
+                const uint32_t odd_low = ((w0 >> 4) & low) | (w1 & ~low);
+                const uint32_t odd_high = ((w2 >> 4) & low) | (w3 & ~low);
+                const uint32_t pairs[4]{__builtin_amdgcn_perm(even_high, even_low, 0x05010400u),
+                    __builtin_amdgcn_perm(odd_high, odd_low, 0x05010400u),
+                    __builtin_amdgcn_perm(even_high, even_low, 0x07030602u),
+                    __builtin_amdgcn_perm(odd_high, odd_low, 0x07030602u)};
+                const uint32_t x_words[2]{xs[word * 2], xs[word * 2 + 1]};
+#pragma unroll
+                for (int pair = 0; pair < 4; ++pair) {
+                    // pair p holds k = 4 * (p / 2) + (p & 1) in its low half and that k + 2 in its high half
+                    const uint32_t x_word = x_words[pair >> 1];
+                    const uint32_t low_byte = pair & 1, high_byte = low_byte + 2;
+                    const int low_input = int(__builtin_amdgcn_perm(x_word, x_word, low_byte * 0x01010101u));
+                    const int high_input = int(__builtin_amdgcn_perm(x_word, x_word, high_byte * 0x01010101u));
+                    const uint32_t low_value = ((pairs[pair] & 0xffffu) * multiplier + increment) & 0x3f3f3f3fu;
+                    const uint32_t high_value = ((pairs[pair] >> 16) * multiplier + increment) & 0x3f3f3f3fu;
+                    sum = __builtin_amdgcn_sudot4(false, int(low_value), true, low_input, sum, false);
+                    sum = __builtin_amdgcn_sudot4(false, int(high_value), true, high_input, sum, false);
+                }
+            }
+            sums[half * 32 + lane][group] = sum - 126 * group_inputs[group];
+            __syncthreads();
+        }
+        __syncthreads();
+        if (tid < split_columns) {
+            const int column = column_base + tid, local = column % part_width;
+            const int weight_row = (column / part_width) * (width / 2) + local;
+            const bool valid = column < call.geometry.output_width && local < width / 2;
+            float accumulator = 0;
+#pragma unroll
+            for (int group = 0; group < 20; ++group) {
+                const float scaled = static_cast<float>(sums[tid][group]) * input_factors[group];
+                accumulator = accumulator + scaled * group_factors[group];
+            }
+            if (column < call.geometry.output_width)
+                call.output[row * call.output_pitch + column]
+                    = valid && input_row >= 0 ? bf16(accumulator * scales[weight_row]) : 0;
+        }
+    }
+}
+
 }
 
 extern "C" int r3dh_moe_iqr_launch(const RadArgs* arguments, RadStream stream) {
@@ -496,6 +636,12 @@ extern "C" int r3dh_moe_iqr_launch(const RadArgs* arguments, RadStream stream) {
         build_run_map<<<1, 256, 0, native_stream>>>(call, map, capacity);
         if (hipGetLastError() != hipSuccess) return RAD_E_DEVICE;
         const dim3 grid((geometry.output_width + mapped_columns - 1) / mapped_columns, capacity);
+        const bool even = geometry.width[0] == geometry.output_width && geometry.width[1] == geometry.output_width
+            && (geometry.output_width / 2) % split_columns == 0;
+        if (geometry.tokens == 1 && even && r3d_exact_path("RAD_IQR_SPLIT")) {
+            gate_up_split<<<dim3(geometry.output_width / split_columns, capacity), 256, 0, native_stream>>>(call, map);
+            return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+        }
         const char* prefetch = std::getenv("RAD_IQR_PREFETCH");
         if (call.dot4 && prefetch && std::strcmp(prefetch, "0") != 0)
             gate_up_mapped<true><<<grid, 128, 0, native_stream>>>(call, map);
