@@ -570,7 +570,7 @@ __device__ void rows_expert(const Route& R, const Cls& c, uint32_t ex, uint32_t 
         }
 }
 
-template <uint32_t MT, uint32_t SUB, class MAKE, uint32_t KS = 1>
+template <uint32_t MT, uint32_t SUB, class MAKE, uint32_t KS = 1, bool GO = false>
 __device__ void dec_expert(const Route& R, const Cls (&cl)[2], uint8_t* lds, int8_t* tab, MAKE make) {
     const uint32_t lane = threadIdx.x & (kWave - 1u), half = lane >> 4, slot = lane & 15u;
     const uint32_t y = blockIdx.y, n0 = blockIdx.x * (16u * kDecW / KS) + (threadIdx.x / kWave / KS) * 16u;
@@ -585,11 +585,11 @@ __device__ void dec_expert(const Route& R, const Cls (&cl)[2], uint8_t* lds, int
     if ((uint32_t)R.off[ex] != y) return;
     const uint32_t r1 = (uint32_t)R.off[ex + 1u];
     const Cls c = pick(cl, ex);
-    if (KS > 1 || r1 - y <= 4u) {
+    if (KS > 1 || GO || r1 - y <= 4u) {
         gemv_expert<4, SUB, MAKE, KS>(R, c, ex, y, r1, lds, tab, make);
         return;
     }
-    if constexpr (KS == 1) rows_expert<MT, SUB>(R, c, ex, y, r1, lds, tab, make);
+    if constexpr (KS == 1 && !GO) rows_expert<MT, SUB>(R, c, ex, y, r1, lds, tab, make);
 }
 
 /* The prefill form: a block per (expert, 128 output columns), the expert's rows in passes of
@@ -614,11 +614,13 @@ __device__ void pf_expert(const Route& R, const Cls (&cl)[2], uint8_t* lds, int8
         rows_expert<MT, SUB>(R, c, ex, y, y + MT * 16u < r1 ? y + MT * 16u : r1, lds, tab, make);
 }
 
-template <uint32_t MT>
+/* GO: every expert at most 4 rows (the launcher's T <= 4 top_k), so only the GEMV form is
+ * built, at fewer registers than the WMMA form's. */
+template <uint32_t MT, bool GO = false>
 __global__ __launch_bounds__(kDecW * kWave) void moe_w4nl_dec_kernel(Route R, Cls c0, Cls c1) {
     __shared__ __attribute__((aligned(16))) uint8_t s_tr[kDecW][16 * kPitch];
     const Cls cl[2] = { c0, c1 };
-    dec_expert<MT, W4nl::kSub>(R, cl, &s_tr[0][0], nullptr, W4Make{});
+    dec_expert<MT, W4nl::kSub, W4Make, 1, GO>(R, cl, &s_tr[0][0], nullptr, W4Make{});
 }
 
 template <uint32_t MT>
@@ -806,7 +808,9 @@ int w4nl_run(const RadArgs* a, RadStream s) {
     if (dec_form(o)) {
         const dim3 g = dec_grid(o), b(kDecW * kWave);
         hipStream_t st = (hipStream_t)s;
-        if (o.T <= 16) hipLaunchKernelGGL(moe_w4nl_dec_kernel<1>, g, b, 0, st, route_of(o), cl[0], cl[1]);
+        if (o.T <= 4 * o.top_k)
+            hipLaunchKernelGGL((moe_w4nl_dec_kernel<1, true>), g, b, 0, st, route_of(o), cl[0], cl[1]);
+        else if (o.T <= 16) hipLaunchKernelGGL(moe_w4nl_dec_kernel<1>, g, b, 0, st, route_of(o), cl[0], cl[1]);
         else if (o.T <= 32) hipLaunchKernelGGL(moe_w4nl_dec_kernel<2>, g, b, 0, st, route_of(o), cl[0], cl[1]);
         else hipLaunchKernelGGL(moe_w4nl_dec_kernel<4>, g, b, 0, st, route_of(o), cl[0], cl[1]);
         return hipGetLastError() == hipSuccess ? RAD_OK : HALO_NO(RAD_E_DEVICE);
