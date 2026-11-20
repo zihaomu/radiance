@@ -543,6 +543,52 @@ TEST(r3d_tp1_head_actual_aql) {
         if (wave_present) setenv("RAD_LOGITS_WAVE", saved_wave.c_str(), 1); else unsetenv("RAD_LOGITS_WAVE");
         if (staged_present) setenv("RAD_LOGITS_STAGED", saved_staged.c_str(), 1); else unsetenv("RAD_LOGITS_STAGED");
     }
+    if (std::getenv("RAD_TP1_HEAD_STREAM_AB")) {
+        const char* original_stream = std::getenv("RAD_LOGITS_STREAM");
+        const bool stream_present = original_stream != nullptr;
+        const std::string saved_stream = original_stream ? original_stream : "";
+        REQUIRE_EQ(setenv("RAD_LOGITS_WAVE", "0", 1), 0);
+        for (int pattern = 0; pattern < 4; ++pattern) {
+            for (int position = 0; position < 2560; ++position) {
+                const float value = pattern == 0 ? float((position * 47) % 257 - 128) / 64.0f
+                    : pattern == 1 ? (position & 1 ? -1.0f : 1.0f)
+                    : pattern == 2 ? (position == 127 || position == 2559 ? 4.0f : 0.0f)
+                    : float(int(uint32_t(position) * 2654435761u >> 20) - 2048) * 0x1p-5f;
+                input.data<uint16_t>()[position] = rad_f32_to_bf16(value);
+            }
+            input.push(compute.stream);
+            std::vector<uint8_t> results[3];
+            float timings[3]{};
+            const char* staged_values[3]{"0", "1", "1"};
+            const char* stream_values[3]{"0", "0", "1"};
+            for (int variant = 0; variant < 3; ++variant) {
+                REQUIRE_EQ(setenv("RAD_LOGITS_STAGED", staged_values[variant], 1), 0);
+                REQUIRE_EQ(setenv("RAD_LOGITS_STREAM", stream_values[variant], 1), 0);
+                output.push(compute.stream);
+                REQUIRE_EQ(api.launch(&args, compute.stream), RAD_OK);
+                results[variant] = output.read(compute.stream);
+                RadEvent start{}, finish{};
+                REQUIRE_EQ(rad_event_create(&start), RAD_OK); REQUIRE_EQ(rad_event_create(&finish), RAD_OK);
+                for (int repeat = 0; repeat < 3; ++repeat) REQUIRE_EQ(api.launch(&args, compute.stream), RAD_OK);
+                REQUIRE_EQ(rad_event_record(start, compute.stream), RAD_OK);
+                for (int repeat = 0; repeat < 10; ++repeat) REQUIRE_EQ(api.launch(&args, compute.stream), RAD_OK);
+                REQUIRE_EQ(rad_event_record(finish, compute.stream), RAD_OK); REQUIRE_EQ(rad_event_sync(finish), RAD_OK);
+                REQUIRE_EQ(rad_event_elapsed_ms(start, finish, &timings[variant]), RAD_OK);
+                timings[variant] *= 100.0f;
+                rad_event_destroy(start); rad_event_destroy(finish);
+                REQUIRE(output.read(compute.stream) == results[variant]);
+            }
+            REQUIRE(results[1] == results[0]);
+            REQUIRE(results[2] == results[0]);
+            REQUIRE(weight.read(compute.stream) == weight.expected);
+            REQUIRE(input.read(compute.stream) == input.expected);
+            std::printf("TP1_HEAD_STREAM_AB pattern=%d exact=1 strict_us=%.1f staged_us=%.1f stream_us=%.1f\n",
+                pattern, timings[0], timings[1], timings[2]);
+        }
+        if (stream_present) setenv("RAD_LOGITS_STREAM", saved_stream.c_str(), 1); else unsetenv("RAD_LOGITS_STREAM");
+        if (wave_present) setenv("RAD_LOGITS_WAVE", saved_wave.c_str(), 1); else unsetenv("RAD_LOGITS_WAVE");
+        if (staged_present) setenv("RAD_LOGITS_STAGED", saved_staged.c_str(), 1); else unsetenv("RAD_LOGITS_STAGED");
+    }
     std::printf("PASS TP1_HEAD_AQL N=248320 K=2560 finite=all sampled_exact=12 shard_boundary=124160 guards=all\n");
 }
 
@@ -1054,6 +1100,42 @@ TEST(r3d_tp1_moe_prefill_bench) {
             REQUIRE(outputs[0] == outputs[1]);
             std::printf("MOE_WINDOW_AB tokens=%d gate_up_us=%.1f window_us=%.1f speedup=%.3f identical=1\n", tokens,
                 window_us[0], window_us[1], window_us[0] / window_us[1]);
+        }
+        if (std::getenv("RAD_TP1_MOE_GATE_AB")) {
+            const char* ab_flag = std::getenv("RAD_TP1_MOE_AB_FLAG") ? std::getenv("RAD_TP1_MOE_AB_FLAG") : "RAD_IQR_SPLIT";
+            setenv("RAD_IQR_DOT4_WINDOW", "1", 1);
+            for (int pattern = 0; pattern < 3; ++pattern) {
+                uint64_t seed = 0x243f6a8885a308d3ull + uint64_t(pattern);
+                for (int index = 0; index < tokens * 2560; ++index) {
+                    seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+                    input.data<int8_t>()[index] = pattern == 0 ? int8_t(int((index * 19 + 7) % 256) - 128)
+                        : pattern == 1 ? int8_t(seed >> 56) : int8_t(index % 2 ? -128 : 127);
+                }
+                input.push(stream);
+                float gate_us[2]{};
+                std::vector<uint8_t> outputs[2];
+                for (int variant : {0, 1, 1, 0}) {
+                    setenv(ab_flag, variant ? "1" : "0", 1);
+                    std::fill(output.expected.begin(), output.expected.end(), 0x5a);
+                    output.push(stream);
+                    REQUIRE_EQ(gate->launch(&args, stream), RAD_OK);
+                    auto got = output.read(stream);
+                    if (outputs[variant].empty()) outputs[variant] = std::move(got);
+                    else REQUIRE(got == outputs[variant]);
+                    REQUIRE_EQ(rad_event_record(start, stream), RAD_OK);
+                    for (int repeat = 0; repeat < 10; ++repeat) REQUIRE_EQ(gate->launch(&args, stream), RAD_OK);
+                    REQUIRE_EQ(rad_event_record(finish, stream), RAD_OK);
+                    REQUIRE_EQ(rad_event_sync(finish), RAD_OK);
+                    float elapsed = 0;
+                    REQUIRE_EQ(rad_event_elapsed_ms(start, finish, &elapsed), RAD_OK);
+                    gate_us[variant] += elapsed * 50.0f;
+                }
+                setenv(ab_flag, "0", 1);
+                REQUIRE(outputs[0] == outputs[1]);
+                std::printf("MOE_GATE_AB flag=%s tokens=%d pattern=%d off_us=%.1f on_us=%.1f speedup=%.3f identical=1\n",
+                    ab_flag, tokens, pattern, gate_us[0], gate_us[1], gate_us[0] / gate_us[1]);
+            }
+            setenv("RAD_IQR_DOT4_WINDOW", "0", 1);
         }
         if (std::getenv("RAD_TP1_MOE_RUN_AB")) {
             const char* ab_flag = std::getenv("RAD_TP1_MOE_AB_FLAG") ? std::getenv("RAD_TP1_MOE_AB_FLAG") : "RAD_W4NL_RUN";
