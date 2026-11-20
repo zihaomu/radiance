@@ -94,6 +94,9 @@ __global__ __launch_bounds__(256) void strict_norm_parallel(const uint16_t* hidd
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
     const int channel_stream = blockIdx.x, row = blockIdx.y;
     const size_t base = size_t(row) * wide + channel_stream * width;
+    float gains[width / 256];
+#pragma unroll
+    for (int index = 0; index < width / 256; ++index) gains[index] = weights[channel_stream * width + tid + index * 256];
     double squares = 0;
     int lowest = 256, highest = 0;
     for (int position = tid; position < width; position += 256) {
@@ -140,9 +143,11 @@ __global__ __launch_bounds__(256) void strict_norm_parallel(const uint16_t* hidd
         factor = __fdiv_rn(1.0f, sqrtf(float(sum / double(width)) + eps));
     }
     __syncthreads();
-    for (int position = tid; position < width; position += 256)
-        normalized[base + position] = narrow_bf16((widen_bf16(staged[position]) * factor)
-            * (weights[channel_stream * width + position] + wadd));
+#pragma unroll
+    for (int index = 0; index < width / 256; ++index) {
+        const int position = tid + index * 256;
+        normalized[base + position] = narrow_bf16((widen_bf16(staged[position]) * factor) * (gains[index] + wadd));
+    }
 }
 
 template <int MODE, int KC, int NTN, int NTM, int RN, int RM, bool PackedK = false>
@@ -608,16 +613,34 @@ __global__ __launch_bounds__(32) void down_inject_chain(const uint16_t* normaliz
     }
     __syncthreads();
     const uint16_t* activations = normalized + size_t(row) * wide;
-    float sum = 0;
-    for (int segment = 0; segment < wide / 2560; ++segment) {
+    const uint16_t* inject_line = is_down ? nullptr : inject_weights + size_t(output - rank) * wide;
+    // The next segment's operands load while the current one's sum is relayed.
+    uint4 weights[2][10], inputs[2][10];
+    auto fetch = [&](int segment, int slot) {
         const int first = segment * 2560 + lane * 80;
         const uint4* xs = reinterpret_cast<const uint4*>(activations + first);
-        float products[80];
+#pragma unroll
+        for (int chunk = 0; chunk < 10; ++chunk) inputs[slot][chunk] = xs[chunk];
         if (is_down) {
             const uint4* ws = reinterpret_cast<const uint4*>(line + first);
 #pragma unroll
+            for (int chunk = 0; chunk < 5; ++chunk) weights[slot][chunk] = ws[chunk];
+        } else {
+            const uint4* ws = reinterpret_cast<const uint4*>(inject_line + first);
+#pragma unroll
+            for (int chunk = 0; chunk < 10; ++chunk) weights[slot][chunk] = ws[chunk];
+        }
+    };
+    float sum = 0;
+    fetch(0, 0);
+#pragma unroll
+    for (int segment = 0; segment < wide / 2560; ++segment) {
+        const int slot = segment & 1, first = segment * 2560 + lane * 80;
+        float products[80];
+        if (is_down) {
+#pragma unroll
             for (int chunk = 0; chunk < 5; ++chunk) {
-                const uint4 w = ws[chunk], a = xs[2 * chunk], b = xs[2 * chunk + 1];
+                const uint4 w = weights[slot][chunk], a = inputs[slot][2 * chunk], b = inputs[slot][2 * chunk + 1];
                 const uint32_t codes[4]{w.x, w.y, w.z, w.w}, pairs[8]{a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
 #pragma unroll
                 for (int byte = 0; byte < 16; ++byte) {
@@ -628,25 +651,25 @@ __global__ __launch_bounds__(32) void down_inject_chain(const uint16_t* normaliz
                 }
             }
         } else {
-            const uint4* ws = reinterpret_cast<const uint4*>(inject_weights + size_t(output - rank) * wide + first);
 #pragma unroll
             for (int chunk = 0; chunk < 10; ++chunk) {
-                const uint4 a = xs[chunk], w = ws[chunk];
-                const uint32_t pairs[4]{a.x, a.y, a.z, a.w}, weights[4]{w.x, w.y, w.z, w.w};
+                const uint4 a = inputs[slot][chunk], w = weights[slot][chunk];
+                const uint32_t pairs[4]{a.x, a.y, a.z, a.w}, values[4]{w.x, w.y, w.z, w.w};
 #pragma unroll
                 for (int pair = 0; pair < 4; ++pair) {
-                    products[chunk * 8 + 2 * pair] = __uint_as_float(pairs[pair] << 16) * __uint_as_float(weights[pair] << 16);
+                    products[chunk * 8 + 2 * pair] = __uint_as_float(pairs[pair] << 16) * __uint_as_float(values[pair] << 16);
                     products[chunk * 8 + 2 * pair + 1] =
-                        __uint_as_float(pairs[pair] & 0xffff0000U) * __uint_as_float(weights[pair] & 0xffff0000U);
+                        __uint_as_float(pairs[pair] & 0xffff0000U) * __uint_as_float(values[pair] & 0xffff0000U);
                 }
             }
         }
+        if (segment + 1 < wide / 2560) fetch(segment + 1, slot ^ 1);
         for (int owner = 0; owner < 32; ++owner) {
             if (lane == owner) {
 #pragma unroll
                 for (int index = 0; index < 80; ++index) sum = sum + products[index];
             }
-            sum = __shfl(sum, owner, 32);
+            sum = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(sum), owner));
         }
     }
     if (lane) return;
@@ -659,10 +682,57 @@ __global__ __launch_bounds__(32) void down_inject_chain(const uint16_t* normaliz
         inject_out[size_t(row) * streams + output - rank] = narrow_bf16(2.0f * sigmoid_exact(sum / float(streams)));
     }
 }
+// up_exact's ascending 320-term chain. e4m3(code) is float-from-bits(code << 20) * 2^120 exactly
+// (subnormal codes too), so with 2^120 folded into a scale below 2^8 each weight rounds as lut[code] * scale.
+__device__ __forceinline__ float up_chain(const uint4 (&packed)[rank / 16 + 1], const float (&line_scales)[4],
+    const float* lut, const float* activation) {
+    bool decode = true;
+    float folded[4];
+#pragma unroll
+    for (int part = 0; part < 4; ++part) {
+        decode &= !(fabsf(line_scales[part]) >= 256.0f);
+        folded[part] = line_scales[part] * 0x1p120f;
+    }
+    float sum = 0;
+    if (decode) {
+#pragma unroll
+        for (int chunk = 0; chunk < rank / 16; ++chunk) {
+            const uint32_t words[4]{packed[chunk].x, packed[chunk].y, packed[chunk].z, packed[chunk].w};
+            // One wait per 16 terms: the activations come in as four 16-byte LDS reads.
+            float inputs[16];
+#pragma unroll
+            for (int quarter = 0; quarter < 4; ++quarter) {
+                const float4 four = reinterpret_cast<const float4*>(activation)[chunk * 4 + quarter];
+                inputs[quarter * 4] = four.x; inputs[quarter * 4 + 1] = four.y;
+                inputs[quarter * 4 + 2] = four.z; inputs[quarter * 4 + 3] = four.w;
+            }
+#pragma unroll
+            for (int byte = 0; byte < 16; ++byte) {
+                const int k = chunk * 16 + byte, shift = 8 * (byte & 3);
+                const uint32_t word = words[byte >> 2];
+                const uint32_t magnitude = (shift < 24 ? word << (20 - shift) : word >> 4) & 0x07f00000U;
+                const uint32_t sign = (word << (24 - shift)) & 0x80000000U;
+                sum += inputs[byte] * (__uint_as_float(magnitude | sign) * folded[k / 80]);
+            }
+        }
+        return sum;
+    }
+#pragma unroll
+    for (int chunk = 0; chunk < rank / 16; ++chunk) {
+        const uint32_t words[4]{packed[chunk].x, packed[chunk].y, packed[chunk].z, packed[chunk].w};
+#pragma unroll
+        for (int byte = 0; byte < 16; ++byte) {
+            const int k = chunk * 16 + byte;
+            sum += activation[k] * (lut[(words[byte >> 2] >> (8 * (byte & 3))) & 255U] * line_scales[k / 80]);
+        }
+    }
+    return sum;
+}
 // One thread per up row: strict_tiled MODE 1's ascending-K chain and gate, with the row prefetched.
 __global__ __launch_bounds__(64) void up_exact(const uint16_t* intermediate, const uint8_t* up,
     uint16_t* gates, uint16_t* trace_gates, float* trace_logits) {
-    __shared__ float lut[256], activation[rank];
+    __shared__ float lut[256];
+    __shared__ __align__(16) float activation[rank];
     const int tid = threadIdx.x, row = blockIdx.y, output_row = blockIdx.x * 64 + tid;
     for (int code = tid; code < 256; code += 64) lut[code] = e4m3(uint8_t(code));
     for (int k = tid; k < rank; k += 64) activation[k] = widen_bf16(intermediate[size_t(row) * rank + k]);
@@ -673,17 +743,42 @@ __global__ __launch_bounds__(64) void up_exact(const uint16_t* intermediate, con
     const float line_scales[4]{__uint_as_float(packed[rank / 16].x), __uint_as_float(packed[rank / 16].y),
                                __uint_as_float(packed[rank / 16].z), __uint_as_float(packed[rank / 16].w)};
     __syncthreads();
+    const float sum = up_chain(packed, line_scales, lut, activation);
+    const uint16_t gated = narrow_bf16(sigmoid_exact(sum));
+    const size_t index = size_t(row) * wide + output_row;
+    gates[index] = gated;
+    if (trace_logits) trace_logits[index] = sum;
+    if (trace_gates) trace_gates[index] = gated;
+}
+// Tolerance path (RAD_HC_UP_SPLIT): four lanes per up row, one per scale group of 80, joined by two xor
+// steps, so the summation order differs from up_exact; 64 rows a block keeps 1280 waves in flight.
+__global__ __launch_bounds__(256) void up_split(const uint16_t* intermediate, const uint8_t* up,
+    uint16_t* gates, uint16_t* trace_gates, float* trace_logits) {
+    __shared__ __align__(16) float activation[rank];
+    const int tid = threadIdx.x, row = blockIdx.y, part = tid & 3, output_row = blockIdx.x * 64 + (tid >> 2);
+    for (int k = tid; k < rank; k += 256) activation[k] = widen_bf16(intermediate[size_t(row) * rank + k]);
+    const uint8_t* line = up + size_t(output_row) * up_pitch;
+    uint4 codes[5];
+#pragma unroll
+    for (int chunk = 0; chunk < 5; ++chunk) codes[chunk] = reinterpret_cast<const uint4*>(line + part * 80)[chunk];
+    const float factor = reinterpret_cast<const float*>(line + rank)[part];
+    __syncthreads();
     float sum = 0;
 #pragma unroll
-    for (int chunk = 0; chunk < rank / 16; ++chunk) {
-        const uint32_t words[4]{packed[chunk].x, packed[chunk].y, packed[chunk].z, packed[chunk].w};
+    for (int chunk = 0; chunk < 5; ++chunk) {
+        const uint32_t words[4]{codes[chunk].x, codes[chunk].y, codes[chunk].z, codes[chunk].w};
 #pragma unroll
         for (int byte = 0; byte < 16; ++byte) {
-            const int k = chunk * 16 + byte;
-            const float weight = lut[(words[byte >> 2] >> (8 * (byte & 3))) & 255U] * line_scales[k / 80];
-            sum += activation[k] * weight;
+            const int shift = 8 * (byte & 3);
+            const uint32_t word = words[byte >> 2];
+            const uint32_t magnitude = (shift < 24 ? word << (20 - shift) : word >> 4) & 0x07f00000U;
+            const uint32_t sign = (word << (24 - shift)) & 0x80000000U;
+            sum += activation[part * 80 + chunk * 16 + byte] * (__uint_as_float(magnitude | sign) * 0x1p120f * factor);
         }
     }
+    sum += __shfl_xor(sum, 1, 4);
+    sum += __shfl_xor(sum, 2, 4);
+    if (part) return;
     const uint16_t gated = narrow_bf16(sigmoid_exact(sum));
     const size_t index = size_t(row) * wide + output_row;
     gates[index] = gated;
@@ -694,7 +789,7 @@ __global__ __launch_bounds__(64) void up_exact(const uint16_t* intermediate, con
 __global__ __launch_bounds__(128) void mix_quant_exact(const uint16_t* normalized, const uint16_t* gates,
     uint16_t* output, uint8_t* plain_codes, float* plain_scales, bool plain_int8,
     uint8_t* rotated_codes, float* rotated_scales, bool rotated_int8) {
-    __shared__ float values[128];
+    __shared__ float values[128], partial[4];
     __shared__ float scale;
     const int lane = threadIdx.x, group = blockIdx.x, row = blockIdx.y, channel = group * 128 + lane;
     float total = 0;
@@ -709,27 +804,34 @@ __global__ __launch_bounds__(128) void mix_quant_exact(const uint16_t* normalize
         uint8_t* codes = pair ? rotated_codes : plain_codes;
         if (!codes) continue;
         const bool int8_codes = pair ? rotated_int8 : plain_int8;
-        __syncthreads();
-        values[lane] = widen_bf16(mixed);
-        __syncthreads();
+        float own = widen_bf16(mixed);
         if (pair) {
-            for (int step = 1; step < 128; step *= 2) {
-                const float first = values[lane & ~step], second = values[lane | step];
+            for (int step = 1; step < 32; step *= 2) {
+                const float other = __shfl_xor(own, step, 32);
+                own = lane & step ? other - own : own + other;
+            }
+            for (int step = 32; step < 128; step *= 2) {
                 __syncthreads();
-                values[lane] = lane & step ? first - second : first + second;
+                values[lane] = own;
                 __syncthreads();
+                const float other = values[lane ^ step];
+                own = lane & step ? other - own : own + other;
             }
         }
+        // The largest magnitude does not depend on the search order (a NaN never wins).
+        float maximum = fabsf(own);
+        for (int distance = 16; distance; distance >>= 1) maximum = fmaxf(maximum, __shfl_xor(maximum, distance, 32));
+        __syncthreads();
+        if ((lane & 31) == 0) partial[lane >> 5] = maximum;
+        __syncthreads();
         const float top = int8_codes ? 127.0f : 448.0f;
         if (lane == 0) {
-            float maximum = 0;
-            for (int position = 0; position < 128; ++position)
-                if (fabsf(values[position]) > maximum) maximum = fabsf(values[position]);
+            maximum = fmaxf(fmaxf(fmaxf(partial[0], partial[1]), fmaxf(partial[2], partial[3])), 0.0f);
             scale = maximum > 0 ? maximum * __fdiv_rn(1.0f, top) : 1.0f;
             (pair ? rotated_scales : plain_scales)[group_index] = scale;
         }
         __syncthreads();
-        const float value = fminf(fmaxf(values[lane] * __fdiv_rn(1.0f, scale), -top), top);
+        const float value = fminf(fmaxf(own * __fdiv_rn(1.0f, scale), -top), top);
         codes[group_index * 128 + lane] = int8_codes ? uint8_t(__float2int_rn(value)) : encode_e4m3(value);
     }
 }
@@ -825,7 +927,8 @@ __global__ __launch_bounds__(512) void up_mix_quant(const uint16_t* intermediate
     const uint16_t* normalized, uint16_t* gates, uint16_t* trace_gates, float* trace_logits, uint16_t* output,
     uint8_t* plain_codes, float* plain_scales, bool plain_int8,
     uint8_t* rotated_codes, float* rotated_scales, bool rotated_int8) {
-    __shared__ float lut[256], activation[rank], values[128];
+    __shared__ float lut[256], values[128];
+    __shared__ __align__(16) float activation[rank];
     __shared__ uint16_t gate[streams][128];
     __shared__ float scale;
     const int tid = threadIdx.x, group = blockIdx.x, row = blockIdx.y;
@@ -840,17 +943,7 @@ __global__ __launch_bounds__(512) void up_mix_quant(const uint16_t* intermediate
     const float line_scales[4]{__uint_as_float(packed[rank / 16].x), __uint_as_float(packed[rank / 16].y),
                                __uint_as_float(packed[rank / 16].z), __uint_as_float(packed[rank / 16].w)};
     __syncthreads();
-    float sum = 0;
-#pragma unroll
-    for (int chunk = 0; chunk < rank / 16; ++chunk) {
-        const uint32_t words[4]{packed[chunk].x, packed[chunk].y, packed[chunk].z, packed[chunk].w};
-#pragma unroll
-        for (int byte = 0; byte < 16; ++byte) {
-            const int k = chunk * 16 + byte;
-            const float weight = lut[(words[byte >> 2] >> (8 * (byte & 3))) & 255U] * line_scales[k / 80];
-            sum += activation[k] * weight;
-        }
-    }
+    const float sum = up_chain(packed, line_scales, lut, activation);
     const uint16_t gated = narrow_bf16(sigmoid_exact(sum));
     const size_t index = size_t(row) * wide + output_row;
     gates[index] = gated;
@@ -1075,7 +1168,12 @@ int strict_launch(const RadArgs* args, RadStream stream, const R3dhHcTrace* trac
         auto scales = [&](int pair) { return code_outputs[pair] ? static_cast<float*>(scale_outputs[pair]->data) : nullptr; };
         auto int8 = [&](int pair) { return code_outputs[pair] && code_outputs[pair]->dtype == RAD_I8; };
         const char* fused_flag = std::getenv("RAD_HC_UPMIX_FUSED");
-        if (fused_flag && std::strcmp(fused_flag, "0") != 0) {
+        const char* split_up = std::getenv("RAD_HC_UP_SPLIT");
+        if (split_up && std::strcmp(split_up, "0") != 0) {
+            up_split<<<dim3(wide / 64, rows), 256, 0, device_stream>>>(intermediate, up_data, gates, up_gates, up_logits);
+            mix_quant_exact<<<dim3(width / 128, rows), 128, 0, device_stream>>>(normalized, gates,
+                static_cast<uint16_t*>(output->data), codes(0), scales(0), int8(0), codes(1), scales(1), int8(1));
+        } else if (fused_flag && std::strcmp(fused_flag, "0") != 0) {
             up_mix_quant<<<dim3(width / 128, rows), 512, 0, device_stream>>>(intermediate, up_data, normalized,
                 gates, up_gates, up_logits, static_cast<uint16_t*>(output->data),
                 codes(0), scales(0), int8(0), codes(1), scales(1), int8(1));
