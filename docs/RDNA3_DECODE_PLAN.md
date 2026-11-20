@@ -86,6 +86,11 @@ Today it takes 44 us, because the sum is handed lane to lane and the loads are n
 | Step | State | Result |
 |---|---|---|
 | 0 Baseline and profiling tools | done | `results/strata-compare/README.md` (workspace) |
-| 1 LM head exact | in progress | |
-| 2 MoE experts exact | not started | |
-| 3 HC exact + tolerance fusion | not started | |
+| 1 LM head exact | done | `logits_joined_stream` (`RAD_LOGITS_STREAM`), bit-identical to strict/staged on the real head. Serving: 9.95 -> 0.89 ms/step |
+| 2a MoE gate_up decode kernel | done | `gate_up_split` (`RAD_IQR_SPLIT`), bit-identical on real experts (3 input patterns, 1-512 tokens). Per call with VRAM experts: p50 91 -> 52 us |
+| 2b MoE host-resident experts | open | Experts in the pinned host pool are read over PCIe inside the kernel: gate_up p90 189 us, p99 534 us. This tail keeps the mean at 111 us (was 114). All-host bench: old kernel 14 GB/s, new 9 GB/s. Next: a PCIe-friendly access pattern for host experts, or keep them off the GPU path |
+| 2c MoE down (w4nl) | not started | `down_run` p50 51 us, mean 65 us |
+| 3a HC exact down chain | done | `down_inject_chain` prefetches the next segment and relays the sum with `readlane`; bit-identical. Serving 44.6 -> 41.8 us/call (4.33 -> 4.05 ms/step). It is now near its floor: 10240 dependent fp32 adds per output. Device suite 72 pass |
+| 3b HC exact up/mix/norm | done | `mix_quant_exact`: register butterfly + parallel max, 0.70 -> 0.35 ms/step. `strict_norm_parallel`: gains prefetched, 0.79 -> 0.57. All bit-identical; default 31.0 tok/s, identical to strict, 6/6 tasks. `up_exact` stays ~1.8 ms (18.5 us/call). Measured: ~8.6 us is loading the 3.4 MB of up weights; the rest is the 320-term serial chain at ~1.7 waves per SIMD. ALU e4m3 decode, bulk LDS reads, coalesced staging and prefetching up during the down chain were tried and do not help |
+| 3c HC tolerance (opt-in) | done | New `up_split` (`RAD_HC_UP_SPLIT`): four lanes per up row, 1280 waves, then the fast mix/quant. Replaces the 20-block fused kernel: 2.22 -> 1.19 + 0.34 ms/step. HC tolerance total 4.22 -> 3.38 ms/step (Strata 1.62). `default-tol` (wave head + down split + up split): 35.6 tok/s, 6/6 tasks; up logits within 8e-6 of exact; text diverges from strict mid-reasoning, same final answer on arithmetic. Device suite 72 pass |
+| E2E after 1+2a (+3a: 30.5 tok/s, same) | done | default 24.2 -> 30.7 tok/s; strict 5.91; strict/default messages identical; 6/6 tasks; device suite 72 pass |
