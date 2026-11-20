@@ -43,6 +43,26 @@
 
 #include "r3d_plugin.h"
 #include "rad_abi_layout.h"
+extern "C" int r3d_layout_w2_head_strict(const RadParam*, int, int, const RadEncoding*,
+    const int*, const RadTensor*, int, RadLayout*);
+extern "C" int r3d_relayout_w2_head_strict(const RadParam*, int, int, const RadEncoding*,
+    const int*, const RadTensor*, int, void*, int64_t);
+extern "C" int r3d_rad_gemm_iqr_scalar(const RadArgs*, RadStream);
+extern "C" int r3d_qwen_schema_count();
+extern "C" int r3d_model_extra_schema_count();
+extern "C" const RadOpSchema* r3d_model_extra_schema_at(int);
+extern "C" int r3d_model_extra_kernel_count();
+extern "C" const RadKernelInfo* r3d_model_extra_kernel_at(int);
+extern "C" const RadOpSchema* r3d_qwen_schema_at(int);
+extern "C" int r3d_qwen_kernel_count();
+extern "C" const RadKernelInfo* r3d_qwen_kernel_at(int);
+extern "C" int r3d_shape_gemm_iqr(const RadParam*, int, int, RadOpdDesc*);
+extern "C" int r3d_rad_layout_iqr(const RadParam*, int, int, const RadEncoding*,
+                                 const int*, const RadTensor*, int, RadLayout*);
+extern "C" int r3d_rad_relayout_iqr(const RadParam*, int, int, const RadEncoding*,
+                                   const int*, const RadTensor*, int, void*, int64_t);
+extern "C" int r3d_rad_unrelayout_iqr(const RadParam*, int, int, const RadEncoding*,
+                                     const int*, const void*, int64_t, const RadTensor*, int);
 
 #ifndef R3D_BUILD_TARGET
 #define R3D_BUILD_TARGET "gfx1100 gfx1101 gfx1102 gfx1103 gfx1150 gfx1151"
@@ -955,11 +975,14 @@ static const RadOpSchema kSchemas[] = {
 };
 
 extern "C" int rad_kernel_schema_count(void) {
-    return (int)(sizeof(kSchemas) / sizeof(kSchemas[0]));
+    return NELEM(kSchemas) + r3d_qwen_schema_count() + r3d_model_extra_schema_count();
 }
 extern "C" const RadOpSchema* rad_kernel_schema_at(int i) {
     if (i < 0 || i >= rad_kernel_schema_count()) return nullptr;
-    return &kSchemas[i];
+    if (i < NELEM(kSchemas)) return &kSchemas[i];
+    i -= NELEM(kSchemas);
+    if (i < r3d_qwen_schema_count()) return r3d_qwen_schema_at(i);
+    return r3d_model_extra_schema_at(i - r3d_qwen_schema_count());
 }
 
 /* ================================================================== tuning
@@ -1579,6 +1602,9 @@ static const RadConstraint cGemmQW2A8[]  = { C_IN("dtype", "w2a8"), C_EQ("group"
                                              C_GE("M", 1), C_LE("M", 16), C_DIV("K", 128),
                                              C_GE("N", 1) };
 
+static const RadConstraint cGemmQW2Head[] = { C_IN("dtype", "w2a8"), C_EQ("group", 128),
+    C_GE("M", 1), C_LE("M", 32), C_EQ("N", 124160), C_EQ("K", 2560) };
+
 /* The packed-code grids at the heights gemm_nt_q_w2a8_m16 declines. The grid is the container's --
  * one scale and one zero per `group` of codes on a {1, group} plane -- so `group` is the block, and
  * K divides by it because a staged 32-code chunk must sit inside one scale group. */
@@ -1603,7 +1629,37 @@ static const RadConstraint cDflashSelect[] = { C_IN("dtype", "bf16"), C_GE("M", 
                                                C_LE("top_k", 256), C_GE("rank", 1),
                                                C_GE("n_vocab", 1) };
 
+static const RadConstraint cGemmIqrScalar[] = {
+    C_IN("dtype", "i8a8h"), C_EQ("group", 128), C_GE("M", 1), C_LE("M", 2),
+    C_DIV("N", 16), C_DIV("K", 128)
+};
+static const RadConstraint cGemmIqrPrefill[] = {
+    C_IN("dtype", "i8a8h"), C_EQ("group", 128), C_GE("M", 3), C_LE("M", 2048),
+    C_DIV("N", 16), C_DIV("K", 128)
+};
+static const int64_t kIqrImplementations[] = {0, 1, 2};
+static const RadTunable tIqrDecode[] = {
+    {"impl", kIqrImplementations, 3, 2, "0=strict scalar, 1=integer WMMA, 2=wave32 group reduction"}
+};
+static const RadTunable tIqrPrefill[] = {
+    {"impl", kIqrImplementations, 3, 1, "0=strict scalar, 1=integer WMMA, 2=wave32 group reduction"}
+};
+
 static const RadKernelInfo kKernels[] = {
+{ "gemm_nt_q_iqr_decode", "gemm_nt_q", "gemm",
+  "Compressed computed-trellis IQR with strict integer group accumulation",
+  "u3/u4/u5, L16, run128/256, row-f32 and column-f32 scales, M1..2",
+  "rotated int8 activation, packed trellis weights, bf16 output",
+  RAD_DOMAIN_DEVICE, 1, ROW(cGemmIqrScalar), tIqrDecode, NELEM(tIqrDecode), nullptr,
+  nullptr, nullptr, r3d_rad_gemm_iqr_scalar, nullptr,
+  r3d_rad_layout_iqr, r3d_rad_relayout_iqr, r3d_shape_gemm_iqr, r3d_rad_unrelayout_iqr },
+{ "gemm_nt_q_iqr_prefill", "gemm_nt_q", "gemm",
+  "Compressed computed-trellis IQR with strict integer group accumulation",
+  "u3/u4/u5, L16, run128/256, row-f32 and column-f32 scales, M3..2048",
+  "rotated int8 activation, packed trellis weights, bf16 output",
+  RAD_DOMAIN_DEVICE, 1, ROW(cGemmIqrPrefill), tIqrPrefill, NELEM(tIqrPrefill), nullptr,
+  nullptr, nullptr, r3d_rad_gemm_iqr_scalar, nullptr,
+  r3d_rad_layout_iqr, r3d_rad_relayout_iqr, r3d_shape_gemm_iqr, r3d_rad_unrelayout_iqr },
 /* ------------------------------------------------------------------ r3d_model_bf16.hip
  *
  * One workgroup a row. The `shape` column states the geometry the grid is built for; the
@@ -2971,8 +3027,16 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_VOCAB_M1,
   ROW(cGemmQW2A8), NOTUNE,
   nullptr, nullptr, r3d_rad_gemm_nt_q_w2a8, nullptr,
-  r3d_layout_gemm_nt_q_w2a8, r3d_relayout_gemm_nt_q_w2a8, nullptr },
+  r3d_layout_w2_head_strict, r3d_relayout_w2_head_strict, nullptr },
 
+{ "gemm_nt_q_w2a8_head_strict", "gemm_nt_q", "gemm",
+  "Strict bounded U2 model head with live-row compact group sums",
+  "N124160 K2560 group128 M1..32; integer group dot, affine zero, BF16 RNE",
+  "Private joined f16 scales and u8 zeros; step-ordered i8 activation",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_VOCAB_M1 + 1,
+  ROW(cGemmQW2Head), NOTUNE,
+  nullptr, nullptr, r3d_rad_gemm_nt_q_w2a8, nullptr,
+  r3d_layout_w2_head_strict, r3d_relayout_w2_head_strict, nullptr },
 { "gemm_nt_q_w2a8_tiled", "gemm_nt_q", "gemm",
   "the packed-code grids at the heights the skinny row declines: 2-bit and 4-bit codes, int8 "
   "activations, the batched decode and the draft head of a 2-bit vocab projection",
@@ -3053,20 +3117,13 @@ static const RadKernelInfo kKernels[] = {
  */
 { "logits_gemm_bf16", "logits_gemm", "vocab",
   "logits[M, n_vocab] = x[M, n_embd] @ lm_head[n_vocab, n_embd]^T, the head read once a token",
-  "M <= 16: a wave a run of vocabulary columns, one output element a lane, the head's rows streamed "
-  "past an activation kept in registers, no wave reduction. M > 16: 128x128 tiles through LDS, 8x8 "
-  "f32 accumulators a lane, the head staged with an 8-element swizzle, k ascending in 32-code "
-  "chunks. The grid is vocab-wide at every M, so there is no split-K and no scratch",
-  "bf16 x, f32 logits: every sampler stage reads f32, so the narrowing the schema does not ask for "
-  "is not performed, and a prefill band's output plane is M x n_vocab f32. The head arrives in the "
-  "form the container stores and the row reads both, chosen by the operand's header, not by a "
-  "parameter: bf16 rows in the order they are stored, or -- what this checkpoint's output.weight "
-  "actually is -- E4M3 codes with a bf16 scale per 128x128 block as two container planes, which the "
-  "row's layout hook presents as the one operand the plan says they are, moving no byte. E4M3 and "
-  "int8 widen to f16 exactly, so the fold into f16 is the only arithmetic the codes pay: 2.77e-04 "
-  "from the reference's exact law, one f16 rounding, 250x finer than the code's own quantum. A head "
-  "with a zero plane is w2a8's grid and is refused at the shim's own line; so is a scale block that "
-  "is not 128x128, which is gemm_nt_q's grid",
+  "One GPU thread per output, one FP32 accumulator over ascending K, separate RN multiplication "
+  "and addition; no FMA, partial sums, split-K, or scratch",
+  "Strict BF16 activations and FP32 logits. Plain BF16 weights bypass header inspection. "
+  "Layout-certified immutable rad.planes heads decode I8 (including -128) or E4M3FN codes and "
+  "BF16/F16/F32 scales on the GPU: code*scale RN, activation*weight RN, then add RN. Scale blocks "
+  "may be per-row/group, legacy 128x128, or zero for a whole axis. No F16 staging, dense weight "
+  "expansion, CPU weight read, or fallback",
   RAD_DOMAIN_DEVICE, R3D_PRIO_VOCAB_M1,
   ROW(cLogitsGemm), tImpl2, NELEM(tImpl2), impl_tune_valid,
   nullptr, nullptr, r3d_rad_logits_gemm_bf16, nullptr,
@@ -3155,11 +3212,14 @@ static const RadKernelInfo kKernels[] = {
  * slot most of them sit in is slower than going through the host.
  */
 extern "C" int rad_kernel_count(void) {
-    return (int)(sizeof(kKernels) / sizeof(kKernels[0]));
+    return NELEM(kKernels) + r3d_qwen_kernel_count() + r3d_model_extra_kernel_count();
 }
 extern "C" const RadKernelInfo* rad_kernel_at(int i) {
     if (i < 0 || i >= rad_kernel_count()) return nullptr;
-    return &kKernels[i];
+    if (i < NELEM(kKernels)) return &kKernels[i];
+    i -= NELEM(kKernels);
+    if (i < r3d_qwen_kernel_count()) return r3d_qwen_kernel_at(i);
+    return r3d_model_extra_kernel_at(i - r3d_qwen_kernel_count());
 }
 
 /* Which rows touch nothing but their operands and their scratch.
@@ -3176,7 +3236,14 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
 extern "C" int rad_kernel_concurrent(int i) {
     const RadKernelInfo* k = rad_kernel_at(i);
     if (!k) return 0;
-    return k->scratch == nullptr;
+    return std::strcmp(k->op, "all_reduce") != 0 && std::strcmp(k->op, "all_gather") != 0
+        && k->scratch == nullptr;
+}
+
+extern "C" int rad_kernel_collective(int index) {
+    const RadKernelInfo* kernel = rad_kernel_at(index);
+    return kernel && (!std::strcmp(kernel->op, "all_reduce")
+        || !std::strcmp(kernel->op, "all_gather"));
 }
 
 static const RadPluginInfo kInfo = {

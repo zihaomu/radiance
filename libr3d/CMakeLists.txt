@@ -68,6 +68,7 @@ set(R3D_UNITS
   # per 32 of K, the block's partials scaled at the block boundary.
   "r3d_gemm_mxfp4a8|"
   "r3d_gemm_inta8|"
+  "r3d_gemm_iqr|"
   # The wave-matrix arm of the w8a8 grid: V_WMMA_I32_16X16X16_IU8 chains an exact i32 group
   # sub-sum, the group term the reference's. The `impl` point of the dot2 arm's row.
   "r3d_gemm_inta8_wmma|"
@@ -201,7 +202,56 @@ endforeach()
 # without ROCm. libr3d has no layout source: nothing it serves is repacked, because a dot2 GEMM
 # reads a weight in the order it is stored (see r3d_rows.cpp). There is no fusion source because
 # no fused row exists.
-set(R3D_DECLARATION r3d_rows.cpp r3d_shapes.cpp)
+list(APPEND R3D_SRC
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_i8_gemm.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_i8_quant.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_hc_hc_bf16.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_hc_strict.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_ar_entry.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_ar_oneshot_2rank_exact.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_moe_iqr.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_moe_w4nl.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_gdn_extra_strict.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_gdn_extra_chunk_strict.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_attn_qsa_device.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_attn_qsa_rope.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_attn_qsa_state.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_qwen_ops_quant.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_qwen_ops_router.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_mtp_ple_native.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_mtp_ple_ngram_ids.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_mtp_ple_select.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_sparse_qsa_device.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_sparse_qsa_index.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_moe_mixed_iqr.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_moe_mixed_bf16.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_allgather.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_sample_merge.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_attn_fused_native.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_vision_strict.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_vision_rope.hip)
+set_source_files_properties(${R3D_SRC} PROPERTIES LANGUAGE HIP)
+set_source_files_properties(
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_hc_strict.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_ar_entry.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_ar_oneshot_2rank_exact.hip
+  PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-fno-fast-math;-fno-associative-math")
+set(R3D_DECLARATION r3d_rows.cpp r3d_shapes.cpp r3d_iqr_layout.cpp r3d_qwen_registry.cpp
+  r3dh_i8_layout.cpp r3dh_hc_layout.cpp r3dh_hc_shapes.cpp r3dh_hc_dispatch.cpp
+  r3d_model_extra_registry.cpp r3dh_moe_iqr_layout.cpp r3dh_moe_w4nl_layout.cpp
+  r3d_mtp_registry.cpp r3dh_mtp_ple_layout.cpp r3dh_mtp_ple_shapes.cpp
+  r3d_sparse_registry.cpp r3dh_sparse_qsa_host.cpp
+  r3dh_moe_mixed_registry.cpp r3dh_moe_mixed_layout.cpp
+  r3d_runtime_registry.cpp r3dh_allgather_host.cpp r3dh_sample_merge_registry.cpp
+  r3dh_attn_fused.cpp r3dh_attn_fused_registry.cpp
+  r3d_vision_registry.cpp r3dh_vision_strict_registry.cpp r3dh_vision_strict_shapes.cpp)
+
+rad_add_plugin(r3dh_ple_host kernels
+  SOURCES r3dh_ple_host.cpp r3dh_ple_host_registry.cpp r3dh_ple_host_hint.cpp
+          r3dh_ple_host_plugin.cpp
+  INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}
+  LIBS ${CMAKE_DL_LIBS} Threads::Threads)
+target_link_options(r3dh_ple_host PRIVATE -Wl,-Bsymbolic)
 
 rad_add_plugin(libr3d kernels
   SOURCES     ${R3D_DECLARATION}
