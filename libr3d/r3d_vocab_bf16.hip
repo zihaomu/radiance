@@ -890,8 +890,7 @@ int joined_strict_run(const RadArgs* args, RadStream stream) {
         if (status != RAD_OK) return status;
     }
     const dim3 grid((columns + 127) / 128, activation.shape[0]);
-    const char* wave = std::getenv("RAD_LOGITS_WAVE");
-    if (reduction == 2560 && activation.shape[0] == 1 && wave && std::strcmp(wave, "0") != 0) {
+    if (reduction == 2560 && activation.shape[0] == 1 && r3d_tolerance_path("RAD_LOGITS_WAVE")) {
         R3D_KLAUNCH(R3D_KNAME(logits_joined_wave), dim3((columns + 3) / 4, activation.shape[0]), dim3(128),
             reinterpret_cast<hipStream_t>(stream), static_cast<const uint16_t*>(activation.data),
             static_cast<const RadPlanesHeader*>(weight.data), static_cast<float*>(output.data),

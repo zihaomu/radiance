@@ -1,4 +1,6 @@
 #include "r3dh_ar.h"
+#include "r3dh_hc_args.h"
+#include "r3d_flags.h"
 #include <algorithm>
 #include <chrono>
 #include <climits>
@@ -218,4 +220,109 @@ extern "C" int r3dh_rad_ar_oneshot_2rank_exact(const RadArgs* args, RadStream st
     return r3dh_ar_launch(instance.peer_scratch, instance.scratch, instance.peer_flags,
         instance.flags, instance.sequence, instance.slot_words, input.data, output->data,
         elements, dtype, (hipStream_t)stream, blocks, 256, 1, 0);
+}
+
+/* ar_hc_write at two ranks, exact wire: an all-reduce instance sized for M's upper bound times n,
+ * and r3dh_ar_hc_write_launch over it. Operands y (inout, the message), inj, h (inout). */
+extern "C" int r3dh_hc_rad_hc_write(const RadArgs*, RadStream);
+extern "C" int r3dh_rad_ar_hc_init(const RadParam* params, int count, int rank, int world,
+                                   void** out) {
+    const RadParam* rows = param(params, count, "M");
+    const RadParam* width = param(params, count, "n");
+    const RadParam* type = param(params, count, "dtype");
+    if (!rows || (rows->kind != RAD_P_INT && rows->kind != RAD_P_RANGE) || !width ||
+        width->kind != RAD_P_INT || !type || type->kind != RAD_P_STR || !type->sval)
+        return RAD_E_SHAPE;
+    const long long high = rows->kind == RAD_P_RANGE ? rows->ihi : rows->ival;
+    if (high < 1 || width->ival < 8 || high > INT_MAX / width->ival) return RAD_E_SHAPE;
+    RadParam reduced[4]{};
+    reduced[0].key = "world_size"; reduced[0].kind = RAD_P_INT; reduced[0].ival = world;
+    reduced[1].key = "exact";      reduced[1].kind = RAD_P_INT; reduced[1].ival = 1;
+    reduced[2].key = "numel";      reduced[2].kind = RAD_P_INT; reduced[2].ival = high * width->ival;
+    reduced[3].key = "dtype";      reduced[3].kind = RAD_P_STR; reduced[3].sval = type->sval;
+    return r3dh_rad_ar_init(reduced, 4, rank, world, out);
+}
+static int ar_hc_write(const RadArgs* args, RadStream stream, const void* gather) {
+    if (!args || !args->instance) return RAD_E_STATE;
+    const Instance& instance = *(const Instance*)args->instance;
+    int device = -1;
+    if (hipGetDevice(&device) != hipSuccess || device != instance.device) return RAD_E_DEVICE;
+    if (args->world_size != 2 || args->rank != instance.rank || instance.dtype != 0)
+        return RAD_E_SHAPE;
+    if (!args->t || args->n_t < 3) return RAD_E_INVAL;
+    const RadParam* width = param(args->p, args->n_p, "n");
+    const RadParam* streams = param(args->p, args->n_p, "hc");
+    if (!width || width->kind != RAD_P_INT || !streams || streams->kind != RAD_P_INT)
+        return RAD_E_SHAPE;
+    const long n = (long)width->ival, hc = (long)streams->ival;
+    const RadTensor& y = args->t[0];
+    const RadTensor& inj = args->t[1];
+    const RadTensor& h = args->t[2];
+    if (y.dtype != RAD_BF16 || inj.dtype != RAD_BF16 || h.dtype != RAD_BF16 || !inj.data || !h.data)
+        return RAD_E_DTYPE;
+    long elements = 0;
+    int status = tensor_count(y, &elements);
+    if (status != RAD_OK) return status;
+    /* The rows are h's, as hc_write takes them; y holds at least that many, unpitched. */
+    long long irows = 0, hrows = 0;
+    const long long irow = r3dh_hc_rows_pitch(&inj, hc, &irows);
+    const long long hrow = r3dh_hc_rows_pitch(&h, hc * n, &hrows);
+    const long rows = (long)hrows;
+    if (irow < hc || hrow < hc * n || irows < rows || rows < 1) return RAD_E_STRIDE;
+    if (n < 8 || elements < rows * n || rows * n > instance.max_numel) return RAD_E_SHAPE;
+    /* RAD_TP2_AR_PAIR=1 (A/B only): the unfused pair, all_reduce in place then hc_write. */
+    static const bool pair = [] {
+        const char* v = std::getenv("RAD_TP2_AR_PAIR");
+        return v && !std::strcmp(v, "1");
+    }();
+    if (gather && rows != 1) return RAD_E_UNSUPPORTED;
+    if (pair && !gather) {
+        const int rc = r3dh_ar_launch(instance.peer_scratch, instance.scratch, instance.peer_flags,
+            instance.flags, instance.sequence, instance.slot_words, y.data, y.data, rows * n, 0,
+            (hipStream_t)stream, (int)std::min(24L, std::max(1L, (rows * n / 8 + 255) / 256)), 256,
+            1, 0);
+        return rc != RAD_OK ? rc : r3dh_hc_rad_hc_write(args, stream);
+    }
+    return r3dh_ar_hc_write_launch(instance.peer_scratch, instance.scratch, instance.peer_flags,
+        instance.flags, instance.sequence, instance.slot_words, y.data, inj.data, h.data,
+        rows, n, hc, irow, hrow, (hipStream_t)stream, gather);
+}
+extern "C" int r3dh_rad_ar_hc_write(const RadArgs* args, RadStream stream) {
+    return ar_hc_write(args, stream, nullptr);
+}
+
+/* ar_gather_hc_write: moe_gather, then ar_hc_write, on one instance. The first six operands are
+ * moe_gather's in its own order (y is the gather's output and the message), so the gather runs
+ * on the op's own arguments; the last three are ar_hc_write's. Byte-identical to the pair by
+ * construction. */
+extern "C" int r3d_rad_moe_gather(const RadArgs*, RadStream);
+extern "C" int r3dh_rad_ar_gather_hc_write(const RadArgs* args, RadStream stream) {
+    if (!args || !args->t || args->n_t < 8) return RAD_E_INVAL;
+    RadArgs write = *args;
+    write.t = args->t + 5;
+    write.n_t = 3;
+    /* A one-row step (decode; M is the padded batch) gathers inside the reduction's push
+     * (RAD_TP2_AR_GATHER_FUSED); ar_hc_write declines any other height. */
+    const RadTensor *ye = &args->t[0], *ew = &args->t[1], *sorted = &args->t[2];
+    const RadTensor *sh = args->t[3].data ? &args->t[3] : nullptr, *sg = args->t[4].data ? &args->t[4] : nullptr;
+    const RadParam* rows = param(args->p, args->n_p, "M");
+    const RadParam* top_k = param(args->p, args->n_p, "top_k");
+    const char* act = nullptr;
+    if (const RadParam* a = param(args->p, args->n_p, "act")) act = a->kind == RAD_P_STR ? a->sval : nullptr;
+    const bool sig = act && !std::strcmp(act, "sigmoid");
+    if (r3d_exact_path("RAD_TP2_AR_GATHER_FUSED") && rows && rows->kind == RAD_P_INT && rows->ival >= 1
+        && top_k && top_k->kind == RAD_P_INT && ye->dtype == RAD_BF16 && ye->data && ew->data && sorted->data
+        && sorted->dtype == RAD_I32 && (ew->dtype == RAD_BF16 || ew->dtype == RAD_F32) && ye->rank == 2
+        && (!sh || (sh->dtype == RAD_BF16 && sg && sg->dtype == RAD_BF16)) && (!act || sig || !std::strcmp(act, "none"))) {
+        alignas(16) unsigned char row[r3dh_gather_row_bytes];
+        if (r3dh_ar_gather_row(row, ye->data, (long)ye->stride[0], ew->data, ew->dtype == RAD_F32,
+                static_cast<const int32_t*>(sorted->data), (int)rad_tensor_numel(sorted), (int)top_k->ival,
+                sh ? sh->data : nullptr, sg ? sg->data : nullptr, sig ? 1 : 0) == RAD_OK) {
+            const int rc = ar_hc_write(&write, stream, row);
+            if (rc != RAD_E_UNSUPPORTED) return rc;
+        }
+    }
+    const int status = r3d_rad_moe_gather(args, stream);
+    if (status != RAD_OK) return status;
+    return r3dh_rad_ar_hc_write(&write, stream);
 }

@@ -209,6 +209,7 @@ list(APPEND R3D_SRC
   ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_hc_strict.hip
   ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_ar_entry.hip
   ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_ar_oneshot_2rank_exact.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_ar_hc_write_2rank.hip
   ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_moe_iqr.hip
   ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_moe_w4nl.hip
   ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_gdn_extra_strict.hip
@@ -235,6 +236,7 @@ set_source_files_properties(
   ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_hc_strict.hip
   ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_ar_entry.hip
   ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_ar_oneshot_2rank_exact.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/r3dh_ar_hc_write_2rank.hip
   PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-fno-fast-math;-fno-associative-math")
 set(R3D_DECLARATION r3d_rows.cpp r3d_shapes.cpp r3d_iqr_layout.cpp r3d_qwen_registry.cpp
   r3dh_i8_layout.cpp r3dh_hc_layout.cpp r3dh_hc_shapes.cpp r3dh_hc_dispatch.cpp

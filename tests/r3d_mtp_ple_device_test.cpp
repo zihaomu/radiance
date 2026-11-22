@@ -17,6 +17,7 @@
 static const bool r3d_strict_defaults = [] {
     for (const char* name : r3d_exact_flags)
         if (std::strncmp(name, "RAD_ATTN_FUSE_", 14)) setenv(name, "0", 0);
+    for (const char* name : r3d_tolerance_defaults) setenv(name, "0", 0);
     return true;
 }();
 

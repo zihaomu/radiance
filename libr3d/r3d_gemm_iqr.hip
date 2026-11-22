@@ -327,6 +327,171 @@ __global__ __launch_bounds__(fused_waves * 32) void iqr_wmma_fused(const int8_t*
         }
 }
 
+// One group's integer sums for the 16 tile columns at one row, without an int8 plane: the trellis
+// state slides down the rows (s = (s << Bits | code) & 0xffff is the window trellis_state builds),
+// the masked bytes meet the byte-splatted input in sudot4, and -126 * sum(x) folds the offset.
+// Integer sums, so equal to the WMMA sums. Returns this lane's column sum; lanes 2c and 2c+1 hold
+// column ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1).
+template<unsigned Mask>
+__device__ __forceinline__ int slide_xor(int value) {
+    if constexpr (Mask == 16u) return __builtin_amdgcn_permlanex16(value, value, 0x76543210u, 0xfedcba98u, false, false);
+    else return __builtin_amdgcn_update_dpp(0, value, int(0x160u | Mask), 0xf, 0xf, true);
+}
+template<unsigned Mask>
+__device__ __forceinline__ void slide_fold(int (&sums)[16], unsigned lane) {
+    constexpr unsigned width = Mask / 2u;
+    const bool upper = (lane & Mask) != 0;
+#pragma unroll
+    for (unsigned index = 0; index < width; ++index) {
+        const int keep = upper ? sums[index + width] : sums[index];
+        const int give = upper ? sums[index] : sums[index + width];
+        sums[index] = keep + slide_xor<Mask>(give);
+    }
+}
+template<unsigned Bits>
+__device__ __forceinline__ int iqr_slide_group(const uint8_t* codes, uint64_t pitch, unsigned tile_column,
+    unsigned run_mask, unsigned position, uint32_t multiplier, uint32_t increment, const int8_t* activation) {
+    constexpr unsigned backs = (16 + Bits - 1) / Bits;
+    constexpr unsigned span = 15 + backs;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned bit = position * Bits;
+    const unsigned shift = bit & 7u;
+    const unsigned run_start = tile_column & ~run_mask;
+    const uint32_t scaled = multiplier & 0x00ffffffu;
+    const uint32_t inputs = *reinterpret_cast<const uint32_t*>(activation + position);
+    uint32_t splat[4];
+    int input_sum = 0;
+#pragma unroll
+    for (unsigned element = 0; element < 4; ++element) {
+        splat[element] = __builtin_amdgcn_perm(inputs, inputs, element * 0x01010101u);
+        input_sum += int(int8_t(inputs >> (element * 8)));
+    }
+    int sums[16];
+#pragma unroll
+    for (unsigned column = 0; column < 16; ++column) sums[column] = -126 * input_sum;
+    uint32_t state[4] = {};
+#pragma unroll
+    for (unsigned index = 0; index < span; ++index) {
+        const unsigned row = run_start | ((tile_column + index - (backs - 1)) & run_mask);
+        uint32_t word;
+        __builtin_memcpy(&word, codes + uint64_t(row) * pitch + bit / 8, sizeof(word));
+        word >>= shift;
+#pragma unroll
+        for (unsigned element = 0; element < 4; ++element) {
+            state[element] = ((state[element] << Bits) | ((word >> (element * Bits)) & ((1u << Bits) - 1u))) & 0xffffu;
+            if (index >= backs - 1) {
+                const uint32_t masked = (state[element] * scaled + increment) & 0x3f3f3f3fu;
+                sums[index - (backs - 1)] = __builtin_amdgcn_sudot4(false, int(masked), true, int(splat[element]),
+                    sums[index - (backs - 1)], false);
+            }
+        }
+    }
+    // Transpose-reduce: each step keeps half of the columns and adds the partner's other half.
+    slide_fold<16>(sums, lane);
+    slide_fold<8>(sums, lane);
+    slide_fold<4>(sums, lane);
+    slide_fold<2>(sums, lane);
+    return sums[0] + slide_xor<1>(sums[0]);
+}
+
+// iqr_wmma_fused at one row with the K groups spread over the block's waves: each group's integer
+// sum lands in LDS and one lane a column runs the float chain over the groups in order.
+constexpr int ksplit_groups = 20;
+template<int Waves, bool Slide>
+__global__ __launch_bounds__(Waves * 32) void iqr_wmma_ksplit(const int8_t* activation,
+    const float* activation_scale, const uint8_t* weight, const float* scales, uint16_t* output,
+    int columns, int reduction) {
+    __shared__ __align__(16) uint8_t transposed[Waves][16 * fused_pitch];
+    __shared__ int sums[ksplit_groups][16];
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned wave = threadIdx.x / 32u;
+    const int tile_column = int(blockIdx.x) * 16;
+    const unsigned slot = lane & 15u;
+    const unsigned half = lane >> 4;
+    const auto* header = reinterpret_cast<const r3d_iqr::Header*>(weight);
+    const uint8_t* codes = weight + sizeof(r3d_iqr::Header);
+    const unsigned bits = header->bits;
+    const unsigned run_rows = header->run_rows;
+    const uint64_t code_pitch = static_cast<uint64_t>(reduction) * bits / 8;
+    const bool windowed = bits >= 3 && bits <= 5 && header->state_bits == 16
+        && run_rows >= 16 && (run_rows & (run_rows - 1)) == 0;
+    const int groups = reduction / 128;
+    uint8_t* transposed_tile = transposed[wave];
+    for (int group = int(wave); group < groups; group += Waves) {
+        const unsigned position = unsigned(group) * 128u + lane * 4u;
+        if (Slide && windowed) {
+            int sum;
+            if (bits == 5)
+                sum = iqr_slide_group<5>(codes, code_pitch, unsigned(tile_column), run_rows - 1u, position,
+                    header->multiplier, header->increment, activation);
+            else if (bits == 4)
+                sum = iqr_slide_group<4>(codes, code_pitch, unsigned(tile_column), run_rows - 1u, position,
+                    header->multiplier, header->increment, activation);
+            else
+                sum = iqr_slide_group<3>(codes, code_pitch, unsigned(tile_column), run_rows - 1u, position,
+                    header->multiplier, header->increment, activation);
+            if (!(lane & 1u))
+                sums[group][((lane >> 4) & 1u) * 8u + ((lane >> 3) & 1u) * 4u + ((lane >> 2) & 1u) * 2u
+                    + ((lane >> 1) & 1u)] = sum;
+            continue;
+        }
+        uint32_t words[16];
+        if (windowed && bits == 5)
+            iqr_fused_decode<5>(codes, code_pitch, unsigned(tile_column), run_rows - 1u, position,
+                header->multiplier, header->increment, words);
+        else if (windowed && bits == 4)
+            iqr_fused_decode<4>(codes, code_pitch, unsigned(tile_column), run_rows - 1u, position,
+                header->multiplier, header->increment, words);
+        else if (windowed)
+            iqr_fused_decode<3>(codes, code_pitch, unsigned(tile_column), run_rows - 1u, position,
+                header->multiplier, header->increment, words);
+        else
+            for (unsigned index = 0; index < 16; ++index) {
+                uint32_t packed = 0;
+                for (unsigned element = 0; element < 4; ++element) {
+                    const uint32_t state = r3d_iqr::trellis_state(codes, code_pitch,
+                        unsigned(tile_column) + index, position + element, bits,
+                        header->state_bits, run_rows);
+                    packed |= uint32_t(uint8_t(r3d_iqr::trellis_mad(state, header->multiplier,
+                        header->increment))) << (element * 8);
+                }
+                words[index] = packed;
+            }
+#pragma unroll
+        for (unsigned index = 0; index < 16; ++index)
+            *reinterpret_cast<uint32_t*>(transposed_tile + index * fused_pitch + lane * 4u) = words[index];
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+        Int8 subtotal{};
+#pragma unroll
+        for (unsigned step = 0; step < 8; ++step) {
+            const auto* source = reinterpret_cast<const uint2*>(transposed_tile + slot * fused_pitch + step * 16u);
+            const uint2 low = source[0], high = source[1];
+            const Int4 weight_fragment{int(low.x), int(low.y), int(high.x), int(high.y)};
+            const uint4 value = *reinterpret_cast<const uint4*>(activation + group * 128 + step * 16);
+            const Int4 input_fragment{int(value.x), int(value.y), int(value.z), int(value.w)};
+            subtotal = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+                true, input_fragment, true, weight_fragment, subtotal, false);
+        }
+        if (half == 0) sums[group][slot] = subtotal[0];
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+    }
+    __syncthreads();
+    if (threadIdx.x < 16) {
+        const int column = tile_column + int(threadIdx.x);
+        const float* column_scale = scales + columns;
+        float accumulator = 0;
+        for (int group = 0; group < groups; ++group) {
+            const float scaled = static_cast<float>(sums[group][threadIdx.x]) * activation_scale[group];
+            accumulator = accumulator + scaled * column_scale[group];
+        }
+        output[column] = narrow_bf16(accumulator * scales[column]);
+    }
+}
+
 template<bool Wave>
 __global__ void iqr_group_bf16(const int8_t* activation, const float* activation_scale,
     const uint8_t* weight, const uint16_t* scales, uint16_t* output,
@@ -493,6 +658,26 @@ extern "C" int r3d_rad_gemm_iqr_scalar(const RadArgs* arguments, RadStream strea
         const auto* weight = static_cast<const uint8_t*>(tensor[2].data);
         const auto* scale = static_cast<const float*>(tensor[3].data);
         auto* result = static_cast<uint16_t*>(tensor[4].data);
+        if (rows == 1 && reduction % 128 == 0 && reduction / 128 <= ksplit_groups
+            && r3d_exact_path("RAD_IQR_KSPLIT")) {
+            const char* waves = std::getenv("RAD_IQR_KSPLIT_WAVES");
+            const bool slide = r3d_exact_path("RAD_IQR_SLIDE");
+            const int count = waves && *waves ? std::atoi(waves) : slide ? 10 : 4;
+            const dim3 blocks(unsigned(columns / 16));
+            if (slide && count == 4)
+                iqr_wmma_ksplit<4, true><<<blocks, 128, 0, native_stream>>>(input, input_scale, weight, scale, result, int(columns), int(reduction));
+            else if (slide && count == 10)
+                iqr_wmma_ksplit<10, true><<<blocks, 320, 0, native_stream>>>(input, input_scale, weight, scale, result, int(columns), int(reduction));
+            else if (slide)
+                iqr_wmma_ksplit<5, true><<<blocks, 160, 0, native_stream>>>(input, input_scale, weight, scale, result, int(columns), int(reduction));
+            else if (count == 4)
+                iqr_wmma_ksplit<4, false><<<blocks, 128, 0, native_stream>>>(input, input_scale, weight, scale, result, int(columns), int(reduction));
+            else if (count == 10)
+                iqr_wmma_ksplit<10, false><<<blocks, 320, 0, native_stream>>>(input, input_scale, weight, scale, result, int(columns), int(reduction));
+            else
+                iqr_wmma_ksplit<5, false><<<blocks, 160, 0, native_stream>>>(input, input_scale, weight, scale, result, int(columns), int(reduction));
+            return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+        }
         if (tiles == 1)
             iqr_wmma_fused<1><<<grid, fused_waves * 32, 0, native_stream>>>(input, input_scale, weight, scale,
                 result, int(rows), int(columns), int(reduction), tensor[0].stride[0], tensor[1].stride[0], tensor[4].stride[0]);

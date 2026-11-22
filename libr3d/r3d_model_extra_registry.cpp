@@ -186,30 +186,34 @@ int paged_shape(const RadParam* params, int count, int operand, RadOpdDesc* outp
         {}, {}, indices({2}, rows + 1, -1, RAD_OPD_F_IDX_CU), tensor(RAD_BF16, {rows, heads * 256})};
     return pick(descriptors, operand, output);
 }
-// qk_norm_rope_gate_kv_store and attn_paged_gate_had_quant at n_head 24 / n_head_kv 2 (TP1).
+// qk_norm_rope_gate_kv_store and attn_paged_gate_had_quant at n_head 24 / n_head_kv 2 (TP1) and 12 / 1 (TP2).
 int prepare_store_shape(const RadParam* params, int count, int operand, RadOpdDesc* output) {
     const int64_t rows = dimension(params, count, "M");
     const int64_t capacity = table_rows(params, count, rows);
-    if (rows < 1 || rows > 2048 || capacity < 1 || capacity > 200000) return RAD_E_UNSUPPORTED;
+    const int64_t heads = dimension(params, count, "n_head", 24), keyheads = heads / 12;
+    if (rows < 1 || rows > 2048 || capacity < 1 || capacity > 200000 || (heads != 12 && heads != 24))
+        return RAD_E_UNSUPPORTED;
     const int64_t pages = (rows + 3) / 4 + 2;
-    const RadOpdDesc descriptors[]{tensor(RAD_BF16, {rows, 12288}), tensor(RAD_BF16, {rows, 512}),
+    const RadOpdDesc descriptors[]{tensor(RAD_BF16, {rows, heads * 512}), tensor(RAD_BF16, {rows, keyheads * 256}),
         tensor(RAD_F32, {capacity, 64}), indices({rows}, capacity), tensor(RAD_F32, {256}), tensor(RAD_F32, {256}),
-        tensor(RAD_BF16, {rows, 6144}), tensor(RAD_BF16, {rows, 512}), tensor(RAD_BF16, {rows, 24, 256}),
-        tensor(RAD_BF16, {rows, 512}), indices({rows}, pages * 4, -1, RAD_OPD_F_IDX_UNIQUE),
-        tensor(RAD_I8, {pages, 2, 4, 516})};
+        tensor(RAD_BF16, {rows, heads * 256}), tensor(RAD_BF16, {rows, keyheads * 256}), tensor(RAD_BF16, {rows, heads, 256}),
+        tensor(RAD_BF16, {rows, keyheads * 256}), indices({rows}, pages * 4, -1, RAD_OPD_F_IDX_UNIQUE),
+        tensor(RAD_I8, {pages, keyheads, 4, 516})};
     return pick(descriptors, operand, output);
 }
 int paged_gate_shape(const RadParam* params, int count, int operand, RadOpdDesc* output) {
     const int64_t rows = dimension(params, count, "q_len");
     const int64_t capacity = dimension(params, count, "max_ctx", rows);
-    if (rows < 1 || rows > 2048 || capacity < rows || capacity > 200000) return RAD_E_UNSUPPORTED;
+    const int64_t heads = dimension(params, count, "n_head", 24);
+    if (rows < 1 || rows > 2048 || capacity < rows || capacity > 200000 || (heads != 12 && heads != 24))
+        return RAD_E_UNSUPPORTED;
     if (operand >= 4 && operand <= 6) return RAD_E_UNSUPPORTED;
     const int64_t pages = (capacity + 3) / 4;
     const int64_t visible = std::min<int64_t>(capacity / 4, 512) * 4 + capacity % 4;
-    const RadOpdDesc descriptors[]{tensor(RAD_BF16, {rows, 6144}), tensor(RAD_I8, {pages, 2, 4, 516}),
+    const RadOpdDesc descriptors[]{tensor(RAD_BF16, {rows, heads * 256}), tensor(RAD_I8, {pages, heads / 12, 4, 516}),
         indices({rows, 513}, pages), indices({rows}, visible + 1, visible), {}, {}, {},
-        tensor(RAD_BF16, {rows, 6144}), tensor(RAD_BF16, {rows, 6144}), tensor(RAD_I8, {rows, 6144}),
-        tensor(RAD_F32, {rows, 48})};
+        tensor(RAD_BF16, {rows, heads * 256}), tensor(RAD_BF16, {rows, heads * 256}), tensor(RAD_I8, {rows, heads * 256}),
+        tensor(RAD_F32, {rows, heads * 2})};
     return pick(descriptors, operand, output);
 }
 template <bool work>
@@ -363,10 +367,10 @@ PACKED_CONSTRAINTS(packed_256_constraints, 256);
 PACKED_CONSTRAINTS(packed_384_constraints, 384);
 PACKED_CONSTRAINTS(packed_640_constraints, 640);
 const RadConstraint gate_constraints[]{GE("M", 1), LE("M", 24576), EQ("n", 256), EQ("group", 128), IN("dtype", "bf16"), IN("act", "sigmoid")};
-const RadConstraint prepare_store_constraints[]{TOKENS, EQ("head_dim", 256), EQ("n_head", 24), EQ("n_head_kv", 2),
+const RadConstraint prepare_store_constraints[]{TOKENS, EQ("head_dim", 256), IN("n_head", "12 24"), IN("n_head_kv", "1 2"),
     EQ("rot", 64), EQ("cs_f32", 1), EQ("block_size", 4), IN("q_dtype", "bf16"), IN("kv_dtype", "i8")};
 const RadConstraint paged_gate_constraints[]{GE("q_len", 1), LE("q_len", 32), EQ("head_dim", 256), EQ("gqa", 12),
-    EQ("n_head", 24), EQ("block_size", 4), EQ("causal", 1), EQ("window", 0), EQ("group", 128),
+    IN("n_head", "12 24"), EQ("block_size", 4), EQ("causal", 1), EQ("window", 0), EQ("group", 128),
     IN("q_dtype", "bf16"), IN("kv_dtype", "i8"), IN("act", "sigmoid")};
 const RadConstraint router_constraints[]{TOKENS, IN("N", "1 512"), EQ("K", 2560), IN("dtype", "bf16")};
 

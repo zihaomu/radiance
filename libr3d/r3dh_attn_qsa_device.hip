@@ -742,7 +742,7 @@ long flag(const char* name, long fallback) {
 // Segments a row's keys are split into under RAD_ATTN_SPLIT (0: the exact kernel). About
 // RAD_ATTN_SPLIT_TARGET (192) workgroups a launch; a row of one query and its own selection only.
 int split_count(const RadArgs* args, long rows, long sequences, bool prefix) {
-    if (!flag("RAD_ATTN_SPLIT", 0) || prefix || sequences != rows || rows > split_capacity) return 0;
+    if (r3d_precision_exact() || !flag("RAD_ATTN_SPLIT", 0) || prefix || sequences != rows || rows > split_capacity) return 0;
     const long target = flag("RAD_ATTN_SPLIT_TARGET", 192);
     const long splits = std::max(1L, std::min(std::min(64L, split_capacity / rows), target / (2 * rows)));
     const uint64_t bytes = uint64_t(rows) * 2 * splits * split_partial * sizeof(float);
@@ -864,7 +864,8 @@ extern "C" int r3dh_attn_qsa_prepare_store(const RadArgs* args, RadStream stream
     if (!args || !args->t || args->n_t != 12) return RAD_E_INVAL;
     const RadTensor* tensors = args->t;
     const int heads = integer(args, "n_head", -1), keyheads = integer(args, "n_head_kv", 0);
-    if (integer(args, "head_dim", 0) != 256 || heads != 24 || keyheads != 2 || integer(args, "block_size", 0) != 4
+    if (integer(args, "head_dim", 0) != 256 || (heads != 24 && heads != 12) || keyheads * 12 != heads
+        || integer(args, "block_size", 0) != 4
         || !named(args, "kv_dtype", "i8") || integer(args, "pos_i64", 0) != 0) return RAD_E_UNSUPPORTED;
     const long rows = tensors[1].shape[0];
     if (!tensors[6].data || !matrix(tensors[9], RAD_BF16, rows, keyheads * 256)

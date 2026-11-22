@@ -7,6 +7,9 @@
 extern "C" int r3dh_rad_ar_init(const RadParam*, int, int, int, void**);
 extern "C" void r3dh_rad_ar_fini(void*);
 extern "C" int r3dh_rad_ar_oneshot_2rank_exact(const RadArgs*, RadStream);
+extern "C" int r3dh_rad_ar_hc_init(const RadParam*, int, int, int, void**);
+extern "C" int r3dh_rad_ar_hc_write(const RadArgs*, RadStream);
+extern "C" int r3dh_rad_ar_gather_hc_write(const RadArgs*, RadStream);
 extern "C" int r3d_runtime_schema_count();
 extern "C" const RadOpSchema* r3d_runtime_schema_at(int);
 extern "C" int r3d_runtime_kernel_count();
@@ -52,17 +55,40 @@ const RadParamSpec all_reduce[]{REQUIRED("world_size", RAD_P_INT), REQUIRED("num
     REQUIRED("dtype", RAD_P_STR), REQUIRED("exact", RAD_P_INT), OPTIONAL("min_bytes", RAD_P_INT),
     OPTIONAL("hops", RAD_P_INT), OPTIONAL("overlap", RAD_P_INT)};
 const RadOperandSpec all_reduce_operands[]{{"x", RAD_OPD_INOUT, 0}, {"y", RAD_OPD_OUT, 1}};
+/* docs/OPS.md. */
+const RadParamSpec ar_hc_write[]{REQUIRED("M", RAD_P_INT), REQUIRED("n", RAD_P_INT),
+    REQUIRED("hc", RAD_P_INT), REQUIRED("world_size", RAD_P_INT), REQUIRED("dtype", RAD_P_STR),
+    OPTIONAL("wire", RAD_P_INT)};
+const RadOperandSpec ar_hc_write_operands[]{
+    {"y", RAD_OPD_INOUT, 0}, {"inj", RAD_OPD_IN, 0}, {"h", RAD_OPD_INOUT, 0}};
+const RadParamSpec ar_gather_hc_write[]{REQUIRED("M", RAD_P_INT), REQUIRED("n", RAD_P_INT),
+    REQUIRED("hc", RAD_P_INT), REQUIRED("top_k", RAD_P_INT), REQUIRED("world_size", RAD_P_INT),
+    REQUIRED("dtype", RAD_P_STR), OPTIONAL("act", RAD_P_STR), OPTIONAL("wire", RAD_P_INT)};
+const RadOperandSpec ar_gather_hc_write_operands[]{
+    {"y_expert", RAD_OPD_IN, 0}, {"expert_w", RAD_OPD_IN, 0}, {"sorted_tok", RAD_OPD_IN, 0},
+    {"shared", RAD_OPD_IN, 1}, {"shared_gate", RAD_OPD_IN, 1},
+    {"y", RAD_OPD_INOUT, 0}, {"inj", RAD_OPD_IN, 0}, {"h", RAD_OPD_INOUT, 0}};
 const RadOpSchema schemas[]{
     {"hc_enter", RANGE(hc_plain), RANGE(hc_enter), "Copy into independent residual streams"},
     {"hc_write", RANGE(hc_plain), RANGE(hc_write), "Residual stream write"},
     {"hc_read", RANGE(hc_read), RANGE(hc_read_operands), "Strict gated residual mixer"},
-    {"all_reduce", RANGE(all_reduce), RANGE(all_reduce_operands), "Exact tensor-parallel sum"}
+    {"all_reduce", RANGE(all_reduce), RANGE(all_reduce_operands), "Exact tensor-parallel sum"},
+    {"ar_hc_write", RANGE(ar_hc_write), RANGE(ar_hc_write_operands),
+     "All-reduce, then the gated residual write"},
+    {"ar_gather_hc_write", RANGE(ar_gather_hc_write), RANGE(ar_gather_hc_write_operands),
+     "moe_gather, then ar_hc_write"}
 };
 const RadConstraint hc_plain_constraints[]{GE("M", 1), LE("M", 2048), EQ("n", 2560), EQ("hc", 4), IN("dtype", "bf16")};
 const RadConstraint hc_read_constraints[]{GE("M", 1), LE("M", 2048), EQ("n", 2560), EQ("hc", 4),
     EQ("lowrank", 320), IN("dtype", "bf16"), IN("mix", "e4m3"), LE("group", 128), LE("inject", 1)};
 const RadConstraint ar_constraints[]{EQ("world_size", 2), EQ("exact", 1), IN("dtype", "bf16 fp16 fp32"),
     {RAD_FACT_P2P, RAD_C_EQ, 1, nullptr}};
+const RadConstraint ar_hc_write_constraints[]{GE("M", 1), LE("M", 2048), DIV("n", 8), GE("hc", 2),
+    LE("hc", 8), EQ("world_size", 2), EQ("wire", 0), IN("dtype", "bf16"),
+    {RAD_FACT_P2P, RAD_C_EQ, 1, nullptr}};
+const RadConstraint ar_gather_hc_write_constraints[]{GE("M", 1), LE("M", 2048), DIV("n", 8),
+    GE("hc", 2), LE("hc", 8), GE("top_k", 1), LE("top_k", 64), EQ("world_size", 2), EQ("wire", 0),
+    IN("dtype", "bf16"), {RAD_FACT_P2P, RAD_C_EQ, 1, nullptr}};
 const RadConstraint i8_constraints[]{GE("M", 1), LE("M", 2048), DIV("N", 128), DIV("K", 128),
     EQ("group", 128), IN("dtype", "i8a8 i8a8h")};
 const RadConstraint quant_constraints[]{GE("M", 1), LE("M", 2048), DIV("n", 128),
@@ -92,6 +118,17 @@ const RadKernelInfo kernels[]{
     {"qwen_ar_tp2_exact", "all_reduce", "ar", "Native peer-pull sum", "two gfx1100 ranks", "exact bf16/fp16/fp32",
       RAD_DOMAIN_DEVICE, 0, RANGE(ar_constraints), nullptr, 0, nullptr,
       r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_oneshot_2rank_exact, nullptr, nullptr, nullptr, ar_shape},
+    {"qwen_ar_hc_write_tp2_exact", "ar_hc_write", "norm", "Peer-pull sum with the residual write",
+      "two gfx1100 ranks, exact wire", "byte-identical to all_reduce + hc_write",
+      RAD_DOMAIN_DEVICE, 0, RANGE(ar_hc_write_constraints), nullptr, 0, nullptr,
+      r3dh_rad_ar_hc_init, r3dh_rad_ar_fini, r3dh_rad_ar_hc_write, nullptr, nullptr, nullptr,
+      r3dh_hc_shape_hc_write},
+    {"qwen_ar_gather_hc_write_tp2_exact", "ar_gather_hc_write", "norm",
+      "moe_gather, then the peer-pull sum with the residual write", "two gfx1100 ranks, exact wire",
+      "byte-identical to moe_gather + all_reduce + hc_write",
+      RAD_DOMAIN_DEVICE, 0, RANGE(ar_gather_hc_write_constraints), nullptr, 0, nullptr,
+      r3dh_rad_ar_hc_init, r3dh_rad_ar_fini, r3dh_rad_ar_gather_hc_write, nullptr, nullptr, nullptr,
+      nullptr},
     {"qwen_i8_rowgroup", "gemm_nt_q", "gemm", "Integer group product", "whole 128 groups", "bf16 group weight scale",
       RAD_DOMAIN_DEVICE, 0, RANGE(i8_constraints), nullptr, 0, nullptr,
       nullptr, nullptr, r3dh_i8_rad_gemm_nt_q, nullptr, r3dh_i8_rad_layout, r3dh_i8_rad_relayout,

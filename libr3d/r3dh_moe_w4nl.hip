@@ -266,11 +266,12 @@ __global__ __launch_bounds__(128) void down_run(Call call) {
     }
     float accumulator[run_rows] = {};
     // Same bytes as the per-element loads: every group's codes are issued at once, then read back in order.
-    __shared__ uint2 hoisted[16][128];
-    const bool vec = call.vec && canonical && inner / 64 <= 16 && !(reinterpret_cast<uintptr_t>(codes) & 7);
+    // Ten groups cover inner 640; a smaller array keeps more blocks resident per WGP.
+    __shared__ uint2 hoisted[10][128];
+    const bool vec = call.vec && canonical && inner / 64 <= 10 && !(reinterpret_cast<uintptr_t>(codes) & 7);
     if (vec) {
 #pragma unroll
-        for (int group = 0; group < 16; ++group)
+        for (int group = 0; group < 10; ++group)
             if (group < inner / 64)
                 hoisted[group][threadIdx.x] = *reinterpret_cast<const uint2*>(codes + group * 32 + component * 8);
     }

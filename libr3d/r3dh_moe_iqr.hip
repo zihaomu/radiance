@@ -475,6 +475,11 @@ __global__ __launch_bounds__(256) void gate_up_split(Call call, const int2* map)
     __shared__ uint32_t tiles[8][35 * split_pitch / 4];
     const int parity = task.x & 1, width = call.geometry.width[parity];
     const int part_width = call.geometry.output_width / 2;
+    if (column_base % part_width >= width / 2) {   // past a narrower expert's rows: zeros, as gate_up_mapped
+        for (int index = tid; index < (end - first) * split_columns; index += 256)
+            call.output[(first + index / split_columns) * call.output_pitch + column_base + index % split_columns] = 0;
+        return;
+    }
     const int first_row = (column_base / part_width) * (width / 2) + column_base % part_width;
     const unsigned tile_row = unsigned(first_row + half * 32);
     const auto* blob = entry(call.weight[parity], task.x / 2);
@@ -636,8 +641,9 @@ extern "C" int r3dh_moe_iqr_launch(const RadArgs* arguments, RadStream stream) {
         build_run_map<<<1, 256, 0, native_stream>>>(call, map, capacity);
         if (hipGetLastError() != hipSuccess) return RAD_E_DEVICE;
         const dim3 grid((geometry.output_width + mapped_columns - 1) / mapped_columns, capacity);
-        const bool even = geometry.width[0] == geometry.output_width && geometry.width[1] == geometry.output_width
-            && (geometry.output_width / 2) % split_columns == 0;
+        const bool even = geometry.width[0] <= geometry.output_width && geometry.width[1] <= geometry.output_width
+            && (geometry.output_width / 2) % split_columns == 0 && (geometry.width[0] / 2) % split_columns == 0
+            && (geometry.width[1] / 2) % split_columns == 0;
         if (geometry.tokens == 1 && even && r3d_exact_path("RAD_IQR_SPLIT")) {
             gate_up_split<<<dim3(geometry.output_width / split_columns, capacity), 256, 0, native_stream>>>(call, map);
             return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;

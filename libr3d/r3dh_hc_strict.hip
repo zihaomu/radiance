@@ -1050,9 +1050,9 @@ int strict_launch(const RadArgs* args, RadStream stream, const R3dhHcTrace* trac
         if (rad_event_record(timing.events[0], stream) != RAD_OK) return RAD_E_DEVICE;
     }
     const bool parallel_norm = r3d_exact_path("RAD_HC_NORM_PARALLEL");
-    const char* fused_inject = std::getenv("RAD_HC_NORM_INJECT_FUSED");
-    const char* split_flag = std::getenv("RAD_HC_DOWN_SPLIT");
-    const char* fast_flag = std::getenv("RAD_HC_WMMA");
+    const char* fused_inject = (r3d_tolerance_path("RAD_HC_NORM_INJECT_FUSED") ? "1" : nullptr);
+    const char* split_flag = (r3d_tolerance_path("RAD_HC_DOWN_SPLIT") ? "1" : nullptr);
+    const char* fast_flag = (r3d_tolerance_path("RAD_HC_WMMA") ? "1" : nullptr);
     const char* tile_flag = std::getenv("RAD_HC_EXACT_TILE");
     const bool down_split = rows <= 16 && split_flag && std::strcmp(split_flag, "0") != 0
         && !(fast_flag && std::strcmp(fast_flag, "0")) && !(tile_flag && std::strcmp(tile_flag, "0"))
@@ -1071,8 +1071,8 @@ int strict_launch(const RadArgs* args, RadStream stream, const R3dhHcTrace* trac
         strict_norm<<<dim3(rows), 256, 0, device_stream>>>(static_cast<const uint16_t*>(hidden->data),
             static_cast<const float*>(weights->data), normalized, count, eps, wadd);
     if (stage_us && rad_event_record(timing.events[1], stream) != RAD_OK) return RAD_E_DEVICE;
-    const char* fast = std::getenv("RAD_HC_WMMA");
-    const char* matrix = std::getenv("RAD_HC_MATRIX_DOWN");
+    const char* fast = (r3d_tolerance_path("RAD_HC_WMMA") ? "1" : nullptr);
+    const char* matrix = (r3d_tolerance_path("RAD_HC_MATRIX_DOWN") ? "1" : nullptr);
     const char* exact_tile = std::getenv("RAD_HC_EXACT_TILE");
     const bool upmix_flag = r3d_exact_path("RAD_HC_UPMIX_EXACT");
     const bool upmix = rows <= 16 && upmix_flag
@@ -1167,8 +1167,8 @@ int strict_launch(const RadArgs* args, RadStream stream, const R3dhHcTrace* trac
         auto codes = [&](int pair) { return code_outputs[pair] ? static_cast<uint8_t*>(code_outputs[pair]->data) : nullptr; };
         auto scales = [&](int pair) { return code_outputs[pair] ? static_cast<float*>(scale_outputs[pair]->data) : nullptr; };
         auto int8 = [&](int pair) { return code_outputs[pair] && code_outputs[pair]->dtype == RAD_I8; };
-        const char* fused_flag = std::getenv("RAD_HC_UPMIX_FUSED");
-        const char* split_up = std::getenv("RAD_HC_UP_SPLIT");
+        const char* fused_flag = (r3d_tolerance_path("RAD_HC_UPMIX_FUSED") ? "1" : nullptr);
+        const char* split_up = (r3d_tolerance_path("RAD_HC_UP_SPLIT") ? "1" : nullptr);
         if (split_up && std::strcmp(split_up, "0") != 0) {
             up_split<<<dim3(wide / 64, rows), 256, 0, device_stream>>>(intermediate, up_data, gates, up_gates, up_logits);
             mix_quant_exact<<<dim3(width / 128, rows), 128, 0, device_stream>>>(normalized, gates,
