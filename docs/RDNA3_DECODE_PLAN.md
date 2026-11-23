@@ -153,10 +153,8 @@ There are 170 calls at about 10 us, near the launch floor.
 - Merge calls that share one input into one launch over concatenated outputs: attention K + V, and the shared expert's gate_up.
 - The per-output arithmetic is unchanged.
 
-### T5: HC tolerance as one kernel (opt-in; target 3.08 -> ~1.6 ms)
-Under the opt-in flags HC is `strict_norm_parallel` + `down_inject_split` + `up_split` + `mix_quant`, four launches and about 32 us per call. Strata's `rdna_gr_fused` does it in about 16 us.
-- Fuse them into one kernel with a device-wide arrival counter between down and up, as `hc_up_mix_tiled` does for its groups.
-- Needs a decision on making tolerance HC the TP2 default (open, user).
+### T5: HC tolerance as one kernel (default; original target 3.08 -> ~1.6 ms)
+At one decode row, `hc_fused` replaces four launches with one (down, grid barrier, up, mix/quant). `RAD_HC_FUSED=0` disables it; `RAD_PRECISION=exact` disables all tolerance paths. Strata's `rdna_gr_fused` is about 16 us per call. Our measured HC kernel sum fell from 3.029 to 2.027 ms/token on W7900 TP2, with 97 calls per token.
 
 ## TP2 projection
 
@@ -182,5 +180,21 @@ Under the opt-in flags HC is `strict_norm_parallel` + `down_inject_split` + `up_
 | T2a/b/c launch reduction | T2a done; T2b/c deferred | `RAD_TP2_AR_GATHER_FUSED`: one-row gather inside the fused AR, `gather_kernel` 0.41 ms and 48 launches removed. T2b needs a graph-level fusion; T2c saves only ~0.1-0.2 ms |
 | T3 MoE down | partial | LDS staging [16][128] -> [10][128]: 1.55 -> 1.39 ms. Offsets in LDS (slower) and 256-thread blocks (no gain) were reverted |
 | T4 int8 GEMV | no change | K + V merge is only 12 launches; a weight-preload try was slower (1.68 -> 1.78 ms) and was reverted. Open: K-split with an ascending fold |
-| T5 HC fused (opt-in) | open | `up_split` rows-per-block tuning gave no gain (reverted). A single kernel needs a grid barrier; waits on the tolerance-default decision |
-| After T1-T5 | measured | default 44.4-44.5 tok/s (22.50 ms), opt-in 54.82 (18.24 ms); Strata 65.75 (15.21 ms). Default byte-identical to strict; device suite 72 pass |
+| T5 HC fused (tolerance default) | done | `fd34af7`: 388 -> 97 HC dispatches/token; 1422 -> 1131 total. Exact unchanged. |
+| After T1-T5 | measured | Tolerance 59.50 tok/s (repeat 57.97), exact 44.64 (repeat 44.25), Strata 65.75. Both modes 6/6 tasks; forced exact 9/9 identical to strict. |
+
+### HC sync follow-up (2026-11-23)
+
+On GPU4, rotating 48 layers of weights, compare uninstrumented event timings within each experiment. Per-block timestamp runs are separate and more intrusive.
+
+| Step | Measured outcome | Decision |
+|---|---|---|
+| D1/D2: delay up loads; inspect gfx1100 ISA | Early 21.54 vs late 22.21 us. No-up control still had 6.62 us first-to-last exit spread. Up operands pinned before the barrier; generation and atomic return have their own waits. | Keep early loads; no A1 weakened-fence experiment. |
+| D3/D4: workload and startup | Squares groups last in 59/96 launches. Empty 168/84/48-block launch cost stayed 3.13 us; start spread 3.45/1.63/0.73 us. | Test work distribution at equal work. |
+| A2: hierarchical arrival | 21.90 vs 21.66 us; last arrival to first release 1.15 vs 0.88 us. | Keep single counter. |
+| B1: remap squares/inject | Last arrival 11.497 vs 11.479 us. | No mapping change. |
+| B2: split LDS / register inputs | 22.58 / 24.88 vs 21.53 us. | Keep full-slice LDS staging. |
+| B3: equal-work 84 x 512 | Under matched cooperative launch: 34.00 vs 34.21 us, overlapping ranges; real startup spread improved only 0.22 us. | No serving change. |
+| C1: AR write -> HC read | 48 plain + 47 gather consecutive same-queue pairs per token out of 97 reads. About 0.397 ms/token in stamped inter-dispatch gaps. | Feasibility only. Prototype plain pairs first; require graph adjacency, peer sequence ownership, publication of both hidden halves, safe inject lifetime and forward progress. |
+
+No new barrier or scheduling variant was promoted. B1/B2/B3 matched eight output buffers over 96 changing inputs. Source of the runtime baseline is `fd34af7`.
