@@ -3,6 +3,8 @@
 #include "rad_device.h"
 #include <hip/hip_runtime.h>
 #include <climits>
+#include <map>
+#include <mutex>
 #include "r3d_flags.h"
 
 // Stage timing (the profile entry, a test hook) uses the host's events. Weak, so the plugin
@@ -785,20 +787,224 @@ __global__ __launch_bounds__(256) void up_split(const uint16_t* intermediate, co
     if (trace_logits) trace_logits[index] = sum;
     if (trace_gates) trace_gates[index] = gated;
 }
-// strict_mix followed by both strict_quant passes for one 128-channel group.
-__global__ __launch_bounds__(128) void mix_quant_exact(const uint16_t* normalized, const uint16_t* gates,
+// RAD_HC_FUSED (tolerance, one row): the read as two kernels plus mix_quant_exact. The down runs
+// split-K over (16-row group, half-stream slice) blocks on h * (gain + wadd), before any norm, and
+// each slice's sum of squares; the up blocks fold the slices with each stream's 1/rms (the norm
+// moved after the dot product), then run up_split's rows and write their channels' norm.
+constexpr int fused_half = width / 2, fused_rows = rank + streams, fused_slices = 2 * streams;
+struct FusedArgs {
+    const uint16_t* hidden; const float* gains; float wadd, eps;
+    const uint8_t* down; const uint16_t* inject_weights; const uint8_t* up;
+    float* part; float* squares; uint16_t* gates; uint16_t* normalized; uint16_t* inject_out; uint16_t* output;
+    uint8_t* plain_codes; float* plain_scales; bool plain_int8;
+    uint8_t* rotated_codes; float* rotated_scales; bool rotated_int8;
+    unsigned* barrier;
+};
+constexpr int fused_groups = rank / 16 + 1, fused_blocks = fused_groups * fused_slices;
+constexpr int fused_barrier_words = 2 + width / 128;
+static_assert(fused_blocks >= wide / 64 && fused_blocks >= width / 128);
+// Self-resetting grid barrier: [0] counts arrivals, [1] is the generation; [2, 2 + width / 128)
+// count the up blocks done per mix group. Every block of the grid is resident (fused_barrier asks
+// for four blocks per unit at most).
+__device__ void fused_grid_sync(unsigned* barrier) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned generation = __hip_atomic_load(barrier + 1, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+        if (__hip_atomic_fetch_add(barrier, 1U, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT) == unsigned(fused_blocks - 1)) {
+            __hip_atomic_store(barrier, 0U, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __hip_atomic_fetch_add(barrier + 1, 1U, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        } else {
+            while (__hip_atomic_load(barrier + 1, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == generation)
+                __builtin_amdgcn_s_sleep(1);
+        }
+    }
+    __syncthreads();
+    __threadfence();
+}
+__device__ __forceinline__ float sigmoid_fast(float value) { return 1.0f / (1.0f + __expf(-value)); }
+// The dot products run on bf16 pairs with v_dot2_f32_bf16. Inputs are staged as bf16 times 2^100
+// in pairs (elements 0,2 | 1,3 of each four), matching fused_e4m3x4; a code decodes by bit moves
+// to bf16 at 2^-120 times its value, so a sum is 2^-20 times the dot product.
+typedef short fused_v2s __attribute__((ext_vector_type(2)));
+constexpr float fused_input_scale = 0x1p100f, fused_sum_scale = 0x1p20f;
+__device__ __forceinline__ int fused_pair_slot(int element) {
+    return ((element >> 2) * 2 + (element & 1)) * 2 + ((element >> 1) & 1);
+}
+__device__ __forceinline__ float fused_dot2(uint32_t weights, uint32_t inputs, float sum) {
+    return __builtin_amdgcn_fdot2_f32_bf16(__builtin_bit_cast(fused_v2s, weights),
+        __builtin_bit_cast(fused_v2s, inputs), sum, false);
+}
+__device__ __forceinline__ float fused_e4m3x4(uint32_t word, uint32_t even_inputs, uint32_t odd_inputs, float sum) {
+    const uint32_t even = ((word & 0x007f007fU) << 4) | ((word & 0x00800080U) << 8);
+    const uint32_t odd = ((word >> 4) & 0x07f007f0U) | (word & 0x80008000U);
+    return fused_dot2(odd, odd_inputs, fused_dot2(even, even_inputs, sum));
+}
+template <bool Fused>
+__device__ void mix_quant_body(const uint16_t* normalized, const uint16_t* gates,
     uint16_t* output, uint8_t* plain_codes, float* plain_scales, bool plain_int8,
-    uint8_t* rotated_codes, float* rotated_scales, bool rotated_int8) {
+    uint8_t* rotated_codes, float* rotated_scales, bool rotated_int8, int group, int row);
+// Down: 16 rows (two per wave) of one half-stream slice, on h * (gain + wadd); group 0 also
+// writes the slice's sum of squares.
+__device__ void fused_down(const FusedArgs& a, uint32_t* xs, float* waves, int group, int slice) {
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const int first = (slice >> 1) * width + (slice & 1) * fused_half, row0 = group * 16 + wave * 2;
+    constexpr int steps = fused_half / 256;
+    const bool down_rows = row0 < rank, inject_rows = !down_rows && a.inject_weights && row0 < fused_rows;
+    uint2 codes[2][steps];
+    uint4 packed[2][steps];
+    float scales[2][steps];
+    if (down_rows) {
+#pragma unroll
+        for (int pair = 0; pair < 2; ++pair) {
+            const uint8_t* line = a.down + size_t(row0 + pair) * down_pitch;
+#pragma unroll
+            for (int step = 0; step < steps; ++step) {
+                codes[pair][step] = *reinterpret_cast<const uint2*>(line + first + step * 256 + lane * 8);
+                scales[pair][step] = reinterpret_cast<const float*>(line + wide)[(first + step * 256 + lane * 8) / 128];
+            }
+        }
+    } else if (inject_rows) {
+#pragma unroll
+        for (int pair = 0; pair < 2; ++pair)
+#pragma unroll
+            for (int step = 0; step < steps; ++step)
+                packed[pair][step] = *reinterpret_cast<const uint4*>(a.inject_weights + size_t(row0 + pair - rank) * wide + first + step * 256 + lane * 8);
+    }
+    auto* slots = reinterpret_cast<uint16_t*>(xs);
+    float square = 0;
+    for (int index = tid; index < fused_half; index += 256) {
+        const float value = widen_bf16(a.hidden[first + index]);
+        slots[fused_pair_slot(index)] = narrow_bf16(value * (a.gains[first + index] + a.wadd) * fused_input_scale);
+        square += value * value;
+    }
+    if (group == 0) {
+        for (int offset = 16; offset; offset >>= 1) square += __shfl_xor(square, offset, 32);
+        if (lane == 0) waves[wave] = square;
+    }
+    __syncthreads();
+    if (group == 0 && tid == 0) {
+        float total = 0;
+        for (int index = 0; index < 8; ++index) total += waves[index];
+        a.squares[slice] = total;
+    }
+    if (!down_rows && !inject_rows) return;
+#pragma unroll
+    for (int pair = 0; pair < 2; ++pair) {
+        float sum = 0;
+        if (down_rows) {
+#pragma unroll
+            for (int step = 0; step < steps; ++step) {
+                const int k = step * 256 + lane * 8;
+                const uint4 inputs = *reinterpret_cast<const uint4*>(xs + k / 2);
+                const float part = fused_e4m3x4(codes[pair][step].y, inputs.z, inputs.w,
+                    fused_e4m3x4(codes[pair][step].x, inputs.x, inputs.y, 0.0f));
+                sum += part * scales[pair][step];
+            }
+            sum *= fused_sum_scale;
+        } else {
+#pragma unroll
+            for (int step = 0; step < steps; ++step) {
+                const int k = step * 256 + lane * 8;
+                const uint4 inputs = *reinterpret_cast<const uint4*>(xs + k / 2);
+                const uint4 w = packed[pair][step];
+                sum = fused_dot2(__builtin_amdgcn_perm(w.y, w.x, 0x05040100U), inputs.x, sum);
+                sum = fused_dot2(__builtin_amdgcn_perm(w.y, w.x, 0x07060302U), inputs.y, sum);
+                sum = fused_dot2(__builtin_amdgcn_perm(w.w, w.z, 0x05040100U), inputs.z, sum);
+                sum = fused_dot2(__builtin_amdgcn_perm(w.w, w.z, 0x07060302U), inputs.w, sum);
+            }
+            sum *= 0x1p-100f;
+        }
+        for (int offset = 16; offset; offset >>= 1) sum += __shfl_xor(sum, offset, 32);
+        if (lane == 0) a.part[slice * fused_rows + row0 + pair] = sum;
+    }
+}
+// The up codes are loaded by the caller before the down phase (they do not depend on it).
+// A block's 64 up rows are 16 channels of all four streams, so it holds every gate its channels mix.
+__device__ __forceinline__ int fused_up_row(int block, int row) {
+    return (row >> 4) * width + block * 16 + (row & 15);
+}
+__device__ void fused_up_load(const FusedArgs& a, int block, uint4* codes, float& factor) {
+    const int part_lane = threadIdx.x & 3;
+    const uint8_t* line = a.up + size_t(fused_up_row(block, threadIdx.x >> 2)) * up_pitch;
+#pragma unroll
+    for (int chunk = 0; chunk < 5; ++chunk) codes[chunk] = reinterpret_cast<const uint4*>(line + part_lane * 80)[chunk];
+    factor = reinterpret_cast<const float*>(line + rank)[part_lane];
+}
+// Up: fold the slices with each stream's 1/rms (the norm after the dot product), then up_split's
+// 64 rows; the block also writes those rows' norm, and block 0 the inject gates. The last of the
+// eight blocks of a 128-channel group to finish runs that group's mix and quant.
+__device__ void fused_up(const FusedArgs& a, uint32_t* activation, float* scale_of, int block, const uint4* codes,
+    float factor) {
+    const int tid = threadIdx.x, part_lane = tid & 3, output_row = fused_up_row(block, tid >> 2);
+    // The partials load with the squares (one round trip), two rows per thread.
+    const int folded = block == 0 && a.inject_out ? fused_rows : rank;
+    float parts[2][fused_slices];
+#pragma unroll
+    for (int pass = 0; pass < 2; ++pass)
+#pragma unroll
+        for (int slice = 0; slice < fused_slices; ++slice)
+            parts[pass][slice] = tid + pass * 256 < folded ? a.part[slice * fused_rows + tid + pass * 256] : 0.0f;
+    if (tid < streams)
+        scale_of[tid] = __fdiv_rn(1.0f, sqrtf((a.squares[2 * tid] + a.squares[2 * tid + 1]) / float(width) + a.eps));
+    __syncthreads();
+    auto* slots = reinterpret_cast<uint16_t*>(activation);
+#pragma unroll
+    for (int pass = 0; pass < 2; ++pass) {
+        const int j = tid + pass * 256;
+        if (j >= folded) continue;
+        float sum = 0;
+        for (int stream = 0; stream < streams; ++stream)
+            sum += scale_of[stream] * (parts[pass][2 * stream] + parts[pass][2 * stream + 1]);
+        const float divided = sum / float(streams);
+        if (j < rank) slots[fused_pair_slot(j)] = narrow_bf16(divided * sigmoid_fast(divided) * fused_input_scale);
+        else a.inject_out[j - rank] = narrow_bf16(2.0f * sigmoid_fast(divided));
+    }
+    if (tid < 64) {
+        const int index = fused_up_row(block, tid);
+        a.normalized[index] = narrow_bf16((widen_bf16(a.hidden[index]) * scale_of[index / width]) * (a.gains[index] + a.wadd));
+    }
+    __syncthreads();
+    float sum = 0;
+#pragma unroll
+    for (int chunk = 0; chunk < 5; ++chunk) {
+        const uint32_t* inputs = activation + (part_lane * 80 + chunk * 16) / 2;
+        sum = fused_e4m3x4(codes[chunk].x, inputs[0], inputs[1], sum);
+        sum = fused_e4m3x4(codes[chunk].y, inputs[2], inputs[3], sum);
+        sum = fused_e4m3x4(codes[chunk].z, inputs[4], inputs[5], sum);
+        sum = fused_e4m3x4(codes[chunk].w, inputs[6], inputs[7], sum);
+    }
+    sum *= fused_sum_scale * factor;
+    sum += __shfl_xor(sum, 1, 4);
+    sum += __shfl_xor(sum, 2, 4);
+    if (!part_lane) a.gates[output_row] = narrow_bf16(sigmoid_fast(sum));
+    __shared__ bool last;
+    __syncthreads();
+    if (tid == 0) {
+        unsigned* count = a.barrier + 2 + block / 8;
+        last = __hip_atomic_fetch_add(count, 1U, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT) == 7;
+        if (last) __hip_atomic_store(count, 0U, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    mix_quant_body<true>(a.normalized, a.gates, a.output, a.plain_codes, a.plain_scales, a.plain_int8,
+        a.rotated_codes, a.rotated_scales, a.rotated_int8, block / 8, 0);
+}
+template <bool Fused>
+__device__ void mix_quant_body(const uint16_t* normalized, const uint16_t* gates,
+    uint16_t* output, uint8_t* plain_codes, float* plain_scales, bool plain_int8,
+    uint8_t* rotated_codes, float* rotated_scales, bool rotated_int8, int group, int row) {
     __shared__ float values[128], partial[4];
     __shared__ float scale;
-    const int lane = threadIdx.x, group = blockIdx.x, row = blockIdx.y, channel = group * 128 + lane;
+    const int lane = threadIdx.x & 127, channel = group * 128 + lane;
+    const bool active = !Fused || threadIdx.x < 128;
     float total = 0;
     for (int source = 0; source < streams; ++source) {
         const size_t index = size_t(row) * wide + source * width + channel;
-        total += widen_bf16(gates[index]) * widen_bf16(normalized[index]);
+        if (active) total += widen_bf16(gates[index]) * widen_bf16(normalized[index]);
     }
     const uint16_t mixed = narrow_bf16(total / float(streams));
-    output[size_t(row) * width + channel] = mixed;
+    if (active) output[size_t(row) * width + channel] = mixed;
     const size_t group_index = size_t(row) * (width / 128) + group;
     for (int pair = 0; pair < 2; ++pair) {
         uint8_t* codes = pair ? rotated_codes : plain_codes;
@@ -812,9 +1018,9 @@ __global__ __launch_bounds__(128) void mix_quant_exact(const uint16_t* normalize
             }
             for (int step = 32; step < 128; step *= 2) {
                 __syncthreads();
-                values[lane] = own;
+                if (active) values[lane] = own;
                 __syncthreads();
-                const float other = values[lane ^ step];
+                const float other = active ? values[lane ^ step] : 0.0f;
                 own = lane & step ? other - own : own + other;
             }
         }
@@ -822,20 +1028,70 @@ __global__ __launch_bounds__(128) void mix_quant_exact(const uint16_t* normalize
         float maximum = fabsf(own);
         for (int distance = 16; distance; distance >>= 1) maximum = fmaxf(maximum, __shfl_xor(maximum, distance, 32));
         __syncthreads();
-        if ((lane & 31) == 0) partial[lane >> 5] = maximum;
+        if (active && (lane & 31) == 0) partial[lane >> 5] = maximum;
         __syncthreads();
         const float top = int8_codes ? 127.0f : 448.0f;
-        if (lane == 0) {
+        if (threadIdx.x == 0) {
             maximum = fmaxf(fmaxf(fmaxf(partial[0], partial[1]), fmaxf(partial[2], partial[3])), 0.0f);
             scale = maximum > 0 ? maximum * __fdiv_rn(1.0f, top) : 1.0f;
             (pair ? rotated_scales : plain_scales)[group_index] = scale;
         }
         __syncthreads();
         const float value = fminf(fmaxf(own * __fdiv_rn(1.0f, scale), -top), top);
-        codes[group_index * 128 + lane] = int8_codes ? uint8_t(__float2int_rn(value)) : encode_e4m3(value);
+        if (active) codes[group_index * 128 + lane] = int8_codes ? uint8_t(__float2int_rn(value)) : encode_e4m3(value);
     }
 }
-
+__global__ __launch_bounds__(128) void mix_quant_exact(const uint16_t* normalized, const uint16_t* gates,
+    uint16_t* output, uint8_t* plain_codes, float* plain_scales, bool plain_int8,
+    uint8_t* rotated_codes, float* rotated_scales, bool rotated_int8) {
+    mix_quant_body<false>(normalized, gates, output, plain_codes, plain_scales, plain_int8, rotated_codes,
+        rotated_scales, rotated_int8, blockIdx.x, blockIdx.y);
+}
+// RAD_HC_FUSED (tolerance, one row): the whole read as one grid of fused_blocks, down (one item
+// per block) and up (wide / 64 blocks, each finishing mix + quant groups) split by the grid barrier.
+__global__ __launch_bounds__(256) void hc_fused(FusedArgs a) {
+    __shared__ __align__(16) uint32_t xs[fused_half / 2];
+    __shared__ __align__(16) uint32_t activation[rank / 2];
+    __shared__ float waves[8], scale_of[streams];
+    uint4 up_codes[5]{};
+    float up_factor = 0;
+    if (blockIdx.x < wide / 64) fused_up_load(a, blockIdx.x, up_codes, up_factor);
+    fused_down(a, xs, waves, blockIdx.x % fused_groups, blockIdx.x / fused_groups);
+    // Keep the up loads ahead of the barrier: the compiler may otherwise sink them past it.
+#pragma unroll
+    for (int chunk = 0; chunk < 5; ++chunk)
+        asm volatile("" : "+v"(up_codes[chunk].x), "+v"(up_codes[chunk].y), "+v"(up_codes[chunk].z), "+v"(up_codes[chunk].w));
+    asm volatile("" : "+v"(up_factor));
+    fused_grid_sync(a.barrier);
+    if (blockIdx.x < wide / 64) fused_up(a, activation, scale_of, blockIdx.x, up_codes, up_factor);
+}
+// The barrier words for hc_fused on one stream, zeroed once; null when the device cannot hold the
+// whole grid at four blocks per unit (gfx11 counts WGPs; one holds eight such blocks). Kept for
+// the process (22 words per stream).
+unsigned* fused_barrier(hipStream_t stream) {
+    static std::mutex mutex;
+    static std::map<hipStream_t, unsigned*> barriers;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (auto found = barriers.find(stream); found != barriers.end()) return found->second;
+    int device = 0, units = 0;
+    void* words = nullptr;
+    if (hipGetDevice(&device) != hipSuccess
+        || hipDeviceGetAttribute(&units, hipDeviceAttributeMultiprocessorCount, device) != hipSuccess
+        || 4 * units < fused_blocks) {
+        barriers.emplace(stream, nullptr);
+        return nullptr;
+    }
+    // As ru_conv_ctr: the engine's hipMemset has finished on return; HIP's own runs on the null
+    // stream, which a non-blocking stream does not wait for.
+    constexpr size_t bytes = fused_barrier_words * sizeof(unsigned);
+    if (hipMalloc(&words, bytes) != hipSuccess) return nullptr;
+    if (hipMemset(words, 0, bytes) != hipSuccess || hipDeviceSynchronize() != hipSuccess) {
+        (void)hipFree(words);
+        return nullptr;
+    }
+    barriers.emplace(stream, static_cast<unsigned*>(words));
+    return static_cast<unsigned*>(words);
+}
 
 bool dense(const RadTensor* tensor, uint32_t dtype, int64_t count) {
     if (!tensor || tensor->dtype != dtype || tensor->rank < 1 || tensor->rank > RAD_MAX_RANK)
@@ -1044,6 +1300,37 @@ int strict_launch(const RadArgs* args, RadStream stream, const R3dhHcTrace* trac
         RadEvent events[7]{};
         ~StageEvents() { for (auto event : events) if (event) rad_event_destroy(event); }
     } timing;
+    const bool fused_room = aligned(size_t(r3dh_hc_geti_or(args, "M", 0)) * rank * 2)
+        >= sizeof(float) * (fused_slices * fused_rows + fused_slices);
+    unsigned* barrier = nullptr;
+    if (rows == 1 && !trace && !stage_us && fused_room && r3d_tolerance_path("RAD_HC_FUSED")
+        && !(reinterpret_cast<uintptr_t>(down_data) & 15) && !(reinterpret_cast<uintptr_t>(up_data) & 15)
+        && !(inject_weights && (reinterpret_cast<uintptr_t>(inject_weights->data) & 15))
+        && (barrier = fused_barrier(device_stream))) {
+        FusedArgs fused{};
+        fused.hidden = static_cast<const uint16_t*>(hidden->data);
+        fused.gains = static_cast<const float*>(weights->data);
+        fused.wadd = wadd;
+        fused.eps = eps;
+        fused.down = down_data;
+        fused.inject_weights = inject_weights ? static_cast<const uint16_t*>(inject_weights->data) : nullptr;
+        fused.up = up_data;
+        fused.part = reinterpret_cast<float*>(intermediate);
+        fused.squares = fused.part + fused_slices * fused_rows;
+        fused.gates = gates;
+        fused.normalized = normalized;
+        fused.inject_out = inject_weights ? static_cast<uint16_t*>(inject->data) : nullptr;
+        fused.output = static_cast<uint16_t*>(output->data);
+        for (int pair = 0; pair < 2; ++pair) {
+            if (!code_outputs[pair]) continue;
+            (pair ? fused.rotated_codes : fused.plain_codes) = static_cast<uint8_t*>(code_outputs[pair]->data);
+            (pair ? fused.rotated_scales : fused.plain_scales) = static_cast<float*>(scale_outputs[pair]->data);
+            (pair ? fused.rotated_int8 : fused.plain_int8) = code_outputs[pair]->dtype == RAD_I8;
+        }
+        fused.barrier = barrier;
+        hc_fused<<<fused_blocks, 256, 0, device_stream>>>(fused);
+        return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    }
     if (stage_us) {
         for (auto& event : timing.events)
             if (rad_event_create(&event) != RAD_OK) return RAD_E_DEVICE;

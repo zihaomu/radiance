@@ -4,9 +4,10 @@
 
 // RDNA3 fast paths whose output is bit-identical to the strict kernels are on by default;
 // setting the variable to 0 selects the strict kernel. Paths that reorder floating-point work
-// follow RAD_PRECISION (below): RAD_LOGITS_WAVE, RAD_HC_DOWN_SPLIT and RAD_HC_UP_SPLIT are on in
-// the default tolerance mode; RAD_HC_NORM_INJECT_FUSED, RAD_HC_WMMA, RAD_HC_MATRIX_DOWN,
-// RAD_HC_UPMIX_FUSED and RAD_ATTN_SPLIT stay opt-in. Exact paths without a measured serving gain
+// follow RAD_PRECISION (below): RAD_LOGITS_WAVE, RAD_HC_FUSED (the one-row HC read as one grid),
+// RAD_HC_DOWN_SPLIT and RAD_HC_UP_SPLIT are on in the default tolerance mode;
+// RAD_HC_NORM_INJECT_FUSED, RAD_HC_WMMA, RAD_HC_MATRIX_DOWN, RAD_HC_UPMIX_FUSED and
+// RAD_ATTN_SPLIT stay opt-in. Exact paths without a measured serving gain
 // stay opt-in too and are read where they are used.
 inline constexpr const char* r3d_exact_flags[]{
     "RAD_IQR_FUSED_WMMA", "RAD_IQR_FUSED_DECODE", "RAD_IQR_U5_WAVE", "RAD_IQR_U5_QG",
@@ -21,8 +22,8 @@ inline constexpr const char* r3d_exact_flags[]{
 // RAD_PRECISION picks the numerics. Unset or "tolerance" (the default), the validated paths that
 // reorder floating-point work are on unless set to "0"; "exact" turns every reordering path off,
 // so the output is bit-identical to the strict kernels whatever else is set.
-inline constexpr const char* r3d_tolerance_defaults[]{"RAD_LOGITS_WAVE", "RAD_HC_DOWN_SPLIT",
-    "RAD_HC_UP_SPLIT"};
+inline constexpr const char* r3d_tolerance_defaults[]{"RAD_LOGITS_WAVE", "RAD_HC_FUSED",
+    "RAD_HC_DOWN_SPLIT", "RAD_HC_UP_SPLIT"};
 
 inline bool r3d_precision_exact() {
     const char* value = std::getenv("RAD_PRECISION");
