@@ -15,7 +15,7 @@ Both tests sent the same 55-token, non-thinking English water-cycle prompt, requ
 
 The observed TP2/TP1 ratio is 1.53. TP1 allowed 4 sequences, a 43,000 MiB host pool and 4096 prefill tokens per batch; TP2 allowed 8 sequences, a 12,288 MiB host pool and 2048 prefill tokens per batch. Both configured `max-model-len: 200000`. `wht6` uses a lossy cross-card transfer path. The different budgets and request histories mean the ratio is a deployment comparison, not a controlled TP-only speedup or a claim about equal output quality.
 
-An earlier TP1 MTP0 experiment used a different 32K-token prompt and its measured requests crossed an expert-prefetch warm-up transition. It does not provide a fully warmed result for the short-prompt table. The original diagnostic record remains in the local experiment workspace. A [matched warm benchmark protocol](r9700-flash-next-warm-protocol.md) specifies the replacement measurement.
+An earlier TP1 MTP0 experiment used a different 32K-token prompt and its measured requests crossed an expert-prefetch warm-up transition. It does not provide a fully warmed result for the short-prompt table. The original diagnostic record remains in the local experiment workspace. The [new matched warm measurements](r9700-flash-next-warm-20261124.md) use the same prompt and GPU for TP1 MTP0/MTP3.
 
 ## Separate long-context TP2 observation, 2026-11-24
 

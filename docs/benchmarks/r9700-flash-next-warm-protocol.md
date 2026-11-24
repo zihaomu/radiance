@@ -1,6 +1,6 @@
 # Matched warm benchmark plan: Qwen3.8-Flash-Next on R9700
 
-Status: protocol only; the matched MTP0 measurements have not yet been run. New MTP0 and code results must pass the warm-state and control gates below before appearing in the README. The existing MTP3 essay numbers retain their separately documented historical protocol until replaced by a qualified matched run.
+Status: executed on 2026-11-24. This is the original plan; the [measurement report](r9700-flash-next-warm-20261124.md) records the observed results, method deviations and the user-accepted 5.4% archive MTP3 start drift.
 
 ## Question and scope
 

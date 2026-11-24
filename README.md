@@ -30,13 +30,23 @@ MTP3 rates are workload-specific. Empty cells mean no verified result is listed,
 |---|---:|---:|---:|---:|---:|---|
 | Radeon PRO W7900D (48 GiB/card) | 1 | 35.01 | | | | [W7900](https://github.com/zihaomu/radiance/tree/rdna3_w7900_qwen3.8_flash_dev) |
 | Radeon PRO W7900D (48 GiB/card) | 2 | 61.54 | 45.32 | | | [W7900](https://github.com/zihaomu/radiance/tree/rdna3_w7900_qwen3.8_flash_dev) |
-| Radeon AI PRO R9700 (32 GiB/card) | 1 | | | 154.47 | | [R9700 TP1](https://github.com/zihaomu/radiance/tree/work/tp1-r9700) |
+| Radeon AI PRO R9700 (32 GiB/card) | 1 | 85.38 | | 149.40 | 177.13 | [R9700 TP1](https://github.com/zihaomu/radiance/tree/work/tp1-r9700) |
 | Radeon AI PRO R9700 (32 GiB/card) | 2 | | | 236.69 | | [R9700 TP2](https://github.com/zihaomu/radiance/tree/work/tp2-r9700) |
 | Strix Halo (Radeon 8060S) | 1 | 33.1 | | 58.7 | 71.2 | [Strix Halo v2](https://github.com/zihaomu/radiance/tree/halo-qwen3.8-flash-next-v2) |
 
 - **W7900D:** [Tested integration and configuration](https://codeberg.org/StillDeadcode/radiance/src/commit/06145aa7494228b09c3bee8e97c0c6a04cb8e688/docs/RDNA3_QWEN38_FLASH.md), source `26c1a1d`, ROCm 10.1. One sequence, 128 decoded tokens. TP1 is one smoke run; each TP2 figure is the median of six session medians (two warm-ups, five measured requests per session). MTP0 uses the default tolerance mode unless marked exact.
-- **R9700:** [Local measurements and raw results](docs/benchmarks/r9700-flash-next.md), 2026-11-16, radiance 2.1.0 (`2a2b7563`), ROCm 10.1. Each MTP3 essay figure is the server-reported median of eight warm, single-stream requests with the same 55-token prompt and 256 generated tokens. TP1 used one card; TP2 used two cards with `tp-wire: wht6`. The configurations differ in sequence and memory budgets, so these figures describe the tested deployments rather than an isolated TP scaling factor. A later, separate TP2 test at about 150K context measured 194.24 tok/s across 20 turns; see the linked report for its protocol. A fully warmed, matched TP1 MTP0 result and an R9700 MTP3 code result have not yet been measured; see the [matched warm benchmark protocol](docs/benchmarks/r9700-flash-next-warm-protocol.md).
+- **R9700:** The TP1 MTP0 and MTP3 essay figures are from the same 55-token prompt, 256-token output and physical GPU2, with two independent service starts per mode and eight measured requests per start after warm-up. The MTP3 code figure uses a separate 71-token Python prompt with the same warm-up protocol. See the [2026-11-24 matched warm report](docs/benchmarks/r9700-flash-next-warm-20261124.md) and its result JSON. TP2's 236.69 tok/s is an earlier warm essay measurement on physical GPU6/7 with different resource settings; see the [historical report](docs/benchmarks/r9700-flash-next.md). These TP1/TP2 figures are not an isolated scaling comparison.
 - **Strix Halo:** [Measured on the 8060S](https://github.com/zihaomu/radiance/commit/af87b4555910fab3d0c46d15b7184f27e59e177f). The same report records MTP3 edit workloads at **80.2 tok/s** (Python) and **80.5 tok/s** (C++). Its prompts and timing protocol are not the W7900D benchmark.
+
+The R9700 TP1 matched warm results use server-reported text decode tokens/s, with prefix caching off and no profiler in the timed requests. MTP0 in the main table is the **essay** result; the code and 32K contexts are separate below. Outputs differ between MTP0 and MTP3, so the rates describe those serving modes rather than an equal-output MTP speedup.
+
+| R9700 TP1 warm workload | Input / output tokens | MTP0 | MTP3 | Start-to-start drift |
+|---|---:|---:|---:|---:|
+| Essay | 55 / 256 | **85.38** | **149.40** | 1.1% / 1.7% |
+| Python code continuation | 71 / 256 | **85.32** | **177.13** | 0.3% / 0.3% |
+| Synthetic archive | 32,768 / 256 | **71.46** | **71.18** | 2.3% / **5.4%** |
+
+The archive MTP3 drift is 5.416%, above the protocol's original 5% limit; it is shown at the user's request with all samples retained. The code task is a fixed 256-token continuation and ends mid-function. An independent client SSE timing check was not run; the table uses server timings.
 
 ## Models
 

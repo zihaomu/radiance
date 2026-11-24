@@ -1,0 +1,187 @@
+{
+  "case": "essay",
+  "source": {
+    "case": "essay",
+    "card": 2,
+    "hip": 1,
+    "kfd": 2651,
+    "pci": "0000:43:00.0",
+    "model_size": 121678372864,
+    "model_sha256_prior_verified": "25aff8c950f4b823bc8b77c8184ed48827cb47058ffce08ae2c83b12e021fea0",
+    "model_full_sha_rechecked": false,
+    "image_id": "sha256:81ecc42c4215f48f19da0afd96deff692ee6da6799c907a3172d5dbc967d4298",
+    "source_baseline": "2a2b756371c26f2768b8d129a098df275ace2c73",
+    "source_diff": [
+      "README.md",
+      "docs/benchmarks/r9700-flash-next-tp1-decode-warm.json",
+      "docs/benchmarks/r9700-flash-next-tp2-150k-20turns.json",
+      "docs/benchmarks/r9700-flash-next-tp2-decode-warm.json",
+      "docs/benchmarks/r9700-flash-next-warm-protocol.md",
+      "docs/benchmarks/r9700-flash-next.md"
+    ],
+    "source_head": "c339e0cbfdd5b15dbf874a8ec7e819bd9ea1543d",
+    "binary_sha256": "8210861ca3dcea66d83a557a4c0f34f472af952a57a35c665ee7a9b4e6886763",
+    "prompt_sha256": "83b7e879d3b3ad0e3bc5d2d5449fa54b68e355d388da063b9ceaf50913227d6d"
+  },
+  "phases": [
+    {
+      "phase": "mtp0-a",
+      "mtp": 0,
+      "warmup_count": 5,
+      "warm_final_rates": [
+        87.52455325434362,
+        87.54626791076996,
+        87.51044245808887
+      ],
+      "measured_count": 8,
+      "measured_median": 85.98209831391785,
+      "measured_min": 80.70300058465432,
+      "measured_max": 87.40034243646105,
+      "measured_rates": [
+        86.77444271145711,
+        86.20028739676118,
+        85.58551877717586,
+        85.5322868081253,
+        85.76390923107449,
+        80.70300058465432,
+        87.09193655872924,
+        87.40034243646105
+      ],
+      "output_sha256": "7ffd41e1949f0df663fdb2e26ebec39d6336e927e94ae1dd22df0b99cf250245",
+      "draft_accepted_median": 0.0,
+      "max_server_arithmetic_relative_error": 0.0,
+      "client_wall_minus_server_ttft_proxy_relative_diff": 0.0008101201056001095,
+      "resource_samples": 59
+    },
+    {
+      "phase": "mtp3-a",
+      "mtp": 3,
+      "warmup_count": 6,
+      "warm_final_rates": [
+        149.98191862101436,
+        149.88629528654315,
+        150.80598953037875
+      ],
+      "measured_count": 8,
+      "measured_median": 146.84799168056236,
+      "measured_min": 140.62998391111915,
+      "measured_max": 150.62553989288187,
+      "measured_rates": [
+        150.62553989288187,
+        150.22929461889615,
+        140.62998391111915,
+        143.95667693922886,
+        143.00769927991945,
+        149.8636100981554,
+        149.7393064218959,
+        141.07859441856135
+      ],
+      "output_sha256": "048ba22c420c359294650121ccd08893866493e4e3c4ee7e97bae0f3f1ede75b",
+      "draft_accepted_median": 163.0,
+      "max_server_arithmetic_relative_error": 0.0,
+      "client_wall_minus_server_ttft_proxy_relative_diff": 0.0006692198850638542,
+      "resource_samples": 47
+    },
+    {
+      "phase": "mtp3-b",
+      "mtp": 3,
+      "warmup_count": 7,
+      "warm_final_rates": [
+        149.11060270710863,
+        149.37406406421758,
+        149.7714590612729
+      ],
+      "measured_count": 8,
+      "measured_median": 149.40330477745482,
+      "measured_min": 148.92992386684188,
+      "measured_max": 149.82258476605946,
+      "measured_rates": [
+        149.5254732584284,
+        149.6380437048879,
+        149.45162234896537,
+        149.3269550415065,
+        149.3549872059443,
+        149.82258476605946,
+        149.17145331145977,
+        148.92992386684188
+      ],
+      "output_sha256": "048ba22c420c359294650121ccd08893866493e4e3c4ee7e97bae0f3f1ede75b",
+      "draft_accepted_median": 163.0,
+      "max_server_arithmetic_relative_error": 0.0,
+      "client_wall_minus_server_ttft_proxy_relative_diff": 0.0016567036083244835,
+      "resource_samples": 42
+    },
+    {
+      "phase": "mtp0-b",
+      "mtp": 0,
+      "warmup_count": 8,
+      "warm_final_rates": [
+        84.7952001734802,
+        84.95852831566849,
+        85.0647886889472
+      ],
+      "measured_count": 8,
+      "measured_median": 85.04190320903116,
+      "measured_min": 84.59467490753266,
+      "measured_max": 85.42373655773632,
+      "measured_rates": [
+        84.97824656029344,
+        85.42373655773632,
+        85.31718326564075,
+        85.33809559619652,
+        84.90585695185084,
+        85.02097682884843,
+        84.59467490753266,
+        85.06282958921389
+      ],
+      "output_sha256": "7ffd41e1949f0df663fdb2e26ebec39d6336e927e94ae1dd22df0b99cf250245",
+      "draft_accepted_median": 0.0,
+      "max_server_arithmetic_relative_error": 0.0,
+      "client_wall_minus_server_ttft_proxy_relative_diff": 0.00042485201506281545,
+      "resource_samples": 54
+    }
+  ],
+  "modes": {
+    "0": {
+      "start_medians": [
+        85.98209831391785,
+        85.04190320903116
+      ],
+      "start_ratio": 1.0110556686693113,
+      "pooled_median": 85.38091607696643,
+      "pooled_min": 80.70300058465432,
+      "pooled_max": 87.40034243646105,
+      "output_sha256": "7ffd41e1949f0df663fdb2e26ebec39d6336e927e94ae1dd22df0b99cf250245",
+      "publishable": true
+    },
+    "3": {
+      "start_medians": [
+        146.84799168056236,
+        149.40330477745482
+      ],
+      "start_ratio": 1.0174010762261634,
+      "pooled_median": 149.40330477745482,
+      "pooled_min": 140.62998391111915,
+      "pooled_max": 150.62553989288187,
+      "output_sha256": "048ba22c420c359294650121ccd08893866493e4e3c4ee7e97bae0f3f1ede75b",
+      "publishable": true
+    }
+  },
+  "comparison_ratio": 1.749844246725762,
+  "cross_mode_output_equal": false,
+  "problems": [],
+  "no_hook_service_timing_qualified": true,
+  "independent_client_sse_check_completed": false,
+  "publication_decision": "publish_server_decode_measurement",
+  "publication_context": {
+    "date_local": "2026-11-24",
+    "reported_metric": "server predicted_per_second, median of 16 measured warm requests per mode",
+    "independent_client_sse_check": "not run; HTTP wall minus server TTFT was a sanity check only",
+    "original_start_drift_gate": 1.05,
+    "user_accepted_exception": false,
+    "exception_detail": null,
+    "cross_mode_output_equal": false,
+    "model_full_sha_rechecked_this_run": false,
+    "model_sha_provenance": "Prior full SHA-256 verification and unchanged size/mtime; current executable and image recorded."
+  }
+}

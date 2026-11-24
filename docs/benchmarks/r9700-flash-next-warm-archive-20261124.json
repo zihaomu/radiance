@@ -1,0 +1,189 @@
+{
+  "case": "archive",
+  "source": {
+    "case": "archive",
+    "card": 2,
+    "hip": 1,
+    "kfd": 2651,
+    "pci": "0000:43:00.0",
+    "model_size": 121678372864,
+    "model_sha256_prior_verified": "25aff8c950f4b823bc8b77c8184ed48827cb47058ffce08ae2c83b12e021fea0",
+    "model_full_sha_rechecked": false,
+    "image_id": "sha256:81ecc42c4215f48f19da0afd96deff692ee6da6799c907a3172d5dbc967d4298",
+    "source_baseline": "2a2b756371c26f2768b8d129a098df275ace2c73",
+    "source_diff": [
+      "README.md",
+      "docs/benchmarks/r9700-flash-next-tp1-decode-warm.json",
+      "docs/benchmarks/r9700-flash-next-tp2-150k-20turns.json",
+      "docs/benchmarks/r9700-flash-next-tp2-decode-warm.json",
+      "docs/benchmarks/r9700-flash-next-warm-protocol.md",
+      "docs/benchmarks/r9700-flash-next.md"
+    ],
+    "source_head": "c339e0cbfdd5b15dbf874a8ec7e819bd9ea1543d",
+    "binary_sha256": "8210861ca3dcea66d83a557a4c0f34f472af952a57a35c665ee7a9b4e6886763",
+    "prompt_sha256": "e7e3bd61ea7a2997a3791bba19ff56ead844ed47353a548ec12f2de9c89e87a6"
+  },
+  "phases": [
+    {
+      "phase": "mtp0-a",
+      "mtp": 0,
+      "warmup_count": 7,
+      "warm_final_rates": [
+        71.27772404518197,
+        71.26583909893861,
+        71.3655983046852
+      ],
+      "measured_count": 8,
+      "measured_median": 72.4144284275453,
+      "measured_min": 71.3833773726455,
+      "measured_max": 73.03597149595296,
+      "measured_rates": [
+        71.52669960900718,
+        73.03597149595296,
+        72.72629767115089,
+        72.39881829047495,
+        72.60815528222686,
+        72.43003856461566,
+        71.3833773726455,
+        71.7083022012091
+      ],
+      "output_sha256": "8bb7c8e3b3f23cfd4f3d0f4a57a55b58ed08ca2c9d9b72b643bb688e1fa94ad3",
+      "draft_accepted_median": 0.0,
+      "max_server_arithmetic_relative_error": 0.0,
+      "client_wall_minus_server_ttft_proxy_relative_diff": 0.0005658615089568775,
+      "resource_samples": 116
+    },
+    {
+      "phase": "mtp3-a",
+      "mtp": 3,
+      "warmup_count": 5,
+      "warm_final_rates": [
+        76.45168785431355,
+        76.30940997629743,
+        76.28647432619124
+      ],
+      "measured_count": 8,
+      "measured_median": 73.46501003314488,
+      "measured_min": 69.37084679341655,
+      "measured_max": 77.21440856364258,
+      "measured_rates": [
+        77.21440856364258,
+        75.47948690373242,
+        75.89714343403259,
+        71.32449017732715,
+        69.37084679341655,
+        71.630606215534,
+        74.82804688690558,
+        72.10197317938417
+      ],
+      "output_sha256": "7921c2d8ee4e9b1f2996b24dbf0b4647da6f065937ae81883982a76bb828061d",
+      "draft_accepted_median": 174.0,
+      "max_server_arithmetic_relative_error": 0.0,
+      "client_wall_minus_server_ttft_proxy_relative_diff": 0.0006725810332935955,
+      "resource_samples": 106
+    },
+    {
+      "phase": "mtp3-b",
+      "mtp": 3,
+      "warmup_count": 6,
+      "warm_final_rates": [
+        72.27872674988832,
+        73.38232265442139,
+        75.38628399758774
+      ],
+      "measured_count": 8,
+      "measured_median": 69.69026153969415,
+      "measured_min": 68.51346410811688,
+      "measured_max": 72.56287237964243,
+      "measured_rates": [
+        71.04296438667346,
+        69.94724196358547,
+        69.43328111580283,
+        72.56287237964243,
+        69.07558357462523,
+        68.51346410811688,
+        70.60788787828918,
+        69.40362526548748
+      ],
+      "output_sha256": "7921c2d8ee4e9b1f2996b24dbf0b4647da6f065937ae81883982a76bb828061d",
+      "draft_accepted_median": 174.0,
+      "max_server_arithmetic_relative_error": 0.0,
+      "client_wall_minus_server_ttft_proxy_relative_diff": 0.0007867141239805697,
+      "resource_samples": 114
+    },
+    {
+      "phase": "mtp0-b",
+      "mtp": 0,
+      "warmup_count": 7,
+      "warm_final_rates": [
+        70.69830967563882,
+        71.35767426116105,
+        70.64184198056667
+      ],
+      "measured_count": 8,
+      "measured_median": 70.79344197140784,
+      "measured_min": 68.91511547507015,
+      "measured_max": 72.52105335948376,
+      "measured_rates": [
+        70.78186881959611,
+        72.52105335948376,
+        70.32312109876332,
+        71.0727264725928,
+        71.01808192191471,
+        70.80501512321959,
+        69.20137322640565,
+        68.91511547507015
+      ],
+      "output_sha256": "8bb7c8e3b3f23cfd4f3d0f4a57a55b58ed08ca2c9d9b72b643bb688e1fa94ad3",
+      "draft_accepted_median": 0.0,
+      "max_server_arithmetic_relative_error": 0.0,
+      "client_wall_minus_server_ttft_proxy_relative_diff": 0.0005356126407008999,
+      "resource_samples": 117
+    }
+  ],
+  "modes": {
+    "0": {
+      "start_medians": [
+        72.4144284275453,
+        70.79344197140784
+      ],
+      "start_ratio": 1.0228974098588417,
+      "pooled_median": 71.45503849082634,
+      "pooled_min": 68.91511547507015,
+      "pooled_max": 73.03597149595296,
+      "output_sha256": "8bb7c8e3b3f23cfd4f3d0f4a57a55b58ed08ca2c9d9b72b643bb688e1fa94ad3",
+      "publishable": true
+    },
+    "3": {
+      "start_medians": [
+        73.46501003314488,
+        69.69026153969415
+      ],
+      "start_ratio": 1.054164648116591,
+      "pooled_median": 71.1837272820003,
+      "pooled_min": 68.51346410811688,
+      "pooled_max": 77.21440856364258,
+      "output_sha256": "7921c2d8ee4e9b1f2996b24dbf0b4647da6f065937ae81883982a76bb828061d",
+      "publishable": false
+    }
+  },
+  "comparison_ratio": 0.9962030499940061,
+  "cross_mode_output_equal": false,
+  "problems": [
+    "mtp3:start_drift_above_5pct"
+  ],
+  "no_hook_service_timing_qualified": false,
+  "independent_client_sse_check_completed": false,
+  "publication_decision": "publish_with_disclosed_exception",
+  "publication_context": {
+    "date_local": "2026-11-24",
+    "reported_metric": "server predicted_per_second, median of 16 measured warm requests per mode",
+    "independent_client_sse_check": "not run; HTTP wall minus server TTFT was a sanity check only",
+    "original_start_drift_gate": 1.05,
+    "user_accepted_exception": true,
+    "exception_detail": "The archive MTP3 start ratio 1.054164648 exceeded the preset 1.05 gate; the user explicitly accepted this 5.4% drift for public display.",
+    "cross_mode_output_equal": false,
+    "model_full_sha_rechecked_this_run": false,
+    "model_sha_provenance": "Prior full SHA-256 verification and unchanged size/mtime; current executable and image recorded."
+  }
+}

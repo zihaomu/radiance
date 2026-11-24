@@ -1,0 +1,187 @@
+{
+  "case": "code",
+  "source": {
+    "case": "code",
+    "card": 2,
+    "hip": 1,
+    "kfd": 2651,
+    "pci": "0000:43:00.0",
+    "model_size": 121678372864,
+    "model_sha256_prior_verified": "25aff8c950f4b823bc8b77c8184ed48827cb47058ffce08ae2c83b12e021fea0",
+    "model_full_sha_rechecked": false,
+    "image_id": "sha256:81ecc42c4215f48f19da0afd96deff692ee6da6799c907a3172d5dbc967d4298",
+    "source_baseline": "2a2b756371c26f2768b8d129a098df275ace2c73",
+    "source_diff": [
+      "README.md",
+      "docs/benchmarks/r9700-flash-next-tp1-decode-warm.json",
+      "docs/benchmarks/r9700-flash-next-tp2-150k-20turns.json",
+      "docs/benchmarks/r9700-flash-next-tp2-decode-warm.json",
+      "docs/benchmarks/r9700-flash-next-warm-protocol.md",
+      "docs/benchmarks/r9700-flash-next.md"
+    ],
+    "source_head": "c339e0cbfdd5b15dbf874a8ec7e819bd9ea1543d",
+    "binary_sha256": "8210861ca3dcea66d83a557a4c0f34f472af952a57a35c665ee7a9b4e6886763",
+    "prompt_sha256": "bf5ae4098ad3a8055f403fb505f4fab74a58de12298138d319b35f0e60d87fda"
+  },
+  "phases": [
+    {
+      "phase": "mtp0-a",
+      "mtp": 0,
+      "warmup_count": 5,
+      "warm_final_rates": [
+        83.52521296631544,
+        83.81706327191249,
+        83.6919769210138
+      ],
+      "measured_count": 8,
+      "measured_median": 85.55464616754398,
+      "measured_min": 79.96767915892356,
+      "measured_max": 85.6540904667654,
+      "measured_rates": [
+        83.66951421497765,
+        84.90654223687265,
+        79.96767915892356,
+        85.51446081122366,
+        85.59483152386431,
+        85.62178460063315,
+        85.6540904667654,
+        85.63360788879578
+      ],
+      "output_sha256": "364c3dbf59ec4adecc3b231d402fdae620532e3ac0d6122b3524e9690fe44b58",
+      "draft_accepted_median": 0.0,
+      "max_server_arithmetic_relative_error": 0.0,
+      "client_wall_minus_server_ttft_proxy_relative_diff": 0.0004662958786976201,
+      "resource_samples": 44
+    },
+    {
+      "phase": "mtp3-a",
+      "mtp": 3,
+      "warmup_count": 7,
+      "warm_final_rates": [
+        175.55704404980278,
+        177.0262533078475,
+        176.48866385004695
+      ],
+      "measured_count": 8,
+      "measured_median": 177.4938787807967,
+      "measured_min": 176.53406622043988,
+      "measured_max": 180.70525340161626,
+      "measured_rates": [
+        176.6400082512912,
+        180.70525340161626,
+        177.0067556627434,
+        180.15367120870832,
+        176.53406622043988,
+        176.91055855050715,
+        178.17907450610826,
+        177.98100189885
+      ],
+      "output_sha256": "f636fb9c6363a3de4b273e81142566951e4363843d620a946ef187bf956d303d",
+      "draft_accepted_median": 183.0,
+      "max_server_arithmetic_relative_error": 0.0,
+      "client_wall_minus_server_ttft_proxy_relative_diff": 0.0008120608396428031,
+      "resource_samples": 35
+    },
+    {
+      "phase": "mtp3-b",
+      "mtp": 3,
+      "warmup_count": 6,
+      "warm_final_rates": [
+        178.36364055088973,
+        178.28019114981169,
+        173.99590967549722
+      ],
+      "measured_count": 8,
+      "measured_median": 176.9737015920956,
+      "measured_min": 165.86266010542084,
+      "measured_max": 178.58843624355637,
+      "measured_rates": [
+        177.25078830758878,
+        178.38565190727988,
+        177.39844113339075,
+        176.3348777405775,
+        176.69661487660244,
+        165.86266010542084,
+        171.7496942855442,
+        178.58843624355637
+      ],
+      "output_sha256": "f636fb9c6363a3de4b273e81142566951e4363843d620a946ef187bf956d303d",
+      "draft_accepted_median": 183.0,
+      "max_server_arithmetic_relative_error": 0.0,
+      "client_wall_minus_server_ttft_proxy_relative_diff": 0.0011018278119472313,
+      "resource_samples": 37
+    },
+    {
+      "phase": "mtp0-b",
+      "mtp": 0,
+      "warmup_count": 5,
+      "warm_final_rates": [
+        85.19469486821771,
+        84.82401301891993,
+        85.10721006315983
+      ],
+      "measured_count": 8,
+      "measured_median": 85.29850995475226,
+      "measured_min": 85.02893350377778,
+      "measured_max": 85.56845787747045,
+      "measured_rates": [
+        85.31864049359602,
+        85.02893350377778,
+        85.3292943652141,
+        85.27837941590849,
+        85.56845787747045,
+        85.5235558807785,
+        85.27263178233659,
+        85.24003964537644
+      ],
+      "output_sha256": "364c3dbf59ec4adecc3b231d402fdae620532e3ac0d6122b3524e9690fe44b58",
+      "draft_accepted_median": 0.0,
+      "max_server_arithmetic_relative_error": 0.0,
+      "client_wall_minus_server_ttft_proxy_relative_diff": 0.00040291448980556144,
+      "resource_samples": 44
+    }
+  ],
+  "modes": {
+    "0": {
+      "start_medians": [
+        85.55464616754398,
+        85.29850995475226
+      ],
+      "start_ratio": 1.0030028216545352,
+      "pooled_median": 85.32396742940506,
+      "pooled_min": 79.96767915892356,
+      "pooled_max": 85.6540904667654,
+      "output_sha256": "364c3dbf59ec4adecc3b231d402fdae620532e3ac0d6122b3524e9690fe44b58",
+      "publishable": true
+    },
+    "3": {
+      "start_medians": [
+        177.4938787807967,
+        176.9737015920956
+      ],
+      "start_ratio": 1.0029392908891064,
+      "pooled_median": 177.12877198516608,
+      "pooled_min": 165.86266010542084,
+      "pooled_max": 180.70525340161626,
+      "output_sha256": "f636fb9c6363a3de4b273e81142566951e4363843d620a946ef187bf956d303d",
+      "publishable": true
+    }
+  },
+  "comparison_ratio": 2.0759556467146005,
+  "cross_mode_output_equal": false,
+  "problems": [],
+  "no_hook_service_timing_qualified": true,
+  "independent_client_sse_check_completed": false,
+  "publication_decision": "publish_server_decode_measurement",
+  "publication_context": {
+    "date_local": "2026-11-24",
+    "reported_metric": "server predicted_per_second, median of 16 measured warm requests per mode",
+    "independent_client_sse_check": "not run; HTTP wall minus server TTFT was a sanity check only",
+    "original_start_drift_gate": 1.05,
+    "user_accepted_exception": false,
+    "exception_detail": null,
+    "cross_mode_output_equal": false,
+    "model_full_sha_rechecked_this_run": false,
+    "model_sha_provenance": "Prior full SHA-256 verification and unchanged size/mtime; current executable and image recorded."
+  }
+}
