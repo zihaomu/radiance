@@ -1,0 +1,304 @@
+{
+  "timestamp_utc": "2026-11-16T07:14:50.992274+00:00",
+  "url": "http://127.0.0.1:8128",
+  "model": "flashnext",
+  "settings": {
+    "runs": 8,
+    "prefill_target_tokens": 8192,
+    "decode_tokens": 256,
+    "decode_prompt": "Write a detailed explanation of how the water cycle works for a high school student. Cover evaporation, condensation, precipitation, groundwater, and human impacts. Write at least 500 words in connected paragraphs.",
+    "decode_endpoint": "/v1/chat/completions",
+    "enable_thinking": false,
+    "concurrency": 4
+  },
+  "results": {
+    "decode": {
+      "rows": [
+        {
+          "client_wall_s": 1.9946,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 55,
+            "prompt_ms": 175.68567299999998,
+            "prompt_per_token_ms": 3.1942849636363633,
+            "prompt_per_second": 313.0591075573932,
+            "predicted_n": 256,
+            "predicted_ms": 1801.7741569999998,
+            "predicted_per_token_ms": 7.065781007843136,
+            "predicted_per_second": 141.52717143228514,
+            "ttft_ms": 176.890616,
+            "total_ms": 1978.664773,
+            "draft_n": 282,
+            "draft_n_accepted": 163
+          },
+          "usage": {
+            "prompt_tokens": 55,
+            "completion_tokens": 256,
+            "total_tokens": 311,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            }
+          },
+          "answer_preview": "The water cycle, scientifically known as the hydrologic cycle, is the continuous movement of water on, above, and below the surface of the Earth. It is a fundamental process that s",
+          "warmup": true
+        },
+        {
+          "client_wall_s": 1.7746,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 55,
+            "prompt_ms": 101.823529,
+            "prompt_per_token_ms": 1.8513368909090908,
+            "prompt_per_second": 540.1502043795791,
+            "predicted_n": 256,
+            "predicted_ms": 1670.248554,
+            "predicted_per_token_ms": 6.549994329411764,
+            "predicted_per_second": 152.67188789914678,
+            "ttft_ms": 102.98562199999999,
+            "total_ms": 1773.234176,
+            "draft_n": 282,
+            "draft_n_accepted": 163
+          },
+          "usage": {
+            "prompt_tokens": 55,
+            "completion_tokens": 256,
+            "total_tokens": 311,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            }
+          },
+          "answer_preview": "The water cycle, scientifically known as the hydrologic cycle, is the continuous movement of water on, above, and below the surface of the Earth. It is a fundamental process that s",
+          "warmup": false
+        },
+        {
+          "client_wall_s": 1.7442,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 55,
+            "prompt_ms": 85.75779299999999,
+            "prompt_per_token_ms": 1.5592325999999999,
+            "prompt_per_second": 641.3411315284199,
+            "predicted_n": 256,
+            "predicted_ms": 1656.299077,
+            "predicted_per_token_ms": 6.495290498039215,
+            "predicted_per_second": 153.95770216926832,
+            "ttft_ms": 86.84682699999999,
+            "total_ms": 1743.145904,
+            "draft_n": 282,
+            "draft_n_accepted": 163
+          },
+          "usage": {
+            "prompt_tokens": 55,
+            "completion_tokens": 256,
+            "total_tokens": 311,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            }
+          },
+          "answer_preview": "The water cycle, scientifically known as the hydrologic cycle, is the continuous movement of water on, above, and below the surface of the Earth. It is a fundamental process that s",
+          "warmup": false
+        },
+        {
+          "client_wall_s": 1.7307,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 55,
+            "prompt_ms": 77.686951,
+            "prompt_per_token_ms": 1.412490018181818,
+            "prompt_per_second": 707.969604831061,
+            "predicted_n": 256,
+            "predicted_ms": 1650.5223609999998,
+            "predicted_per_token_ms": 6.472636709803921,
+            "predicted_per_second": 154.49654365512714,
+            "ttft_ms": 79.059823,
+            "total_ms": 1729.5821839999999,
+            "draft_n": 282,
+            "draft_n_accepted": 163
+          },
+          "usage": {
+            "prompt_tokens": 55,
+            "completion_tokens": 256,
+            "total_tokens": 311,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            }
+          },
+          "answer_preview": "The water cycle, scientifically known as the hydrologic cycle, is the continuous movement of water on, above, and below the surface of the Earth. It is a fundamental process that s",
+          "warmup": false
+        },
+        {
+          "client_wall_s": 1.7296,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 55,
+            "prompt_ms": 77.10839399999999,
+            "prompt_per_token_ms": 1.4019707999999997,
+            "prompt_per_second": 713.2816175629337,
+            "predicted_n": 256,
+            "predicted_ms": 1650.005874,
+            "predicted_per_token_ms": 6.470611270588235,
+            "predicted_per_second": 154.54490436559502,
+            "ttft_ms": 78.27644699999999,
+            "total_ms": 1728.282321,
+            "draft_n": 282,
+            "draft_n_accepted": 163
+          },
+          "usage": {
+            "prompt_tokens": 55,
+            "completion_tokens": 256,
+            "total_tokens": 311,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            }
+          },
+          "answer_preview": "The water cycle, scientifically known as the hydrologic cycle, is the continuous movement of water on, above, and below the surface of the Earth. It is a fundamental process that s",
+          "warmup": false
+        },
+        {
+          "client_wall_s": 1.73,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 55,
+            "prompt_ms": 77.451522,
+            "prompt_per_token_ms": 1.4082094909090908,
+            "prompt_per_second": 710.1216164609393,
+            "predicted_n": 256,
+            "predicted_ms": 1650.225452,
+            "predicted_per_token_ms": 6.471472360784313,
+            "predicted_per_second": 154.52434071414385,
+            "ttft_ms": 78.651855,
+            "total_ms": 1728.877307,
+            "draft_n": 282,
+            "draft_n_accepted": 163
+          },
+          "usage": {
+            "prompt_tokens": 55,
+            "completion_tokens": 256,
+            "total_tokens": 311,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            }
+          },
+          "answer_preview": "The water cycle, scientifically known as the hydrologic cycle, is the continuous movement of water on, above, and below the surface of the Earth. It is a fundamental process that s",
+          "warmup": false
+        },
+        {
+          "client_wall_s": 1.7309,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 55,
+            "prompt_ms": 77.189514,
+            "prompt_per_token_ms": 1.4034457090909092,
+            "prompt_per_second": 712.5320156828556,
+            "predicted_n": 256,
+            "predicted_ms": 1651.285616,
+            "predicted_per_token_ms": 6.475629866666666,
+            "predicted_per_second": 154.42513247205565,
+            "ttft_ms": 78.403407,
+            "total_ms": 1729.689023,
+            "draft_n": 282,
+            "draft_n_accepted": 163
+          },
+          "usage": {
+            "prompt_tokens": 55,
+            "completion_tokens": 256,
+            "total_tokens": 311,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            }
+          },
+          "answer_preview": "The water cycle, scientifically known as the hydrologic cycle, is the continuous movement of water on, above, and below the surface of the Earth. It is a fundamental process that s",
+          "warmup": false
+        },
+        {
+          "client_wall_s": 1.7299,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 55,
+            "prompt_ms": 77.469082,
+            "prompt_per_token_ms": 1.4085287636363637,
+            "prompt_per_second": 709.9606524316372,
+            "predicted_n": 256,
+            "predicted_ms": 1649.766165,
+            "predicted_per_token_ms": 6.4696712352941175,
+            "predicted_per_second": 154.5673595506185,
+            "ttft_ms": 78.63889499999999,
+            "total_ms": 1728.4050599999998,
+            "draft_n": 282,
+            "draft_n_accepted": 163
+          },
+          "usage": {
+            "prompt_tokens": 55,
+            "completion_tokens": 256,
+            "total_tokens": 311,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            }
+          },
+          "answer_preview": "The water cycle, scientifically known as the hydrologic cycle, is the continuous movement of water on, above, and below the surface of the Earth. It is a fundamental process that s",
+          "warmup": false
+        },
+        {
+          "client_wall_s": 1.7306,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 55,
+            "prompt_ms": 77.220824,
+            "prompt_per_token_ms": 1.4040149818181817,
+            "prompt_per_second": 712.2431120393121,
+            "predicted_n": 256,
+            "predicted_ms": 1651.083427,
+            "predicted_per_token_ms": 6.474836968627451,
+            "predicted_per_second": 154.44404312344903,
+            "ttft_ms": 78.402667,
+            "total_ms": 1729.4860939999999,
+            "draft_n": 282,
+            "draft_n_accepted": 163
+          },
+          "usage": {
+            "prompt_tokens": 55,
+            "completion_tokens": 256,
+            "total_tokens": 311,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            }
+          },
+          "answer_preview": "The water cycle, scientifically known as the hydrologic cycle, is the continuous movement of water on, above, and below the surface of the Earth. It is a fundamental process that s",
+          "warmup": false
+        }
+      ],
+      "median_output_tokens_per_s": 154.47,
+      "median_output_tokens": 256.0,
+      "median_ttft_ms": 78.65,
+      "median_draft_proposed": 282.0,
+      "median_draft_accepted": 163.0
+    }
+  }
+}
