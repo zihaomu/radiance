@@ -20,6 +20,23 @@ slowly than a card.
 
 To support the development of radiance: [Patreon](https://patreon.com/StillDeadCode).
 
+## Qwen3.8-Flash-Next benchmarks
+
+**Model:** [Qwen3.8-Flash-Next: IQR-V4 experts, int8 trunk, MTP, vision](https://huggingface.co/StillDeadcode/qwen3.8-next-flash-iqr-v4).
+The table reports **text decode throughput in generated tokens/s**. MTP0 means drafting is off;
+MTP3 rates are workload-specific. Empty cells mean no verified result is listed, not zero or unsupported.
+
+| Platform | TP | MTP0 | MTP0 exact | MTP3 essay | MTP3 code | Implementation branch |
+|---|---:|---:|---:|---:|---:|---|
+| Radeon PRO W7900D (48 GiB/card) | 1 | 35.01 | | | | [W7900](https://github.com/zihaomu/radiance/tree/rdna3_w7900_qwen3.8_flash_dev) |
+| Radeon PRO W7900D (48 GiB/card) | 2 | 61.54 | 45.32 | | | [W7900](https://github.com/zihaomu/radiance/tree/rdna3_w7900_qwen3.8_flash_dev) |
+| Radeon AI PRO R9700 (32 GiB/card) | 1 | | | | | [R9700 TP1](https://github.com/zihaomu/radiance/tree/work/tp1-r9700) |
+| Radeon AI PRO R9700 (32 GiB/card) | 2 | | | | | [R9700 TP2](https://github.com/zihaomu/radiance/tree/work/tp2-r9700) |
+| Strix Halo (Radeon 8060S) | 1 | 33.1 | | 58.7 | 71.2 | [Strix Halo v2](https://github.com/zihaomu/radiance/tree/halo-qwen3.8-flash-next-v2) |
+
+- **W7900D:** [Tested integration and configuration](https://codeberg.org/StillDeadcode/radiance/src/commit/06145aa7494228b09c3bee8e97c0c6a04cb8e688/docs/RDNA3_QWEN38_FLASH.md), source `26c1a1d`, ROCm 10.1. One sequence, 128 decoded tokens. TP1 is one smoke run; each TP2 figure is the median of six session medians (two warm-ups, five measured requests per session). MTP0 uses the default tolerance mode unless marked exact.
+- **Strix Halo:** [Measured on the 8060S](https://github.com/zihaomu/radiance/commit/af87b4555910fab3d0c46d15b7184f27e59e177f). The same report records MTP3 edit workloads at **80.2 tok/s** (Python) and **80.5 tok/s** (C++). Its prompts and timing protocol are not the W7900D benchmark.
+
 ## Models
 
 | model | container | get it | fleet file |
