@@ -802,6 +802,71 @@ TEST(r3d_tp1_router_wave) {
     std::printf("PASS TP1_ROUTER_WAVE cases=%d shapes=N1,96,512 rows=1,2,17 patterns=normal,zero,wide exact=all\n", cases);
 }
 
+TEST(r3d_tp2_router_reduce_policy) {
+    RadDeviceProps props{};
+    REQUIRE_EQ(rad_dev_props(0, &props), RAD_OK);
+    if (props.is_host_backend) SKIP("gfx1100 required");
+    REQUIRE_EQ(rad_dev_set(0), RAD_OK);
+    Library native("libr3d");
+    auto launch = reinterpret_cast<RadLaunchFn>(dlsym(native.handle, "r3dh_qwen_ops_router_gemm"));
+    REQUIRE(launch);
+    Queue compute(0);
+    struct SavedEnv {
+        const char* name;
+        bool present;
+        std::string value;
+        explicit SavedEnv(const char* key) : name(key), present(std::getenv(key) != nullptr),
+            value(present ? std::getenv(key) : "") {}
+        ~SavedEnv() { if (present) setenv(name, value.c_str(), 1); else unsetenv(name); }
+    } precision("RAD_PRECISION"), reduce("RAD_ROUTER_REDUCE"), wave("RAD_ROUTER_WAVE");
+    REQUIRE_EQ(setenv(wave.name, "1", 1), 0);
+    auto check = [&](int world, int rows, int columns, const char* mode, const char* override_value, bool fast) {
+        REQUIRE_EQ(mode ? setenv(precision.name, mode, 1) : unsetenv(precision.name), 0);
+        REQUIRE_EQ(override_value ? setenv(reduce.name, override_value, 1) : unsetenv(reduce.name), 0);
+        Buffer input(RAD_BF16, {rows, 2560}, RAD_MEM_DEVICE);
+        Buffer weights(RAD_BF16, {columns, 2560}, RAD_MEM_DEVICE);
+        Buffer output(RAD_BF16, {rows, columns}, RAD_MEM_DEVICE);
+        auto fill = [](uint16_t* values, uint32_t state) {
+            for (int position = 0; position < 2560; ++position) {
+                state = state * 1664525u + 1013904223u;
+                values[position] = uint16_t(((state >> 16) & 0x8000u) |
+                    ((119u + ((state >> 8) & 15u)) << 7) | (state & 127u));
+            }
+        };
+        for (int row = 0; row < rows; ++row) fill(input.data<uint16_t>() + row * 2560, 74129u);
+        for (int column = 0; column < columns; ++column)
+            fill(weights.data<uint16_t>() + column * 2560, (column & 1) ? 2691052478u : 3814312059u);
+        for (Buffer* buffer : {&input, &weights, &output}) buffer->push(compute.stream);
+        RadTensor tensors[]{input.device, weights.device, output.device};
+        RadParam params[]{RAD_INT("M", rows), RAD_INT("N", columns), RAD_INT("K", 2560), RAD_STR("dtype", "bf16")};
+        RadArgs args{}; args.t = tensors; args.n_t = 3; args.p = params; args.n_p = 4; args.world_size = world;
+        REQUIRE_EQ(launch(&args, compute.stream), RAD_OK);
+        for (int row = 0; row < rows; ++row) for (int column = 0; column < columns; ++column) {
+            // Odd columns round to 0x489f without midpoint replay; even columns distinguish dispatch modes.
+            output.data<uint16_t>()[row * columns + column] = (column & 1) ? 0x48a0 : fast ? 0xc4ff : 0xc4fe;
+        }
+        const auto actual = output.read(compute.stream);
+        if (actual != output.expected) {
+            const auto mismatch = std::mismatch(actual.begin(), actual.end(), output.expected.begin());
+            const size_t offset = size_t(mismatch.first - actual.begin()) & ~size_t(1);
+            uint16_t got{}, want{};
+            std::memcpy(&got, actual.data() + offset, sizeof(got));
+            std::memcpy(&want, output.expected.data() + offset, sizeof(want));
+            std::fprintf(stderr, "router policy TP=%d M=%d N=%d precision=%s reduce=%s offset=%zu got=%04x want=%04x\n",
+                         world, rows, columns, mode ? mode : "unset", override_value ? override_value : "unset", offset, got, want);
+        }
+        REQUIRE(actual == output.expected);
+        REQUIRE(input.read(compute.stream) == input.expected);
+        REQUIRE(weights.read(compute.stream) == weights.expected);
+    };
+    check(2, 1, 512, nullptr, nullptr, true);
+    check(2, 1, 512, "tolerance", "0", false);
+    check(2, 1, 512, "exact", "1", false);
+    check(1, 1, 512, "tolerance", "1", false);
+    check(2, 2, 512, "tolerance", "1", false);
+    check(2, 1, 1, "tolerance", "1", false);
+}
+
 TEST(r3d_tp1_ple_gate_parallel) {
     using namespace iqr_output_boundary;
     RadDeviceProps props{};

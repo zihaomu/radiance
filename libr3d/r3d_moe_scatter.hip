@@ -29,6 +29,7 @@
 #include "r3d.h"
 #include "r3d_args.h"
 #include "r3d_launch.h"
+#include "r3d_moe_protect.h"
 
 #define R3D_BARRIER() do { __syncthreads(); asm volatile("" ::: "memory"); } while (0)
 
@@ -36,24 +37,10 @@ namespace {
 
 constexpr uint32_t kSortWave = 32;
 constexpr uint32_t kMaxExpert = 512;
-constexpr uint32_t kMaxProtect = 8;
+using r3d_scatter::Protect;
+using r3d_scatter::sort_place;
 constexpr uint32_t kScatterSmall = 1024;
 constexpr uint32_t kScatWaves = 8;   // 256 threads
-
-struct Protect {
-    uint32_t n;
-    uint16_t e[kMaxProtect];
-};
-
-/* Local expert `e`'s place in the sort: the protected ones last, the rest closed up in order. */
-__device__ __forceinline__ int32_t sort_place(int32_t e, uint32_t n_local, const Protect& p) {
-    int32_t below = 0;
-    for (uint32_t j = 0; j < p.n; ++j) {
-        if ((int32_t)p.e[j] == e) return (int32_t)(n_local - p.n + j);
-        below += (int32_t)p.e[j] < e;
-    }
-    return e - below;
-}
 
 template <uint32_t NW>
 struct ScatterLds {
@@ -245,23 +232,8 @@ int scatter_body(const RadArgs* a, RadStream s, bool with_inv)
     const long long base = r3d_geti_or(a, "expert_base", 0);
     if (base < 0) return R3D_NO(RAD_E_SHAPE);
 
-    // protect: a comma list of local expert indices, strictly ascending, at most kMaxProtect.
     Protect prot{};
-    if (const char* str = r3d_gets(a, "protect")) {
-        const char* p = str;
-        long long prev = -1;
-        while (*p) {
-            char* end = nullptr;
-            const long long v = std::strtoll(p, &end, 10);
-            if (end == p || v <= prev || v >= n_expert || prot.n >= kMaxProtect)
-                return R3D_NO(RAD_E_SHAPE);
-            prot.e[prot.n++] = (uint16_t)v;
-            prev = v;
-            p = end;
-            if (*p == ',') ++p;
-            else if (*p) return R3D_NO(RAD_E_SHAPE);
-        }
-    }
+    if (!r3d_scatter::read_protect(r3d_gets(a, "protect"), n_expert, prot)) return R3D_NO(RAD_E_SHAPE);
 
     const int32_t* idp = (const int32_t*)r3d_p(ids);
     int32_t* sp = (int32_t*)r3d_wp(sorted);

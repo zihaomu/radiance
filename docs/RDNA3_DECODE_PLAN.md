@@ -198,3 +198,13 @@ On GPU4, rotating 48 layers of weights, compare uninstrumented event timings wit
 | C1: AR write -> HC read | 48 plain + 47 gather consecutive same-queue pairs per token out of 97 reads. About 0.397 ms/token in stamped inter-dispatch gaps. | Feasibility only. Prototype plain pairs first; require graph adjacency, peer sequence ownership, publication of both hidden halves, safe inject lifetime and forward progress. |
 
 No new barrier or scheduling variant was promoted. B1/B2/B3 matched eight output buffers over 96 changing inputs. Source of the runtime baseline is `fd34af7`.
+
+### TP2 MoE router projection (2026-11-23)
+
+Of 96 BF16 projections per decode token, 48 select the MoE router logits (512 columns); the other 48 are shared gates. The former took 0.596 ms/token on the baseline card-0 trace. Tolerance mode now reduces the 2560-element router dot across a wave and replays the ordered FP32 sum when the low 16 FP32 bits are within 16 of the BF16 midpoint. This is a rounding heuristic, not a guarantee of exact output. Only aligned TP2, one-row, 512-column calls take it. `RAD_ROUTER_REDUCE=0` restores ordered routing; `RAD_PRECISION=exact` forces it off. Shared gates, prefill, TP1, and top-k are unchanged.
+
+- Unguarded reduction was faster but moved selected weights by up to 4 BF16 ULPs in real replay, beyond the 1-ULP acceptance limit. It was not shipped.
+- Guarded replay on two independent sets of 96 real one-row activations per layer for all 48 layers on each W7900: no selected expert or order changes, up to 1 ULP weight difference on the first set, zero on the held-out set. Both ranks agreed. Full serving messages can nevertheless diverge in tolerance mode.
+- Staged no-draft TP2 decode128: median 60.03 tok/s off vs 60.86 on, 6/6 counterbalanced pairs faster, median paired gain 1.32%. Each session used two warm-up and five measured requests. The stamped guarded projection took 6.70 us/call; the original trace measured 12.41 us/call for the router. Do not treat trace deltas as end-to-end gains.
+- `r3d_tp2_router_reduce_policy` checks default dispatch, opt-out, exact override, midpoint repair, and fallback shapes; `r3d_tp1_router_wave` retains the strict oracle test.
+- Integrated repeat on GPU4+5: **60.00 -> 60.75 tok/s**, 6/6 paired wins, median paired gain **1.20%**. Default and forced exact each passed 6/6 tasks; forced exact matched strict on all nine messages. Full GPU4 suite: 1,649,438 checks over 73 cases (13 skipped), no failures.

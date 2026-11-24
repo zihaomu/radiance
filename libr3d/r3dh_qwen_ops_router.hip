@@ -30,14 +30,9 @@ __device__ uint16_t round_bf16(float value) {
     const uint32_t bits = __float_as_uint(value);
     return (bits & 0x7fffffffu) > 0x7f800000u ? (bits >> 16) | 0x40u : (bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16;
 }
-// Wave per column. Lane L keeps products [80L, 80L+80) in registers and the running sum is handed
-// lane to lane, so the additions are exactly project's ascending FP32 chain.
-__global__ __launch_bounds__(128) void project_wave(const uint16_t* input, const uint16_t* weight,
-    uint16_t* logits, int64_t input_pitch, int64_t weight_pitch, int64_t output_pitch, int columns) {
-    const int lane = threadIdx.x & 31, column = blockIdx.x * 4 + (threadIdx.x >> 5), row = blockIdx.y;
-    if (column >= columns) return;
-    const uint4* left = reinterpret_cast<const uint4*>(input + row * input_pitch) + lane * 10;
-    const uint4* right = reinterpret_cast<const uint4*>(weight + column * weight_pitch) + lane * 10;
+__device__ __forceinline__ float ordered_dot(const uint4* left, const uint4* right, int lane) {
+    left += lane * 10;
+    right += lane * 10;
     float products[80];
 #pragma unroll
     for (int chunk = 0; chunk < 10; ++chunk) {
@@ -58,7 +53,42 @@ __global__ __launch_bounds__(128) void project_wave(const uint16_t* input, const
         }
         sum = __shfl(sum, owner, 32);
     }
+    return sum;
+}
+__global__ __launch_bounds__(128) void project_wave(const uint16_t* input, const uint16_t* weight,
+    uint16_t* logits, int64_t input_pitch, int64_t weight_pitch, int64_t output_pitch, int columns) {
+    const int lane = threadIdx.x & 31, column = blockIdx.x * 4 + (threadIdx.x >> 5), row = blockIdx.y;
+    if (column >= columns) return;
+    const auto* left = reinterpret_cast<const uint4*>(input + row * input_pitch);
+    const auto* right = reinterpret_cast<const uint4*>(weight + column * weight_pitch);
+    const float sum = ordered_dot(left, right, lane);
     if (!lane) logits[row * output_pitch + column] = round_bf16(sum);
+}
+using RouterPair = short __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ float dot_pair(uint32_t left, uint32_t right, float sum) {
+    return __builtin_amdgcn_fdot2_f32_bf16(__builtin_bit_cast(RouterPair, left),
+                                           __builtin_bit_cast(RouterPair, right), sum, false);
+}
+__global__ __launch_bounds__(128) void project_reduce(const uint16_t* input, const uint16_t* weight,
+    uint16_t* logits, int64_t weight_pitch) {
+    const int lane = threadIdx.x & 31, column = blockIdx.x * 4 + (threadIdx.x >> 5);
+    const auto* left = reinterpret_cast<const uint4*>(input);
+    const auto* right = reinterpret_cast<const uint4*>(weight + int64_t(column) * weight_pitch);
+    float partial[4]{};
+#pragma unroll
+    for (int chunk = 0; chunk < 10; ++chunk) {
+        const uint4 activation = left[chunk * 32 + lane], weights = right[chunk * 32 + lane];
+        partial[0] = dot_pair(activation.x, weights.x, partial[0]);
+        partial[1] = dot_pair(activation.y, weights.y, partial[1]);
+        partial[2] = dot_pair(activation.z, weights.z, partial[2]);
+        partial[3] = dot_pair(activation.w, weights.w, partial[3]);
+    }
+    float sum = (partial[0] + partial[1]) + (partial[2] + partial[3]);
+    for (int offset = 16; offset; offset >>= 1) sum += __shfl_xor(sum, offset, 32);
+    const unsigned low = __float_as_uint(__shfl(sum, 0, 32)) & 0xffffu;
+    // Redo near BF16 rounding midpoints, where a small logit change can alter routing weights.
+    if (low >= 0x8000u - 16 && low <= 0x8000u + 16) sum = ordered_dot(left, right, lane);
+    if (!lane) logits[column] = round_bf16(sum);
 }
 }
 extern "C" int r3dh_qwen_ops_router_gemm(const RadArgs* args, RadStream stream) {
@@ -88,6 +118,12 @@ extern "C" int r3dh_qwen_ops_router_gemm(const RadArgs* args, RadStream stream) 
     const bool aligned = (reinterpret_cast<uintptr_t>(args->t[0].data) | reinterpret_cast<uintptr_t>(args->t[1].data)) % 16 == 0
         && args->t[0].stride[0] % 8 == 0 && args->t[1].stride[0] % 8 == 0;
     if (rows <= 16 && aligned && wave) {
+        if (args->world_size == 2 && rows == 1 && columns == 512 && r3d_tolerance_path("RAD_ROUTER_REDUCE")) {
+            project_reduce<<<dim3(columns / 4), 128, 0, reinterpret_cast<hipStream_t>(stream)>>>(
+                static_cast<const uint16_t*>(args->t[0].data), static_cast<const uint16_t*>(args->t[1].data),
+                static_cast<uint16_t*>(args->t[2].data), args->t[1].stride[0]);
+            return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+        }
         project_wave<<<dim3((columns + 3) / 4, rows), 128, 0, reinterpret_cast<hipStream_t>(stream)>>>(
             static_cast<const uint16_t*>(args->t[0].data), static_cast<const uint16_t*>(args->t[1].data),
             static_cast<uint16_t*>(args->t[2].data), args->t[0].stride[0], args->t[1].stride[0],

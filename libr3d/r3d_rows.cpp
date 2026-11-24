@@ -2343,8 +2343,7 @@ static const RadKernelInfo kKernels[] = {
  { "moe_router_topk_scatter", "router_topk_scatter", "moe",
   "The router top-k and the counting sort as one op: the selection over the whole n_expert logits, "
   "then the sort over this rank's n_local slice",
-  "phase 1 the top-k (one wave per row), phase 2 the small counting sort (one workgroup); the "
-  "selection's expert_w is the sort's input",
+       "one-wave selection and stable scatter at gfx1100 TP2 decode; otherwise separate selection and sort launches",
   "bf16 logits [M,ne] and expert_w [M,k]; i32 expert_ids [M,k], sorted_tok [M*k], expert_offset "
   "[nl+1], expert_count [nl]; n_expert <= 512, n_local <= n_expert, T <= 1024",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,

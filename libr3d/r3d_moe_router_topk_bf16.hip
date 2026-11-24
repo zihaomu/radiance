@@ -26,6 +26,8 @@
 #include "r3d_args.h"
 #include "r3d_launch.h"
 #include "r3d_codecs.h"
+#include "r3d_flags.h"
+#include "r3d_moe_protect.h"
 
 #define R3D_BARRIER() do { __syncthreads(); asm volatile("" ::: "memory"); } while (0)
 
@@ -141,6 +143,60 @@ __global__ __launch_bounds__(kW) void r3d_router_topk_kernel(
     const uint32_t lane = threadIdx.x;
     const uint32_t m = blockIdx.x;             // one block per row
     r3d_router_topk_row<MAXOWN>(lg, ids, w, m, n_expert, top_k, lg_ld, norm, lane, wmin);
+}
+
+__global__ __launch_bounds__(kW) void r3d_router_topk_scatter_onewave(
+    const uint16_t* logits, int32_t* ids, uint16_t* weights, int32_t* sorted,
+    int32_t* offsets, int32_t* counts, uint32_t local_experts, int32_t base, int norm, r3d_scatter::Protect protect) {
+    constexpr uint32_t kept = 10;
+    __shared__ uint32_t work[kW * (2 + kept)];
+    const uint32_t lane = threadIdx.x;
+    r3d_router_topk_row<16>(logits, ids, weights, 0, 512, kept, 512, norm, lane, work);
+    R3D_BARRIER();
+    uint32_t place = local_experts;
+    if (lane < kept) {
+        const int32_t id = ids[lane];
+        if (id >= base && uint32_t(id - base) < local_experts)
+            place = r3d_scatter::sort_place(id - base, local_experts, protect);
+    }
+    const uint32_t begin = lane * kW;
+    uint32_t mask = 0, below = 0, position = 0;
+    bool duplicate = false;
+#pragma unroll
+    for (uint32_t slot = 0; slot < kept; ++slot) {
+        const uint32_t other = __shfl(place, slot, kW);
+        position += other < place || (other == place && slot < lane);
+        below += other < begin;
+        if (other < local_experts && other / kW == lane) {
+            const uint32_t bit = 1u << (other & 31u);
+            duplicate |= (mask & bit) != 0;
+            mask |= bit;
+        }
+    }
+    if (lane < kept) sorted[position] = place < local_experts ? int32_t(lane) : -1;
+    const uint32_t live = __popc(uint32_t(__ballot(lane < kept && place < local_experts)));
+    if (!lane) offsets[local_experts] = int32_t(live);
+    // Top-k can leave old IDs in unfilled slots when fewer than ten logits are selectable.
+    const bool repeated = __any(duplicate);
+    for (uint32_t bucket = 0; bucket < (local_experts + kW - 1) / kW; ++bucket) {
+        const uint32_t expert = bucket * kW + lane;
+        const uint32_t bits = __shfl(mask, bucket, kW);
+        uint32_t offset = __shfl(below, bucket, kW) + __popc(bits & ((1u << lane) - 1));
+        uint32_t count = (bits >> lane) & 1u;
+        if (repeated) {
+            offset = count = 0;
+#pragma unroll
+            for (uint32_t slot = 0; slot < kept; ++slot) {
+                const uint32_t other = __shfl(place, slot, kW);
+                offset += other < expert;
+                count += other == expert;
+            }
+        }
+        if (expert < local_experts) {
+            offsets[expert] = int32_t(offset);
+            counts[expert] = int32_t(count);
+        }
+    }
 }
 
 }  // namespace
@@ -293,8 +349,24 @@ int r3d_rad_router_topk_scatter(const RadArgs* a, RadStream s)
     const uint32_t lg_ld = (uint32_t)r3d_row_pitch(L);
     if (lg_ld < ne) return R3D_NO(RAD_E_SHAPE);
 
-    // Phase 1: the top-k selection (the router_topk kernel, over the whole n_expert).
-    dim3 grid((unsigned)M), blk(kW);
+    bool decode_row = false;
+#ifdef R3D_BUILD_TARGET
+    decode_row = !std::strcmp(R3D_BUILD_TARGET, "gfx1100") && a->world_size == 2 && ne == 512 && nl == 512 &&
+        tk == 10 && norm == 1 && r3d_geti_or(a, "expert_base", 0) == 0 && r3d_numel(L) == 512 &&
+        r3d_numel(I) == 10 && r3d_numel(W) == 10 && r3d_numel(ST) == 10 && r3d_numel(OFF) >= 513 &&
+        r3d_numel(CNT) >= 512 && I->dtype == RAD_I32 && W->dtype == RAD_BF16 && ST->dtype == RAD_I32 &&
+        OFF->dtype == RAD_I32 && CNT->dtype == RAD_I32 && r3d_contig(L) && r3d_contig(I) &&
+        r3d_contig(W) && r3d_contig(ST) && r3d_contig(OFF) && r3d_contig(CNT);
+#endif
+    if (decode_row && r3d_exact_path("RAD_TP2_TOPK_SCATTER")) {
+        r3d_scatter::Protect protect{};
+        if (!r3d_scatter::read_protect(r3d_gets(a, "protect"), nl, protect)) return R3D_NO(RAD_E_SHAPE);
+        R3D_KLAUNCH(r3d_router_topk_scatter_onewave, dim3(1), dim3(kW), (hipStream_t)s,
+                    (const uint16_t*)r3d_p(L), (int32_t*)r3d_wp(I), (uint16_t*)r3d_wp(W),
+                    (int32_t*)r3d_wp(ST), (int32_t*)r3d_wp(OFF), (int32_t*)r3d_wp(CNT), (uint32_t)nl, 0, norm, protect);
+        return (int)hipGetLastError();
+    }
+    dim3 grid(decode_row ? 1u : (unsigned)M), blk(kW);
     const unsigned short* lg = (const unsigned short*)r3d_p(L);
     int32_t* ip = (int32_t*)r3d_wp(I);
     unsigned short* wp = (unsigned short*)r3d_wp(W);

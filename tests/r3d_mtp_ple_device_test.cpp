@@ -780,6 +780,61 @@ TEST(r3d_router_actual_aql_ragged_band) {
     r3d_bf16_aql_gemm(true, true);
 }
 
+TEST(r3d_tp2_topk_scatter_exact) {
+    RadDeviceProps props{};
+    REQUIRE_EQ(rad_dev_props(0, &props), RAD_OK);
+    if (props.is_host_backend || std::strcmp(props.arch, "gfx1100")) SKIP("gfx1100 required");
+    REQUIRE_EQ(rad_dev_set(0), RAD_OK);
+    Library native("libr3d");
+    auto launch = reinterpret_cast<RadLaunchFn>(dlsym(native.handle, "r3d_rad_router_topk_scatter"));
+    REQUIRE(launch);
+    struct RestoreFlag {
+        const char* name = "RAD_TP2_TOPK_SCATTER";
+        bool present = std::getenv(name) != nullptr;
+        std::string value = present ? std::getenv(name) : "";
+        ~RestoreFlag() { if (present) setenv(name, value.c_str(), 1); else unsetenv(name); }
+    } flag;
+    Queue queue(0);
+    constexpr int experts = 512, kept = 10;
+    for (const int rows : {1, 2}) for (const bool protect : {false, true}) {
+        Buffer logits(RAD_BF16, {rows, experts}, RAD_MEM_DEVICE);
+        Buffer ids(RAD_I32, {rows, kept}, RAD_MEM_DEVICE), weights(RAD_BF16, {rows, kept}, RAD_MEM_DEVICE);
+        Buffer sorted(RAD_I32, {rows * kept}, RAD_MEM_DEVICE), offsets(RAD_I32, {experts + 1}, RAD_MEM_DEVICE);
+        Buffer counts(RAD_I32, {experts}, RAD_MEM_DEVICE);
+        std::fill_n(logits.data<uint16_t>(), rows * experts, uint16_t(0x3f80));
+        logits.push(queue.stream);
+        RadTensor tensors[]{logits.device, ids.device, weights.device, sorted.device, offsets.device, counts.device};
+        RadParam params[]{RAD_INT("M", rows == 1 ? 64 : rows), RAD_INT("n_expert", experts), RAD_INT("n_local", experts),
+                          RAD_INT("top_k", kept), RAD_INT("expert_base", 0), RAD_INT("norm", 1), RAD_STR("protect", protect ? "7,9" : "")};
+        RadArgs args{}; args.t = tensors; args.n_t = 6; args.p = params; args.n_p = 7; args.world_size = 2;
+        for (const char* setting : {"0", "1"}) {
+            REQUIRE_EQ(setenv(flag.name, setting, 1), 0);
+            for (Buffer* buffer : {&ids, &weights, &sorted, &offsets, &counts}) {
+                std::fill(buffer->expected.begin(), buffer->expected.end(), uint8_t(0x5a));
+                buffer->push(queue.stream);
+            }
+            REQUIRE_EQ(launch(&args, queue.stream), RAD_OK);
+            std::fill_n(counts.data<int32_t>(), experts, 0);
+            std::vector<std::pair<int, int>> ordering;
+            for (int slot = 0; slot < rows * kept; ++slot) {
+                const int id = slot % kept;
+                ids.data<int32_t>()[slot] = id;
+                weights.data<uint16_t>()[slot] = rad_f32_to_bf16(0.1f);
+                const int place = !protect ? id : id == 7 ? 510 : id == 9 ? 511 : id - (id > 7);
+                ++counts.data<int32_t>()[place];
+                ordering.emplace_back(place, slot);
+            }
+            std::sort(ordering.begin(), ordering.end());
+            for (size_t index = 0; index < ordering.size(); ++index) sorted.data<int32_t>()[index] = ordering[index].second;
+            offsets.data<int32_t>()[0] = 0;
+            for (int index = 0; index < experts; ++index)
+                offsets.data<int32_t>()[index + 1] = offsets.data<int32_t>()[index] + counts.data<int32_t>()[index];
+            for (Buffer* buffer : {&logits, &ids, &weights, &sorted, &offsets, &counts})
+                REQUIRE(buffer->read(queue.stream) == buffer->expected);
+        }
+    }
+}
+
 TEST(r3d_bf16_actual_aql_joined_layout_compatibility) {
     RadDeviceProps props{};
     REQUIRE_EQ(rad_dev_props(0, &props), RAD_OK);
