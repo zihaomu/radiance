@@ -83,6 +83,8 @@ void select_expected(const std::array<RadTensor, 8>& tensors, int topk, bool sig
 }
 }
 
+#include "r3d_qsa_radix_aql.h"
+
 TEST(r3d_qsa_index_actual_aql_compact_score_select) {
     using namespace qsa_index_boundary;
     RadDeviceProps properties{};

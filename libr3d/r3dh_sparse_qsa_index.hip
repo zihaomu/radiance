@@ -242,6 +242,117 @@ __device__ void select_part(const SelectCall& call, int row) {
         selected[column * call.selected.stride[1]] = -1;
 }
 __global__ __launch_bounds__(256) void select_kernel_parallel(SelectCall call) { select_part(call, blockIdx.x); }
+constexpr int radix_capacity = 9216;
+template<bool four_rows>
+__device__ __forceinline__ void select_radix_row(SelectCall call) {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1100__)
+    select_part(call, blockIdx.x);
+#else
+#if defined(__HIP_DEVICE_COMPILE__)
+    if (__builtin_amdgcn_wavefrontsize() != 32) { select_part(call, blockIdx.x); return; }
+#endif
+    const int tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+    const int row = four_rows ? int(blockIdx.x) : 0;
+    const int position = static_cast<const int*>(call.positions.data)[row * call.positions.stride[0]];
+    const int width = min(int(call.score_columns), int(call.table_columns));
+    const int complete = min(min(static_cast<const int*>(call.count.data)[0], width), (position + 1) / 4);
+    const int* table = static_cast<const int*>(call.table.data);
+    int* selected = static_cast<int*>(call.selected.data) + row * call.selected.stride[0];
+    __shared__ uint32_t keys[radix_capacity];
+    __shared__ int hist[8][16], bins[16], rank, live, high_base, equal_base;
+    __shared__ uint32_t prefix;
+    int valid_count = 0;
+    for (int column = tid; column < complete; column += 256) {
+        float value;
+        const bool valid = candidate(call.scores, call.table, row, 0, column, call.signed_score, value);
+        const uint32_t raw = value == 0.0f ? 0u : __float_as_uint(value);
+        keys[column] = valid ? (raw & 0x80000000u ? ~raw : raw ^ 0x80000000u) : 0u;
+        valid_count += valid;
+    }
+    for (int distance = 16; distance; distance >>= 1) valid_count += __shfl_down(valid_count, distance, 32);
+    if (lane == 0) hist[wave][0] = valid_count;
+    __syncthreads();
+    if (tid == 0) {
+        live = 0;
+        for (int group = 0; group < 8; ++group) live += hist[group][0];
+        rank = 512; prefix = 0; high_base = 0; equal_base = 0;
+    }
+    __syncthreads();
+    const bool prune = live > 512;
+    if (prune) {
+        uint32_t mask = 0;
+        for (int shift = 28; shift >= 0; shift -= 4) {
+            const uint32_t target = prefix;
+            int count = 0;
+            for (int base = 0; base < complete; base += 256) {
+                const uint32_t key = base + tid < complete ? keys[base + tid] : 0u;
+                uint32_t members = uint32_t(__ballot(key != 0u && (key & mask) == target));
+                const unsigned digit = (key >> shift) & 15u;
+#pragma unroll
+                for (int bit = 0; bit < 4; ++bit) {
+                    const uint32_t ones = uint32_t(__ballot((digit >> bit) & 1u));
+                    members &= (lane >> bit) & 1 ? ones : ~ones;
+                }
+                count += __popc(members);
+            }
+            if (lane < 16) hist[wave][lane] = count;
+            __syncthreads();
+            if (tid < 16) {
+                int total = 0;
+                for (int group = 0; group < 8; ++group) total += hist[group][tid];
+                bins[tid] = total;
+            }
+            __syncthreads();
+            if (tid == 0) {
+                int bucket = 15, remaining = rank;
+                while (bucket > 0 && remaining > bins[bucket]) remaining -= bins[bucket--];
+                rank = remaining; prefix = target | (uint32_t(bucket) << shift);
+            }
+            mask |= 15u << shift;
+            __syncthreads();
+        }
+    }
+    const uint32_t threshold = prefix;
+    const int quota = rank;
+    for (int base = 0; base < complete; base += 256) {
+        const int column = base + tid;
+        const uint32_t key = column < complete ? keys[column] : 0u;
+        const bool above = key > threshold, equal = prune && key == threshold;
+        const uint32_t high_mask = uint32_t(__ballot(above)), equal_mask = uint32_t(__ballot(equal));
+        if (lane == 0) { hist[wave][0] = __popc(high_mask); hist[wave][1] = __popc(equal_mask); }
+        __syncthreads();
+        if (tid == 0) {
+            int high = high_base, tied = equal_base;
+            for (int group = 0; group < 8; ++group) {
+                const int add_high = hist[group][0], add_equal = hist[group][1];
+                hist[group][0] = high; hist[group][1] = tied;
+                high += add_high; tied += add_equal;
+            }
+            high_base = high; equal_base = tied;
+        }
+        __syncthreads();
+        const uint32_t earlier = (1u << lane) - 1u;
+        if (above) selected[(hist[wave][0] + __popc(high_mask & earlier)) * call.selected.stride[1]] = table[column * call.table.stride[1]];
+        if (equal) {
+            const int index = hist[wave][1] + __popc(equal_mask & earlier);
+            if (index < quota) selected[(512 - quota + index) * call.selected.stride[1]] = table[column * call.table.stride[1]];
+        }
+        __syncthreads();
+    }
+    int written = min(512, live);
+    if (complete >= 0 && complete < width && (position + 1) % 4 && table[complete * call.table.stride[1]] >= 0) {
+        if (tid == 0) selected[written * call.selected.stride[1]] = table[complete * call.table.stride[1]];
+        ++written;
+    }
+    for (int column = written + tid; column <= 512; column += 256) selected[column * call.selected.stride[1]] = -1;
+    if (tid == 0) {
+        static_cast<int*>(call.nselected.data)[row * call.nselected.stride[0]] = written;
+        static_cast<int*>(call.used.data)[row * call.used.stride[0]] = written ? (written - 1) * 4 + position % 4 + 1 : 0;
+    }
+#endif
+}
+    __global__ __launch_bounds__(256) void select_kernel_radix(SelectCall call) { select_radix_row<false>(call); }
+    __global__ __launch_bounds__(256) void select_kernel_radix4(SelectCall call) { select_radix_row<true>(call); }
 ScoreCall score_call(const RadTensor* tensors) {
     return ScoreCall{compact<2>(tensors[0]), compact<1>(tensors[1]), compact<2>(tensors[2]),
         compact<1>(tensors[3]), compact<1>(tensors[4]), compact<2>(tensors[5]),
@@ -275,17 +386,32 @@ extern "C" int r3dh_sparse_qsa_score(const RadArgs* args, RadStream stream) {
     }
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
-extern "C" int r3dh_sparse_qsa_select(const RadArgs* args, RadStream stream) {
+extern "C" int r3dh_sparse_qsa_select_observed(const RadArgs* args, RadStream stream, int* path) {
     const int status = r3dh_sparse_qsa_shape("qsa_select", args);
     if (status) return status;
     const RadTensor* tensors = args->t;
     const SelectCall call = select_call(args);
     const bool parallel = r3d_exact_path("RAD_QSA_SELECT_PARALLEL");
-    if (parallel)
+    const char* enabled = std::getenv("RAD_QSA_SELECT_RADIX");
+    const long width = std::min(call.score_columns, call.table_columns);
+    const bool eligible = !std::strcmp(R3D_BUILD_TARGET, "gfx1100") && parallel && enabled && !std::strcmp(enabled, "1") && call.topk == 512 &&
+        call.cu_rows == 2 && width > 512 && width <= radix_capacity;
+    const bool radix = eligible && tensors[0].shape[0] == 1;
+    const char* four = eligible && tensors[0].shape[0] == 4 ? std::getenv("RAD_QSA_SELECT_RADIX4") : nullptr;
+    const bool radix4 = four && !std::strcmp(four, "1");
+    if (path) *path = radix ? 2 : radix4 ? 3 : parallel ? 1 : 0;
+    if (radix)
+        hipLaunchKernelGGL(select_kernel_radix, dim3(1), dim3(256), 0, reinterpret_cast<hipStream_t>(stream), call);
+    else if (radix4)
+        hipLaunchKernelGGL(select_kernel_radix4, dim3(4), dim3(256), 0, reinterpret_cast<hipStream_t>(stream), call);
+    else if (parallel)
         hipLaunchKernelGGL(select_kernel_parallel, dim3(tensors[0].shape[0]), dim3(256), 0,
             reinterpret_cast<hipStream_t>(stream), call);
     else
         hipLaunchKernelGGL(select_kernel, dim3(tensors[0].shape[0]), dim3(1), 0,
             reinterpret_cast<hipStream_t>(stream), call);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+extern "C" int r3dh_sparse_qsa_select(const RadArgs* args, RadStream stream) {
+    return r3dh_sparse_qsa_select_observed(args, stream, nullptr);
 }
