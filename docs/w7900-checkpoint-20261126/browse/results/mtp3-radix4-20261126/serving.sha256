@@ -1,0 +1,3 @@
+21515c71b59267439cf07f5e7ccc60faac4f0c4a10f77a9ff693b4453654ba57  serve-dev-radix4-20261126/bin/radiance
+0da99b111059dcc2d1c9c1ccad994b2beecc4171a5d075e7dd656de3c58b0096  serve-dev-radix4-20261126/radiance_home/architectures/qwen4exp_fp8.so
+c0fe547752aafbd7a40b8e7672d3a04bc073ba362f55de5f6782945d5db81e27  serve-dev-radix4-20261126/radiance_home/kernels/libr3d.so

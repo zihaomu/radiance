@@ -1,0 +1,67 @@
+{
+   "speedup" : {
+      "decode" : 1.44413190072705,
+      "end_to_end" : 1.2939934727121,
+      "prefill" : 1.28721058219957
+   },
+   "tp1" : {
+      "client" : 38.532332643615,
+      "decode" : 38.2975209803298,
+      "expert_prefetch" : true,
+      "hash" : "aa75c3c43b20b79cb72ed3798e393eca0233fbb9642fee77b7b0406838589a4f",
+      "host_experts_per_rank" : "16.86 GiB",
+      "prompt" : 249.186730764477,
+      "prompt_s" : 131.499794871,
+      "samples" : [
+         {
+            "client" : 38.2191257589215,
+            "decode" : 37.9824208038166,
+            "prompt" : 249.09988530511,
+            "prompt_s" : 131.545624599,
+            "total_s" : 138.259939777,
+            "ttft_s" : 131.546307665
+         },
+         {
+            "client" : 38.8455395283084,
+            "decode" : 38.6126211568429,
+            "prompt" : 249.273576223843,
+            "prompt_s" : 131.453965143,
+            "total_s" : 138.058714718,
+            "ttft_s" : 131.45465645
+         }
+      ],
+      "tiers" : "VRAM 43.68 GiB, host pool 18.04 GiB, container on disk 0 B, mapped 47.68 GiB (rank 0)",
+      "total_s" : 138.1593272475,
+      "ttft_s" : 131.5004820575
+   },
+   "tp2" : {
+      "client" : 55.5311786017023,
+      "decode" : 55.3066717664576,
+      "expert_prefetch" : false,
+      "hash" : "7c5a4393260dbf29a8d4f4c1c04ec6aac68b5e98dfc93296a39721bc2ea8b769",
+      "host_experts_per_rank" : "75.95 MiB",
+      "prompt" : 320.755796783749,
+      "prompt_s" : 102.1587150345,
+      "samples" : [
+         {
+            "client" : 55.5101424662373,
+            "decode" : 55.2841960182548,
+            "prompt" : 320.744689235948,
+            "prompt_s" : 102.162252719,
+            "total_s" : 106.775095178,
+            "ttft_s" : 102.162565407
+         },
+         {
+            "client" : 55.5522147371672,
+            "decode" : 55.3291475146604,
+            "prompt" : 320.76690433155,
+            "prompt_s" : 102.15517735,
+            "total_s" : 106.764354844,
+            "ttft_s" : 102.155572467
+         }
+      ],
+      "tiers" : "VRAM 30.63 GiB, host pool 682.20 MiB, container on disk 0 B, mapped 47.68 GiB (rank 0)",
+      "total_s" : 106.769725011,
+      "ttft_s" : 102.159068937
+   }
+}

@@ -1,0 +1,340 @@
+{
+   "control" : {
+      "early-held" : {
+         "retired_us" : {
+            "batch_max" : 197.089,
+            "batch_min" : 152.659,
+            "median" : 165.0915
+         },
+         "submit_us" : {
+            "batch_max" : 196.179,
+            "batch_min" : 151.959,
+            "median" : 164.3365
+         },
+         "wall_us" : {
+            "batch_max" : 710.546,
+            "batch_min" : 645.236,
+            "median" : 659.74125
+         }
+      },
+      "early-now" : {
+         "retired_us" : {
+            "batch_max" : 177.26,
+            "batch_min" : 153.729,
+            "median" : 163.687
+         },
+         "submit_us" : {
+            "batch_max" : 177.09,
+            "batch_min" : 153.549,
+            "median" : 163.5145
+         },
+         "wall_us" : {
+            "batch_max" : 704.236,
+            "batch_min" : 639.427,
+            "median" : 657.77875
+         }
+      },
+      "late-held" : {
+         "retired_us" : {
+            "batch_max" : 185.129,
+            "batch_min" : 154.529,
+            "median" : 165.5965
+         },
+         "submit_us" : {
+            "batch_max" : 184.419,
+            "batch_min" : 153.789,
+            "median" : 164.8615
+         },
+         "wall_us" : {
+            "batch_max" : 678.057,
+            "batch_min" : 640.796,
+            "median" : 656.799
+         }
+      }
+   },
+   "count" : {
+      "early-held" : {
+         "creates" : {
+            "batch_max" : 0,
+            "batch_min" : 0,
+            "median" : 0
+         },
+         "fresh_nonzero" : {
+            "batch_max" : 0,
+            "batch_min" : 0,
+            "median" : 0
+         },
+         "fresh_queue_reads" : {
+            "batch_max" : 0,
+            "batch_min" : 0,
+            "median" : 0
+         },
+         "fresh_reads" : {
+            "batch_max" : 0,
+            "batch_min" : 0,
+            "median" : 0
+         },
+         "gets" : {
+            "batch_max" : 48,
+            "batch_min" : 48,
+            "median" : 48
+         },
+         "peak" : {
+            "batch_max" : 48,
+            "batch_min" : 48,
+            "median" : 48
+         },
+         "queue_reads" : {
+            "batch_max" : 48,
+            "batch_min" : 48,
+            "median" : 48
+         },
+         "retired_us" : {
+            "batch_max" : 179.189,
+            "batch_min" : 155.039,
+            "median" : 165.274
+         },
+         "retires" : {
+            "batch_max" : 48,
+            "batch_min" : 48,
+            "median" : 48
+         },
+         "submit_us" : {
+            "batch_max" : 178.409,
+            "batch_min" : 154.269,
+            "median" : 164.559
+         },
+         "value_reads" : {
+            "batch_max" : 48,
+            "batch_min" : 48,
+            "median" : 48
+         },
+         "wall_us" : {
+            "batch_max" : 718.666,
+            "batch_min" : 640.327,
+            "median" : 660.217
+         }
+      },
+      "early-now" : {
+         "creates" : {
+            "batch_max" : 0,
+            "batch_min" : 0,
+            "median" : 0
+         },
+         "fresh_nonzero" : {
+            "batch_max" : 0,
+            "batch_min" : 0,
+            "median" : 0
+         },
+         "fresh_queue_reads" : {
+            "batch_max" : 11,
+            "batch_min" : 11,
+            "median" : 11
+         },
+         "fresh_reads" : {
+            "batch_max" : 11,
+            "batch_min" : 11,
+            "median" : 11
+         },
+         "gets" : {
+            "batch_max" : 48,
+            "batch_min" : 48,
+            "median" : 48
+         },
+         "peak" : {
+            "batch_max" : 37,
+            "batch_min" : 37,
+            "median" : 37
+         },
+         "queue_reads" : {
+            "batch_max" : 48,
+            "batch_min" : 48,
+            "median" : 48
+         },
+         "retired_us" : {
+            "batch_max" : 178.499,
+            "batch_min" : 156.509,
+            "median" : 167.984
+         },
+         "retires" : {
+            "batch_max" : 48,
+            "batch_min" : 48,
+            "median" : 48
+         },
+         "submit_us" : {
+            "batch_max" : 178.329,
+            "batch_min" : 156.459,
+            "median" : 167.809
+         },
+         "value_reads" : {
+            "batch_max" : 48,
+            "batch_min" : 48,
+            "median" : 48
+         },
+         "wall_us" : {
+            "batch_max" : 680.727,
+            "batch_min" : 639.407,
+            "median" : 655.446
+         }
+      },
+      "late-held" : {
+         "creates" : {
+            "batch_max" : 0,
+            "batch_min" : 0,
+            "median" : 0
+         },
+         "fresh_nonzero" : {
+            "batch_max" : 0,
+            "batch_min" : 0,
+            "median" : 0
+         },
+         "fresh_queue_reads" : {
+            "batch_max" : 0,
+            "batch_min" : 0,
+            "median" : 0
+         },
+         "fresh_reads" : {
+            "batch_max" : 0,
+            "batch_min" : 0,
+            "median" : 0
+         },
+         "gets" : {
+            "batch_max" : 48,
+            "batch_min" : 48,
+            "median" : 48
+         },
+         "peak" : {
+            "batch_max" : 48,
+            "batch_min" : 48,
+            "median" : 48
+         },
+         "queue_reads" : {
+            "batch_max" : 48,
+            "batch_min" : 48,
+            "median" : 48
+         },
+         "retired_us" : {
+            "batch_max" : 183.379,
+            "batch_min" : 156.369,
+            "median" : 165.854
+         },
+         "retires" : {
+            "batch_max" : 48,
+            "batch_min" : 48,
+            "median" : 48
+         },
+         "submit_us" : {
+            "batch_max" : 182.519,
+            "batch_min" : 155.599,
+            "median" : 164.9795
+         },
+         "value_reads" : {
+            "batch_max" : 48,
+            "batch_min" : 48,
+            "median" : 48
+         },
+         "wall_us" : {
+            "batch_max" : 1889.72,
+            "batch_min" : 640.536,
+            "median" : 660.6565
+         }
+      }
+   },
+   "cpu" : 32,
+   "paired" : {
+      "early-held-minus-early-now" : {
+         "retired_us" : {
+            "deltas" : [
+               0.0349999999999966,
+               -1.68000000000001,
+               -3.83000000000001,
+               1.32499999999999,
+               11.32,
+               1.52950000000001
+            ],
+            "faster" : 2,
+            "max" : 11.32,
+            "median" : 0.679999999999993,
+            "min" : -3.83000000000001,
+            "rounds" : 6
+         },
+         "submit_us" : {
+            "deltas" : [
+               -0.514999999999986,
+               -2.25,
+               -4.5,
+               0.715000000000032,
+               10.58,
+               0.974499999999978
+            ],
+            "faster" : 3,
+            "max" : 10.58,
+            "median" : 0.100000000000023,
+            "min" : -4.5,
+            "rounds" : 6
+         },
+         "wall_us" : {
+            "deltas" : [
+               0.249500000000012,
+               0.485999999999876,
+               1.50999999999999,
+               8.7299999999999,
+               -0.115000000000009,
+               2.89499999999998
+            ],
+            "faster" : 1,
+            "max" : 8.7299999999999,
+            "median" : 0.997999999999934,
+            "min" : -0.115000000000009,
+            "rounds" : 6
+         }
+      },
+      "late-held-minus-early-held" : {
+         "retired_us" : {
+            "deltas" : [
+               3.05549999999999,
+               3.00999999999999,
+               -2.065,
+               0.425000000000011,
+               -5.35050000000001,
+               0.58499999999998
+            ],
+            "faster" : 2,
+            "max" : 3.05549999999999,
+            "median" : 0.504999999999995,
+            "min" : -5.35050000000001,
+            "rounds" : 6
+         },
+         "submit_us" : {
+            "deltas" : [
+               3.06549999999999,
+               3.01000000000002,
+               -2.05500000000001,
+               0.464999999999975,
+               -5.13050000000004,
+               0.585000000000008
+            ],
+            "faster" : 2,
+            "max" : 3.06549999999999,
+            "median" : 0.524999999999991,
+            "min" : -5.13050000000004,
+            "rounds" : 6
+         },
+         "wall_us" : {
+            "deltas" : [
+               -3.14449999999999,
+               6.77400000000011,
+               -2.7505000000001,
+               -8.14999999999998,
+               -2.46499999999992,
+               -3.41949999999997
+            ],
+            "faster" : 5,
+            "max" : 6.77400000000011,
+            "median" : -2.94750000000005,
+            "min" : -8.14999999999998,
+            "rounds" : 6
+         }
+      }
+   }
+}

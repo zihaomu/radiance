@@ -1,0 +1,4 @@
+I device: AQL backend, 1 device(s) [0:gfx1100]
+  ok   r3d_qsa_radix_dispatch_contract (5.06 s)
+38483 check(s) over 1 case(s) in 5.06 s, 182.71 s of CPU
+QSA_RADIX_PASS cases=380 single=208 four=74 fallback=98 exact_device_bytes=124859480 streams=2 precision_modes=2

@@ -1,0 +1,4 @@
+I device: AQL backend, 1 device(s) [0:gfx1100]
+  ok   r3d_qsa_index_actual_aql_compact_score_select (3.58 s)
+27215 check(s) over 1 case(s) in 3.58 s, 356.39 s of CPU
+PASS QSA_INDEX_AQL fixtures=144 score_select_pipelines=288 score_launches=288 select_launches=864 rejects=1152 exact_device_bytes=444289968 independent_libref_bytes=98593488 boundary512=786 boundary513=786 queues=2 tolerance=0

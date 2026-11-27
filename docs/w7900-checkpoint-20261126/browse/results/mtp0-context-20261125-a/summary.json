@@ -1,0 +1,479 @@
+{
+   "cases" : [
+      {
+         "input" : 1024,
+         "ms_token" : 16.9212884032258,
+         "rates" : [
+            59.2250317477693,
+            58.9698288574774
+         ],
+         "tok_s" : 59.0974303026233,
+         "trace" : {
+            "calls" : {
+               "attention" : 12,
+               "other" : 1071,
+               "qsa_score" : 0,
+               "qsa_select" : 0
+            },
+            "first_pass" : 17,
+            "kernel_by_symbol_ms" : {
+               "_Z15iqr_wmma_ksplitILi10ELb1EEvPKaPKfPKhS3_Ptii" : 1.29153566666667,
+               "_Z34r3dh_ar_oneshot_2rank_exact_kernelI14__hip_bfloat16Li8EEvPK15HIP_vector_typeIiLj4EEPS2_S4_S5_PjS6_S6_iiiij" : 0.0114233333333333,
+               "_ZN12_GLOBAL__N_110split_gemvILi1ELi16384EEEvPKaPKfS2_S4_Ptiilll" : 1.72881583333333,
+               "_ZN12_GLOBAL__N_111cast_kernelILi256EEEvPKvPvjjjiii" : 0.01664,
+               "_ZN12_GLOBAL__N_111convolutionENS_4CallEb" : 0.175626666666667,
+               "_ZN12_GLOBAL__N_112project_waveEPKtS1_Ptllli" : 0.474353333333333,
+               "_ZN12_GLOBAL__N_112table_kernelEPKiPfllff" : 0.00695666666666667,
+               "_ZN12_GLOBAL__N_113binary_kernelILi256ELi0ELi1ELi0EEEvPKtS2_Ptjjjjf" : 0.00584325,
+               "_ZN12_GLOBAL__N_113build_run_mapENS_4CallEP15HIP_vector_typeIiLj2EEi" : 0.19088325,
+               "_ZN12_GLOBAL__N_113gate_up_splitENS_4CallEPK15HIP_vector_typeIiLj2EE" : 1.23772616666667,
+               "_ZN12_GLOBAL__N_113prepare_storeENS_4PrepENS_5StoreE" : 0.0739666666666667,
+               "_ZN12_GLOBAL__N_113work_parallelENS_5StateE" : 0.0781233333333333,
+               "_ZN12_GLOBAL__N_114project_reduceEPKtS1_Ptl" : 0.322372916666667,
+               "_ZN12_GLOBAL__N_114protected_gemmENS_8GeometryEPKtlS2_lPKiS4_Ptl" : 0.188406416666667,
+               "_ZN12_GLOBAL__N_115gemm_m16_kernelILi1ELb1ELb1EEEvPKtS2_PtPfiiiiiii" : 0.24346325,
+               "_ZN12_GLOBAL__N_115hc_enter_kernelEPKtPtllill" : 0.00381333333333333,
+               "_ZN12_GLOBAL__N_115silu_mul_kernelILi256ELi1EEEvPKtPtjjj" : 0.00705333333333333,
+               "_ZN12_GLOBAL__N_116ngram_ids_kernelEPKiPiS1_PKxS4_S4_S1_S1_S1_S2_jjjjxjS2_jj" : 0.00913333333333333,
+               "_ZN12_GLOBAL__N_116recurrent_pairedENS_4CallE" : 0.657736583333333,
+               "_ZN12_GLOBAL__N_117gemm_split_reduceEPKfPtiiii" : 0.15658325,
+               "_ZN12_GLOBAL__N_117quantize_parallelENS_4CallE" : 0.0842066666666667,
+               "_ZN12_GLOBAL__N_118gather_rows_kernelILi256EEEvPKvPKiPvjjjiil" : 0.00695,
+               "_ZN12_GLOBAL__N_118logits_joined_waveEPKtPK15RadPlanesHeaderPfilll" : 0.405636416666667,
+               "_ZN12_GLOBAL__N_119embed_lookup_kernelILi256EEEvPKiPKvPvjiiffjlii" : 0.00914333333333333,
+               "_ZN12_GLOBAL__N_119key_kernel_parallelEN12r3dh_qsa_key7KeyCallE" : 0.0960333333333333,
+               "_ZN12_GLOBAL__N_119r3d_ple_conv_kernelILb1EEEvPKtS2_PtPKiS2_S5_S5_S5_S3_jjjjjjjjxxxx" : 0.0104166666666667,
+               "_ZN12_GLOBAL__N_120attention_paged_fastILb1EEEvNS_9AttentionE" : 0.850562833333333,
+               "_ZN12_GLOBAL__N_129r3dh_ar_hc_write_2rank_kernelILb0EEEvP15HIP_vector_typeIiLj4EES3_PKS2_PjS6_S6_PKtPtiiillijNS_9GatherRowE" : 0.812243083333333,
+               "_ZN12_GLOBAL__N_129r3dh_ar_hc_write_2rank_kernelILb1EEEvP15HIP_vector_typeIiLj4EES3_PKS2_PjS6_S6_PKtPtiiillijNS_9GatherRowE" : 1.09462625,
+               "_ZN12_GLOBAL__N_131r3d_router_topk_scatter_onewaveEPKtPiPtS2_S2_S2_jiiN11r3d_scatter7ProtectE" : 0.463073083333333,
+               "_ZN12_GLOBAL__N_14tailENS_5StateE" : 0.128969916666667,
+               "_ZN12_GLOBAL__N_18down_runENS_4CallE" : 1.38490941666667,
+               "_ZN12_GLOBAL__N_18hc_fusedENS_9FusedArgsE" : 2.018469,
+               "_ZN12_GLOBAL__N_18quantizeILb0EEEvPKtS2_PaPfPtilllll" : 0.638659833333333,
+               "_ZN12_GLOBAL__N_18quantizeILb1EEEvPKtPaPflll" : 0.00302,
+               "_ZN19r3dh_mtp_ple_detail13gate_parallelENS_8DataViewES0_S0_S0_S0_S0_S0_S0_lllllllfff" : 0.0390366666666667
+            },
+            "kernel_ms" : {
+               "attention" : 0.850562833333333,
+               "other" : 14.07585025,
+               "qsa_score" : 0,
+               "qsa_select" : 0
+            },
+            "last_pass" : 28,
+            "passes" : 12,
+            "records" : 1085,
+            "span_ms" : 17.7166298333333
+         },
+         "ttft_s" : 3.2725196115
+      },
+      {
+         "input" : 2016,
+         "ms_token" : 17.4662236451613,
+         "rates" : [
+            57.1918563844151,
+            57.3149971638136
+         ],
+         "tok_s" : 57.2534267741144,
+         "trace" : {
+            "calls" : {
+               "attention" : 12,
+               "other" : 1071,
+               "qsa_score" : 0,
+               "qsa_select" : 0
+            },
+            "first_pass" : 18,
+            "kernel_by_symbol_ms" : {
+               "_Z15iqr_wmma_ksplitILi10ELb1EEvPKaPKfPKhS3_Ptii" : 1.28895533333333,
+               "_Z34r3dh_ar_oneshot_2rank_exact_kernelI14__hip_bfloat16Li8EEvPK15HIP_vector_typeIiLj4EEPS2_S4_S5_PjS6_S6_iiiij" : 0.01145675,
+               "_ZN12_GLOBAL__N_110split_gemvILi1ELi16384EEEvPKaPKfS2_S4_Ptiilll" : 1.69448775,
+               "_ZN12_GLOBAL__N_111cast_kernelILi256EEEvPKvPvjjjiii" : 0.01611,
+               "_ZN12_GLOBAL__N_111convolutionENS_4CallEb" : 0.177664,
+               "_ZN12_GLOBAL__N_112project_waveEPKtS1_Ptllli" : 0.471451916666667,
+               "_ZN12_GLOBAL__N_112table_kernelEPKiPfllff" : 0.00690333333333333,
+               "_ZN12_GLOBAL__N_113binary_kernelILi256ELi0ELi1ELi0EEEvPKtS2_Ptjjjjf" : 0.00577333333333333,
+               "_ZN12_GLOBAL__N_113build_run_mapENS_4CallEP15HIP_vector_typeIiLj2EEi" : 0.191237416666667,
+               "_ZN12_GLOBAL__N_113gate_up_splitENS_4CallEPK15HIP_vector_typeIiLj2EE" : 1.26089533333333,
+               "_ZN12_GLOBAL__N_113prepare_storeENS_4PrepENS_5StoreE" : 0.0734170833333333,
+               "_ZN12_GLOBAL__N_113work_parallelENS_5StateE" : 0.0775300833333333,
+               "_ZN12_GLOBAL__N_114project_reduceEPKtS1_Ptl" : 0.32992175,
+               "_ZN12_GLOBAL__N_114protected_gemmENS_8GeometryEPKtlS2_lPKiS4_Ptl" : 0.247044416666667,
+               "_ZN12_GLOBAL__N_115gemm_m16_kernelILi1ELb1ELb1EEEvPKtS2_PtPfiiiiiii" : 0.24513775,
+               "_ZN12_GLOBAL__N_115hc_enter_kernelEPKtPtllill" : 0.00380333333333333,
+               "_ZN12_GLOBAL__N_115silu_mul_kernelILi256ELi1EEEvPKtPtjjj" : 0.00714,
+               "_ZN12_GLOBAL__N_116ngram_ids_kernelEPKiPiS1_PKxS4_S4_S1_S1_S1_S2_jjjjxjS2_jj" : 0.00907008333333333,
+               "_ZN12_GLOBAL__N_116recurrent_pairedENS_4CallE" : 0.653092833333333,
+               "_ZN12_GLOBAL__N_117gemm_split_reduceEPKfPtiiii" : 0.156364583333333,
+               "_ZN12_GLOBAL__N_117quantize_parallelENS_4CallE" : 0.0840605833333334,
+               "_ZN12_GLOBAL__N_118gather_rows_kernelILi256EEEvPKvPKiPvjjjiil" : 0.00695666666666667,
+               "_ZN12_GLOBAL__N_118logits_joined_waveEPKtPK15RadPlanesHeaderPfilll" : 0.406015083333333,
+               "_ZN12_GLOBAL__N_119embed_lookup_kernelILi256EEEvPKiPKvPvjiiffjlii" : 0.00924333333333333,
+               "_ZN12_GLOBAL__N_119key_kernel_parallelEN12r3dh_qsa_key7KeyCallE" : 0.0939769166666666,
+               "_ZN12_GLOBAL__N_119r3d_ple_conv_kernelILb1EEEvPKtS2_PtPKiS2_S5_S5_S5_S3_jjjjjjjjxxxx" : 0.0105266666666667,
+               "_ZN12_GLOBAL__N_120attention_paged_fastILb1EEEvNS_9AttentionE" : 1.38820883333333,
+               "_ZN12_GLOBAL__N_129r3dh_ar_hc_write_2rank_kernelILb0EEEvP15HIP_vector_typeIiLj4EES3_PKS2_PjS6_S6_PKtPtiiillijNS_9GatherRowE" : 0.81187975,
+               "_ZN12_GLOBAL__N_129r3dh_ar_hc_write_2rank_kernelILb1EEEvP15HIP_vector_typeIiLj4EES3_PKS2_PjS6_S6_PKtPtiiillijNS_9GatherRowE" : 1.08634775,
+               "_ZN12_GLOBAL__N_131r3d_router_topk_scatter_onewaveEPKtPiPtS2_S2_S2_jiiN11r3d_scatter7ProtectE" : 0.4626115,
+               "_ZN12_GLOBAL__N_14tailENS_5StateE" : 0.114797166666667,
+               "_ZN12_GLOBAL__N_18down_runENS_4CallE" : 1.39127875,
+               "_ZN12_GLOBAL__N_18hc_fusedENS_9FusedArgsE" : 2.00250225,
+               "_ZN12_GLOBAL__N_18quantizeILb0EEEvPKtS2_PaPfPtilllll" : 0.636769416666667,
+               "_ZN12_GLOBAL__N_18quantizeILb1EEEvPKtPaPflll" : 0.00302008333333333,
+               "_ZN19r3dh_mtp_ple_detail13gate_parallelENS_8DataViewES0_S0_S0_S0_S0_S0_S0_lllllllfff" : 0.0388368333333333
+            },
+            "kernel_ms" : {
+               "attention" : 1.38820883333333,
+               "other" : 14.0862798333333,
+               "qsa_score" : 0,
+               "qsa_select" : 0
+            },
+            "last_pass" : 29,
+            "passes" : 12,
+            "records" : 1085,
+            "span_ms" : 18.2483883333333
+         },
+         "ttft_s" : 6.837273203
+      },
+      {
+         "input" : 2064,
+         "ms_token" : 21.9420105483871,
+         "rates" : [
+            45.7690294894183,
+            45.3819641894112
+         ],
+         "tok_s" : 45.5754968394147,
+         "trace" : {
+            "calls" : {
+               "attention" : 12,
+               "other" : 1083,
+               "qsa_score" : 12,
+               "qsa_select" : 12
+            },
+            "first_pass" : 18,
+            "kernel_by_symbol_ms" : {
+               "_Z15iqr_wmma_ksplitILi10ELb1EEvPKaPKfPKhS3_Ptii" : 5.42891591666667,
+               "_Z34r3dh_ar_oneshot_2rank_exact_kernelI14__hip_bfloat16Li8EEvPK15HIP_vector_typeIiLj4EEPS2_S4_S5_PjS6_S6_iiiij" : 0.01204,
+               "_ZN12_GLOBAL__N_110split_gemvILi1ELi16384EEEvPKaPKfS2_S4_Ptiilll" : 10.34254825,
+               "_ZN12_GLOBAL__N_111cast_kernelILi256EEEvPKvPvjjjiii" : 0.01738,
+               "_ZN12_GLOBAL__N_111convolutionENS_4CallEb" : 0.175843166666667,
+               "_ZN12_GLOBAL__N_112project_waveEPKtS1_Ptllli" : 0.471146416666667,
+               "_ZN12_GLOBAL__N_112table_kernelEPKiPfllff" : 0.00685333333333333,
+               "_ZN12_GLOBAL__N_113binary_kernelILi256ELi0ELi1ELi0EEEvPKtS2_Ptjjjjf" : 0.00583333333333333,
+               "_ZN12_GLOBAL__N_113build_run_mapENS_4CallEP15HIP_vector_typeIiLj2EEi" : 0.191296416666667,
+               "_ZN12_GLOBAL__N_113gate_up_splitENS_4CallEPK15HIP_vector_typeIiLj2EE" : 1.24686208333333,
+               "_ZN12_GLOBAL__N_113prepare_storeENS_4PrepENS_5StoreE" : 0.0780865833333333,
+               "_ZN12_GLOBAL__N_113work_parallelENS_5StateE" : 0.0554130833333333,
+               "_ZN12_GLOBAL__N_114project_reduceEPKtS1_Ptl" : 0.323923333333333,
+               "_ZN12_GLOBAL__N_114protected_gemmENS_8GeometryEPKtlS2_lPKiS4_Ptl" : 0.0882633333333333,
+               "_ZN12_GLOBAL__N_115gemm_m16_kernelILi1ELb1ELb1EEEvPKtS2_PtPfiiiiiii" : 0.245266583333333,
+               "_ZN12_GLOBAL__N_115hc_enter_kernelEPKtPtllill" : 0.00375,
+               "_ZN12_GLOBAL__N_115silu_mul_kernelILi256ELi1EEEvPKtPtjjj" : 0.00704666666666667,
+               "_ZN12_GLOBAL__N_116ngram_ids_kernelEPKiPiS1_PKxS4_S4_S1_S1_S1_S2_jjjjxjS2_jj" : 0.00908333333333333,
+               "_ZN12_GLOBAL__N_116prepare_parallelENS_4PrepE" : 0.0493465,
+               "_ZN12_GLOBAL__N_116recurrent_pairedENS_4CallE" : 0.64905275,
+               "_ZN12_GLOBAL__N_117gemm_split_reduceEPKfPtiiii" : 0.15623325,
+               "_ZN12_GLOBAL__N_117quantize_parallelENS_4CallE" : 0.0865898333333333,
+               "_ZN12_GLOBAL__N_118gather_rows_kernelILi256EEEvPKvPKiPvjjjiil" : 0.00691333333333333,
+               "_ZN12_GLOBAL__N_118logits_joined_waveEPKtPK15RadPlanesHeaderPfilll" : 0.406132833333333,
+               "_ZN12_GLOBAL__N_119embed_lookup_kernelILi256EEEvPKiPKvPvjiiffjlii" : 0.00944333333333333,
+               "_ZN12_GLOBAL__N_119key_kernel_parallelEN12r3dh_qsa_key7KeyCallE" : 0.0769031666666667,
+               "_ZN12_GLOBAL__N_119r3d_ple_conv_kernelILb1EEEvPKtS2_PtPKiS2_S5_S5_S5_S3_jjjjjjjjxxxx" : 0.0103433333333333,
+               "_ZN12_GLOBAL__N_120attention_paged_fastILb1EEEvNS_9AttentionE" : 1.41763216666667,
+               "_ZN12_GLOBAL__N_121score_kernel_parallelILb1EEEvNS_9ScoreCallE" : 0.0722933333333333,
+               "_ZN12_GLOBAL__N_122select_kernel_parallelENS_10SelectCallE" : 4.34843658333333,
+               "_ZN12_GLOBAL__N_129r3dh_ar_hc_write_2rank_kernelILb0EEEvP15HIP_vector_typeIiLj4EES3_PKS2_PjS6_S6_PKtPtiiillijNS_9GatherRowE" : 0.819665833333333,
+               "_ZN12_GLOBAL__N_129r3dh_ar_hc_write_2rank_kernelILb1EEEvP15HIP_vector_typeIiLj4EES3_PKS2_PjS6_S6_PKtPtiiillijNS_9GatherRowE" : 1.09300883333333,
+               "_ZN12_GLOBAL__N_131r3d_router_topk_scatter_onewaveEPKtPiPtS2_S2_S2_jiiN11r3d_scatter7ProtectE" : 0.459832833333333,
+               "_ZN12_GLOBAL__N_14tailENS_5StateE" : 0.08159325,
+               "_ZN12_GLOBAL__N_18down_runENS_4CallE" : 1.386799,
+               "_ZN12_GLOBAL__N_18hc_fusedENS_9FusedArgsE" : 2.007772,
+               "_ZN12_GLOBAL__N_18quantizeILb0EEEvPKtS2_PaPfPtilllll" : 0.64446225,
+               "_ZN12_GLOBAL__N_18quantizeILb1EEEvPKtPaPflll" : 0.00294333333333333,
+               "_ZN19r3dh_mtp_ple_detail13gate_parallelENS_8DataViewES0_S0_S0_S0_S0_S0_S0_lllllllfff" : 0.0389966666666667
+            },
+            "kernel_ms" : {
+               "attention" : 1.41763216666667,
+               "other" : 26.6955841666667,
+               "qsa_score" : 0.0722933333333333,
+               "qsa_select" : 4.34843658333333
+            },
+            "last_pass" : 29,
+            "passes" : 12,
+            "records" : 1121,
+            "span_ms" : 23.5217696666667
+         },
+         "ttft_s" : 7.0231282
+      },
+      {
+         "input" : 8192,
+         "ms_token" : 34.1842876612903,
+         "rates" : [
+            29.255220907013,
+            29.2511908487691
+         ],
+         "tok_s" : 29.253205877891,
+         "trace" : {
+            "calls" : {
+               "attention" : 12,
+               "other" : 1083,
+               "qsa_score" : 12,
+               "qsa_select" : 12
+            },
+            "first_pass" : 17,
+            "kernel_by_symbol_ms" : {
+               "_Z15iqr_wmma_ksplitILi10ELb1EEvPKaPKfPKhS3_Ptii" : 17.84971025,
+               "_Z34r3dh_ar_oneshot_2rank_exact_kernelI14__hip_bfloat16Li8EEvPK15HIP_vector_typeIiLj4EEPS2_S4_S5_PjS6_S6_iiiij" : 0.01163,
+               "_ZN12_GLOBAL__N_110split_gemvILi1ELi16384EEEvPKaPKfS2_S4_Ptiilll" : 35.2223640833333,
+               "_ZN12_GLOBAL__N_111cast_kernelILi256EEEvPKvPvjjjiii" : 0.0149366666666667,
+               "_ZN12_GLOBAL__N_111convolutionENS_4CallEb" : 0.177473333333333,
+               "_ZN12_GLOBAL__N_112project_waveEPKtS1_Ptllli" : 0.472816416666667,
+               "_ZN12_GLOBAL__N_112table_kernelEPKiPfllff" : 0.00685666666666667,
+               "_ZN12_GLOBAL__N_113binary_kernelILi256ELi0ELi1ELi0EEEvPKtS2_Ptjjjjf" : 0.0058,
+               "_ZN12_GLOBAL__N_113build_run_mapENS_4CallEP15HIP_vector_typeIiLj2EEi" : 0.190809916666667,
+               "_ZN12_GLOBAL__N_113gate_up_splitENS_4CallEPK15HIP_vector_typeIiLj2EE" : 1.248436,
+               "_ZN12_GLOBAL__N_113prepare_storeENS_4PrepENS_5StoreE" : 0.07841325,
+               "_ZN12_GLOBAL__N_113work_parallelENS_5StateE" : 0.0577066666666667,
+               "_ZN12_GLOBAL__N_114project_reduceEPKtS1_Ptl" : 0.316609916666667,
+               "_ZN12_GLOBAL__N_114protected_gemmENS_8GeometryEPKtlS2_lPKiS4_Ptl" : 0.332365916666667,
+               "_ZN12_GLOBAL__N_115gemm_m16_kernelILi1ELb1ELb1EEEvPKtS2_PtPfiiiiiii" : 0.244769833333333,
+               "_ZN12_GLOBAL__N_115hc_enter_kernelEPKtPtllill" : 0.00349658333333333,
+               "_ZN12_GLOBAL__N_115silu_mul_kernelILi256ELi1EEEvPKtPtjjj" : 0.00695333333333333,
+               "_ZN12_GLOBAL__N_116ngram_ids_kernelEPKiPiS1_PKxS4_S4_S1_S1_S1_S2_jjjjxjS2_jj" : 0.00908666666666667,
+               "_ZN12_GLOBAL__N_116prepare_parallelENS_4PrepE" : 0.0496265833333333,
+               "_ZN12_GLOBAL__N_116recurrent_pairedENS_4CallE" : 0.653879833333333,
+               "_ZN12_GLOBAL__N_117gemm_split_reduceEPKfPtiiii" : 0.156369916666667,
+               "_ZN12_GLOBAL__N_117quantize_parallelENS_4CallE" : 0.08743,
+               "_ZN12_GLOBAL__N_118gather_rows_kernelILi256EEEvPKvPKiPvjjjiil" : 0.00693666666666667,
+               "_ZN12_GLOBAL__N_118logits_joined_waveEPKtPK15RadPlanesHeaderPfilll" : 0.405439833333333,
+               "_ZN12_GLOBAL__N_119embed_lookup_kernelILi256EEEvPKiPKvPvjiiffjlii" : 0.00913666666666667,
+               "_ZN12_GLOBAL__N_119key_kernel_parallelEN12r3dh_qsa_key7KeyCallE" : 0.07672,
+               "_ZN12_GLOBAL__N_119r3d_ple_conv_kernelILb1EEEvPKtS2_PtPKiS2_S5_S5_S5_S3_jjjjjjjjxxxx" : 0.0105833333333333,
+               "_ZN12_GLOBAL__N_120attention_paged_fastILb1EEEvNS_9AttentionE" : 1.41266316666667,
+               "_ZN12_GLOBAL__N_121score_kernel_parallelILb1EEEvNS_9ScoreCallE" : 0.0771133333333333,
+               "_ZN12_GLOBAL__N_122select_kernel_parallelENS_10SelectCallE" : 16.659514,
+               "_ZN12_GLOBAL__N_129r3dh_ar_hc_write_2rank_kernelILb0EEEvP15HIP_vector_typeIiLj4EES3_PKS2_PjS6_S6_PKtPtiiillijNS_9GatherRowE" : 0.815593,
+               "_ZN12_GLOBAL__N_129r3dh_ar_hc_write_2rank_kernelILb1EEEvP15HIP_vector_typeIiLj4EES3_PKS2_PjS6_S6_PKtPtiiillijNS_9GatherRowE" : 1.096973,
+               "_ZN12_GLOBAL__N_131r3d_router_topk_scatter_onewaveEPKtPiPtS2_S2_S2_jiiN11r3d_scatter7ProtectE" : 0.45978325,
+               "_ZN12_GLOBAL__N_14tailENS_5StateE" : 0.0842466666666667,
+               "_ZN12_GLOBAL__N_18down_runENS_4CallE" : 1.38036283333333,
+               "_ZN12_GLOBAL__N_18hc_fusedENS_9FusedArgsE" : 1.996736,
+               "_ZN12_GLOBAL__N_18quantizeILb0EEEvPKtS2_PaPfPtilllll" : 0.66897975,
+               "_ZN12_GLOBAL__N_18quantizeILb1EEEvPKtPaPflll" : 0.00301666666666667,
+               "_ZN19r3dh_mtp_ple_detail13gate_parallelENS_8DataViewES0_S0_S0_S0_S0_S0_S0_lllllllfff" : 0.0389466666666667
+            },
+            "kernel_ms" : {
+               "attention" : 1.41266316666667,
+               "other" : 64.2509961666666,
+               "qsa_score" : 0.0771133333333333,
+               "qsa_select" : 16.659514
+            },
+            "last_pass" : 28,
+            "passes" : 12,
+            "records" : 1121,
+            "span_ms" : 37.0462166666667
+         },
+         "ttft_s" : 25.123588713
+      },
+      {
+         "input" : 32768,
+         "ms_token" : 65.7207946451613,
+         "rates" : [
+            15.2339579965064,
+            15.197853212831
+         ],
+         "tok_s" : 15.2159056046687,
+         "trace" : {
+            "calls" : {
+               "attention" : 12,
+               "other" : 1083,
+               "qsa_score" : 12,
+               "qsa_select" : 12
+            },
+            "first_pass" : 17,
+            "kernel_by_symbol_ms" : {
+               "_Z15iqr_wmma_ksplitILi10ELb1EEvPKaPKfPKhS3_Ptii" : 49.041687,
+               "_Z34r3dh_ar_oneshot_2rank_exact_kernelI14__hip_bfloat16Li8EEvPK15HIP_vector_typeIiLj4EEPS2_S4_S5_PjS6_S6_iiiij" : 0.01133,
+               "_ZN12_GLOBAL__N_110split_gemvILi1ELi16384EEEvPKaPKfS2_S4_Ptiilll" : 97.58235625,
+               "_ZN12_GLOBAL__N_111cast_kernelILi256EEEvPKvPvjjjiii" : 0.0153566666666667,
+               "_ZN12_GLOBAL__N_111convolutionENS_4CallEb" : 0.180750166666667,
+               "_ZN12_GLOBAL__N_112project_waveEPKtS1_Ptllli" : 0.46965125,
+               "_ZN12_GLOBAL__N_112table_kernelEPKiPfllff" : 0.00691333333333333,
+               "_ZN12_GLOBAL__N_113binary_kernelILi256ELi0ELi1ELi0EEEvPKtS2_Ptjjjjf" : 0.00586,
+               "_ZN12_GLOBAL__N_113build_run_mapENS_4CallEP15HIP_vector_typeIiLj2EEi" : 0.19142375,
+               "_ZN12_GLOBAL__N_113gate_up_splitENS_4CallEPK15HIP_vector_typeIiLj2EE" : 1.24856191666667,
+               "_ZN12_GLOBAL__N_113prepare_storeENS_4PrepENS_5StoreE" : 0.07812025,
+               "_ZN12_GLOBAL__N_113work_parallelENS_5StateE" : 0.0571868333333333,
+               "_ZN12_GLOBAL__N_114project_reduceEPKtS1_Ptl" : 0.3219405,
+               "_ZN12_GLOBAL__N_114protected_gemmENS_8GeometryEPKtlS2_lPKiS4_Ptl" : 0.185063916666667,
+               "_ZN12_GLOBAL__N_115gemm_m16_kernelILi1ELb1ELb1EEEvPKtS2_PtPfiiiiiii" : 0.245713666666667,
+               "_ZN12_GLOBAL__N_115hc_enter_kernelEPKtPtllill" : 0.00361,
+               "_ZN12_GLOBAL__N_115silu_mul_kernelILi256ELi1EEEvPKtPtjjj" : 0.00699333333333333,
+               "_ZN12_GLOBAL__N_116ngram_ids_kernelEPKiPiS1_PKxS4_S4_S1_S1_S1_S2_jjjjxjS2_jj" : 0.00903333333333333,
+               "_ZN12_GLOBAL__N_116prepare_parallelENS_4PrepE" : 0.04951675,
+               "_ZN12_GLOBAL__N_116recurrent_pairedENS_4CallE" : 0.6593845,
+               "_ZN12_GLOBAL__N_117gemm_split_reduceEPKfPtiiii" : 0.156830333333333,
+               "_ZN12_GLOBAL__N_117quantize_parallelENS_4CallE" : 0.0863635,
+               "_ZN12_GLOBAL__N_118gather_rows_kernelILi256EEEvPKvPKiPvjjjiil" : 0.00691333333333333,
+               "_ZN12_GLOBAL__N_118logits_joined_waveEPKtPK15RadPlanesHeaderPfilll" : 0.4061975,
+               "_ZN12_GLOBAL__N_119embed_lookup_kernelILi256EEEvPKiPKvPvjiiffjlii" : 0.00915,
+               "_ZN12_GLOBAL__N_119key_kernel_parallelEN12r3dh_qsa_key7KeyCallE" : 0.0768235833333333,
+               "_ZN12_GLOBAL__N_119r3d_ple_conv_kernelILb1EEEvPKtS2_PtPKiS2_S5_S5_S5_S3_jjjjjjjjxxxx" : 0.0103933333333333,
+               "_ZN12_GLOBAL__N_120attention_paged_fastILb1EEEvNS_9AttentionE" : 1.41562283333333,
+               "_ZN12_GLOBAL__N_121score_kernel_parallelILb1EEEvNS_9ScoreCallE" : 0.1244135,
+               "_ZN12_GLOBAL__N_122select_kernel_parallelENS_10SelectCallE" : 47.84947825,
+               "_ZN12_GLOBAL__N_129r3dh_ar_hc_write_2rank_kernelILb0EEEvP15HIP_vector_typeIiLj4EES3_PKS2_PjS6_S6_PKtPtiiillijNS_9GatherRowE" : 0.91302825,
+               "_ZN12_GLOBAL__N_129r3dh_ar_hc_write_2rank_kernelILb1EEEvP15HIP_vector_typeIiLj4EES3_PKS2_PjS6_S6_PKtPtiiillijNS_9GatherRowE" : 1.09025525,
+               "_ZN12_GLOBAL__N_131r3d_router_topk_scatter_onewaveEPKtPiPtS2_S2_S2_jiiN11r3d_scatter7ProtectE" : 0.460127416666667,
+               "_ZN12_GLOBAL__N_14tailENS_5StateE" : 0.08336025,
+               "_ZN12_GLOBAL__N_18down_runENS_4CallE" : 1.38812933333333,
+               "_ZN12_GLOBAL__N_18hc_fusedENS_9FusedArgsE" : 2.00846733333333,
+               "_ZN12_GLOBAL__N_18quantizeILb0EEEvPKtS2_PaPfPtilllll" : 0.63686475,
+               "_ZN12_GLOBAL__N_18quantizeILb1EEEvPKtPaPflll" : 0.00308,
+               "_ZN19r3dh_mtp_ple_detail13gate_parallelENS_8DataViewES0_S0_S0_S0_S0_S0_S0_lllllllfff" : 0.03895
+            },
+            "kernel_ms" : {
+               "attention" : 1.41562283333333,
+               "other" : 157.745387583333,
+               "qsa_score" : 0.1244135,
+               "qsa_select" : 47.84947825
+            },
+            "last_pass" : 28,
+            "passes" : 12,
+            "records" : 1121,
+            "span_ms" : 66.9859030833333
+         },
+         "ttft_s" : 102.3246280115
+      }
+   ],
+   "comparisons" : {
+      "1024->32768" : {
+         "gpu_kernel_ms_delta" : {
+            "attention" : 0.565059999999997,
+            "other" : 143.669537333333,
+            "qsa_score" : 0.1244135,
+            "qsa_select" : 47.84947825
+         },
+         "largest_positive_symbols" : [
+            {
+               "ms" : 95.8535404166667,
+               "symbol" : "_ZN12_GLOBAL__N_110split_gemvILi1ELi16384EEEvPKaPKfS2_S4_Ptiilll"
+            },
+            {
+               "ms" : 47.84947825,
+               "symbol" : "_ZN12_GLOBAL__N_122select_kernel_parallelENS_10SelectCallE"
+            },
+            {
+               "ms" : 47.7501513333333,
+               "symbol" : "_Z15iqr_wmma_ksplitILi10ELb1EEvPKaPKfPKhS3_Ptii"
+            },
+            {
+               "ms" : 0.565059999999997,
+               "symbol" : "_ZN12_GLOBAL__N_120attention_paged_fastILb1EEEvNS_9AttentionE"
+            },
+            {
+               "ms" : 0.1244135,
+               "symbol" : "_ZN12_GLOBAL__N_121score_kernel_parallelILb1EEEvNS_9ScoreCallE"
+            },
+            {
+               "ms" : 0.100785166666667,
+               "symbol" : "_ZN12_GLOBAL__N_129r3dh_ar_hc_write_2rank_kernelILb0EEEvP15HIP_vector_typeIiLj4EES3_PKS2_PjS6_S6_PKtPtiiillijNS_9GatherRowE"
+            },
+            {
+               "ms" : 0.04951675,
+               "symbol" : "_ZN12_GLOBAL__N_116prepare_parallelENS_4PrepE"
+            },
+            {
+               "ms" : 0.01083575,
+               "symbol" : "_ZN12_GLOBAL__N_113gate_up_splitENS_4CallEPK15HIP_vector_typeIiLj2EE"
+            }
+         ],
+         "wall_ms_token_delta" : 48.7995062419355
+      },
+      "2016->2064" : {
+         "gpu_kernel_ms_delta" : {
+            "attention" : 0.02942333333334,
+            "other" : 12.6093043333334,
+            "qsa_score" : 0.0722933333333333,
+            "qsa_select" : 4.34843658333333
+         },
+         "largest_positive_symbols" : [
+            {
+               "ms" : 8.6480605,
+               "symbol" : "_ZN12_GLOBAL__N_110split_gemvILi1ELi16384EEEvPKaPKfS2_S4_Ptiilll"
+            },
+            {
+               "ms" : 4.34843658333333,
+               "symbol" : "_ZN12_GLOBAL__N_122select_kernel_parallelENS_10SelectCallE"
+            },
+            {
+               "ms" : 4.13996058333334,
+               "symbol" : "_Z15iqr_wmma_ksplitILi10ELb1EEvPKaPKfPKhS3_Ptii"
+            },
+            {
+               "ms" : 0.0722933333333333,
+               "symbol" : "_ZN12_GLOBAL__N_121score_kernel_parallelILb1EEEvNS_9ScoreCallE"
+            },
+            {
+               "ms" : 0.0493465,
+               "symbol" : "_ZN12_GLOBAL__N_116prepare_parallelENS_4PrepE"
+            },
+            {
+               "ms" : 0.02942333333334,
+               "symbol" : "_ZN12_GLOBAL__N_120attention_paged_fastILb1EEEvNS_9AttentionE"
+            },
+            {
+               "ms" : 0.00778608333333297,
+               "symbol" : "_ZN12_GLOBAL__N_129r3dh_ar_hc_write_2rank_kernelILb0EEEvP15HIP_vector_typeIiLj4EES3_PKS2_PjS6_S6_PKtPtiiillijNS_9GatherRowE"
+            },
+            {
+               "ms" : 0.00769283333333304,
+               "symbol" : "_ZN12_GLOBAL__N_18quantizeILb0EEEvPKtS2_PaPfPtilllll"
+            }
+         ],
+         "wall_ms_token_delta" : 4.47578690322581
+      },
+      "2064->32768" : {
+         "gpu_kernel_ms_delta" : {
+            "attention" : -0.00200933333333997,
+            "other" : 131.049803416666,
+            "qsa_score" : 0.0521201666666667,
+            "qsa_select" : 43.5010416666667
+         },
+         "largest_positive_symbols" : [
+            {
+               "ms" : 87.239808,
+               "symbol" : "_ZN12_GLOBAL__N_110split_gemvILi1ELi16384EEEvPKaPKfS2_S4_Ptiilll"
+            },
+            {
+               "ms" : 43.6127710833333,
+               "symbol" : "_Z15iqr_wmma_ksplitILi10ELb1EEvPKaPKfPKhS3_Ptii"
+            },
+            {
+               "ms" : 43.5010416666667,
+               "symbol" : "_ZN12_GLOBAL__N_122select_kernel_parallelENS_10SelectCallE"
+            },
+            {
+               "ms" : 0.0968005833333337,
+               "symbol" : "_ZN12_GLOBAL__N_114protected_gemmENS_8GeometryEPKtlS2_lPKiS4_Ptl"
+            },
+            {
+               "ms" : 0.093362416666667,
+               "symbol" : "_ZN12_GLOBAL__N_129r3dh_ar_hc_write_2rank_kernelILb0EEEvP15HIP_vector_typeIiLj4EES3_PKS2_PjS6_S6_PKtPtiiillijNS_9GatherRowE"
+            },
+            {
+               "ms" : 0.0521201666666667,
+               "symbol" : "_ZN12_GLOBAL__N_121score_kernel_parallelILb1EEEvNS_9ScoreCallE"
+            },
+            {
+               "ms" : 0.0103317500000001,
+               "symbol" : "_ZN12_GLOBAL__N_116recurrent_pairedENS_4CallE"
+            },
+            {
+               "ms" : 0.00490699999999999,
+               "symbol" : "_ZN12_GLOBAL__N_111convolutionENS_4CallEb"
+            }
+         ],
+         "wall_ms_token_delta" : 43.7787840967742
+      }
+   }
+}
