@@ -179,6 +179,7 @@ void execute(Api& api, Fixture& fixture, int rows, int rank, bool full, int band
                          : matrix(joined.device(), r3d_w2::dtype, columns, reduction), output.device, sums.device, {}};
                 if (blob) { tensors[3].rank = 1; tensors[3].shape[0] = fixture.joined.size(); tensors[3].stride[0] = 1; }
                 RadArgs args{}; args.t = tensors; args.n_t = 7; args.p = fixture.params.data(); args.n_p = fixture.params.size();
+                if (full) { args.world_size = 2; args.rank = rank; }
                 REQUIRE_EQ(api.row->launch(&args, stream), RAD_OK); ++launches;
                 REQUIRE(expected != output.expected);
                 const auto actual = output.read(stream); equal(actual, expected, "strict coarse BF16 all outputs and guards");
@@ -254,9 +255,9 @@ void execute(Api& api, Fixture& fixture, int rows, int rank, bool full, int band
                     rank, rank * 124160, columns, reduction, rows, band, repeat); std::fflush(stdout);
     }
 }
-TEST(r3d_w2_head_actual_tp2_aql) {
-    if (!device_available()) SKIP("explicit gfx1100 card run required");
-    Api api; Model model("/home/zihaomu/bigssd2/radiance_workspace/models/qwen3.8-next-flash-iqr-v4.rad");
+template<class Check>
+void actual_tp2_shards(Api& api, Check check) {
+    Model model("/home/zihaomu/bigssd2/radiance_workspace/models/qwen3.8-next-flash-iqr-v4.rad");
     const RadFileEntry* head = nullptr;
     for (const auto& entry : model.directory) {
         const auto& encoding = model.encodings[entry.enc];
@@ -280,13 +281,151 @@ TEST(r3d_w2_head_actual_tp2_aql) {
             model.read(plane.offset + rank * destinations[index].second, destinations[index].first, destinations[index].second);
         }
         fixture.pack(api);
+        check(fixture, rank);
+    }
+}
+TEST(r3d_w2_head_actual_tp2_aql) {
+    if (!device_available()) SKIP("explicit gfx1100 card run required");
+    Api api;
+    actual_tp2_shards(api, [&](Fixture& fixture, int rank) {
         for (int rows : {1, 2, 3, 8}) execute(api, fixture, rows, rank, true);
         for (int rows : {1, 3, 8, 16, 31, 32}) execute(api, fixture, rows, rank, true, 32);
         api.row = named(api.native, "gemm_nt_q_w2a8_m16");
-    }
+    });
     std::printf("W2_ACTUAL_PASS launches=%llu producer=%llu libref_gemm=%llu values=%llu rejects=%llu R8=stable_global_offsets_0_124160 device_corruption=enqueue_ok_no_writes\n",
         (unsigned long long)launches, (unsigned long long)producer_calls, (unsigned long long)oracle_calls,
         (unsigned long long)values, (unsigned long long)rejects);
+}
+TEST(r3d_w2_head_tp2_exact_wave_differential_aql) {
+    if (!device_available()) SKIP("explicit gfx1100 card run required");
+    struct SavedEnv {
+        const char* key;
+        bool present;
+        std::string value;
+        explicit SavedEnv(const char* name) : key(name), present(std::getenv(name) != nullptr),
+            value(present ? std::getenv(name) : "") {}
+        ~SavedEnv() { if (present) setenv(key, value.c_str(), 1); else unsetenv(key); }
+    } flag("RAD_MTP_W2_EXACT"), precision("RAD_PRECISION");
+    constexpr int columns = 124160, reduction = 2560, groups = 20, out_pitch = columns + 17;
+    Api api; Queue queue(0);
+    auto* head = named(api.native, "gemm_nt_q_w2a8_head_strict");
+    actual_tp2_shards(api, [&](Fixture& fixture, int rank) {
+        const int sum_cols = rank ? 32 : 16, sum_stride = rank ? 32 : 19, live_pitch = rank ? 16 : 19;
+        Buffer activation(RAD_I8, {2, reduction}, RAD_MEM_DEVICE, reduction + 17);
+        Buffer scale(RAD_F32, {2, 1}, RAD_MEM_DEVICE, 3);
+        Buffer sums(RAD_F32, {groups, sum_cols}, RAD_MEM_DEVICE, sum_stride);
+        Buffer output(RAD_BF16, {2, columns}, RAD_MEM_DEVICE, out_pitch);
+        Storage codes(fixture.codes.size(), RAD_MEM_DEVICE), joined(fixture.joined.size(), RAD_MEM_DEVICE);
+        std::copy(fixture.codes.begin(), fixture.codes.end(), codes.expected.begin() + 64);
+        std::copy(fixture.joined.begin(), fixture.joined.end(), joined.expected.begin() + 64);
+        codes.push(queue.stream); joined.push(queue.stream);
+        auto* input = activation.data<int8_t>() + 1;
+        for (int row = 0; row < 2; ++row) {
+            scale.data<float>()[row * 3] = 0x1.031a7cp-4f;
+            for (int group = 0; group < groups; ++group) {
+                int sum = 0;
+                for (int inner = 0; inner < 128; ++inner) {
+                    const int position = group * 128 + inner;
+                    const int value = ((position * 73 + position / 7 + rank * 31 + row * 13) & 255) - 128;
+                    input[row * (reduction + 17) + step(position)] = int8_t(value); sum += value;
+                }
+                sums.data<float>()[group * live_pitch + row] = float(sum);
+            }
+        }
+        activation.push(queue.stream); sums.push(queue.stream); scale.push(queue.stream);
+        RadTensor tensors[]{activation.device, scale.device, matrix(codes.device(), RAD_U2, columns, reduction),
+            matrix(joined.device(), r3d_w2::dtype, columns, reduction), output.device, sums.device, {}};
+        tensors[0].data = static_cast<int8_t*>(tensors[0].data) + 1;
+        tensors[0].shape[0] = tensors[1].shape[0] = tensors[4].shape[0] = 1;
+        if (!rank) { tensors[3].rank = 1; tensors[3].shape[0] = fixture.joined.size(); tensors[3].stride[0] = 1; }
+        fixture.params[4].ival = 32;
+        RadArgs args{}; args.t = tensors; args.n_t = 7; args.p = fixture.params.data(); args.n_p = fixture.params.size();
+        args.world_size = 2; args.rank = rank;
+        auto run = [&](const char* setting, int status = RAD_OK) {
+            if (setting) setenv(flag.key, setting, 1); else unsetenv(flag.key);
+            output.push(queue.stream);
+            if (head->launch(&args, queue.stream) != status) throw std::runtime_error("W2 launch status mismatch");
+            return output.read(queue.stream);
+        };
+        setenv(precision.key, "exact", 1);
+        const auto strict = run("0");
+        auto guarded = output.expected;
+        std::copy_n(strict.begin() + 64, columns * 2, guarded.begin() + 64);
+        REQUIRE(guarded != output.expected); equal(strict, guarded, "strict real output guards and inactive row");
+        equal(run(nullptr), strict, "unset real shard");
+        equal(run("1"), strict, "exact real shard all BF16");
+        setenv(precision.key, "tolerance", 1); equal(run("1"), strict, "tolerance real shard all BF16");
+        setenv(precision.key, "exact", 1);
+        args.world_size = 1; args.rank = 0; equal(run("1"), strict, "TP1 fallback");
+        args.world_size = 2; args.rank = rank;
+        tensors[0].shape[0] = tensors[1].shape[0] = tensors[4].shape[0] = 2;
+        const auto two_rows = run("0"); REQUIRE(two_rows != strict); equal(run("1"), two_rows, "two live rows fallback");
+        if (rank) return;
+        tensors[0].shape[0] = tensors[1].shape[0] = tensors[4].shape[0] = 1;
+        std::fill_n(input, reduction, int8_t(0)); scale.data<float>()[0] = 1.0f;
+        for (int group = 0; group < groups; ++group) {
+            input[step(group * 128)] = group == 4 ? -1 : 1;
+            sums.data<float>()[group * live_pitch] = float(input[step(group * 128)]);
+        }
+        const auto* entries = reinterpret_cast<const RadPlanesEntry*>(fixture.joined.data() + sizeof(RadPlanesHeader));
+        auto* scales = joined.expected.data() + 64 + entries[0].offset;
+        auto* zeros = joined.expected.data() + 64 + entries[1].offset;
+        const int probes[]{0, 1, 2, 15, 16, columns - 1, 17, 31};
+        const uint16_t answers[]{0x3f80, 0x3f80, 0x3f81, 0x3f82, 0x3f80, 0x3f80};
+        for (int index = 0; index < 8; ++index) {
+            const int column = probes[index];
+            auto* packed = codes.expected.data() + 64 + size_t(column) * (reduction / 4);
+            std::fill_n(packed, reduction / 4, 0); std::fill_n(zeros + column * groups, groups, 0);
+            std::fill_n(scales + column * groups * 2, groups * 2, 0);
+            auto term = [&](int group, uint8_t code, uint8_t zero, float weight) {
+                packed[group * 32] = code; zeros[column * groups + group] = zero;
+                const uint16_t half = rad_f32_to_f16(weight);
+                std::memcpy(scales + (column * groups + group) * 2, &half, 2);
+            };
+            if (index < 4) {
+                term(0, 1, 0, 1.0f); term(1, index == 3 ? 3 : 1, 0, 0x1p-8f);
+                if (index == 1 || index == 2) term(19, index == 2, index == 1, 0x1p-14f);
+            } else if (index < 6) {
+                term(0, 0, 255, 32768.0f); term(1, 1, 0, 0.125f);
+                term(4, 0, 255, 32768.0f); term(19, 1, 0, 1.0f);
+            } else {
+                term(0, index == 6 ? 1 : 3, 0, 1.5f); term(4, 1, 0, index == 6 ? 1.5f : 4.5f);
+            }
+        }
+        activation.push(queue.stream); scale.push(queue.stream); sums.push(queue.stream);
+        codes.push(queue.stream); joined.push(queue.stream);
+        const auto boundary = run("0"); equal(run("1"), boundary, "midpoint and cancellation differential");
+        for (int index = 0; index < 6; ++index) {
+            uint16_t actual; std::memcpy(&actual, boundary.data() + 64 + probes[index] * 2, 2);
+            REQUIRE_EQ(actual, answers[index]);
+        }
+        scale.data<float>()[0] = 0x1.000002p0f; scale.push(queue.stream);
+        const auto ordered = run("0"); equal(run("1"), ordered, "separate FP32 multiplies and ascending adds");
+        const uint16_t ordered_answers[]{0x0000, 0x3500};
+        for (int index = 0; index < 2; ++index) {
+            uint16_t actual; std::memcpy(&actual, ordered.data() + 64 + probes[6 + index] * 2, 2);
+            REQUIRE_EQ(actual, ordered_answers[index]);
+        }
+        auto& last = sums.data<float>()[(groups - 1) * live_pitch];
+        for (const float endpoint : {-16384.0f, 16384.0f}) {
+            last = endpoint; sums.push(queue.stream);
+            const auto valid = run("0"); REQUIRE(valid != output.expected); equal(run("1"), valid, "inclusive sum limit");
+        }
+        for (const float bad : {-16385.0f, 16385.0f, 0.5f, std::numeric_limits<float>::infinity(),
+                                std::numeric_limits<float>::quiet_NaN()}) {
+            last = bad; sums.push(queue.stream);
+            for (const char* setting : {"0", "1"}) equal(run(setting), output.expected, "invalid last sum no writes");
+        }
+        last = 1; sums.push(queue.stream);
+        reinterpret_cast<RadPlanesHeader*>(joined.expected.data() + 64)->magic = 0;
+        joined.push(queue.stream);
+        for (const char* setting : {"0", "1"}) equal(run(setting), output.expected, "invalid device header no writes");
+        Storage mapped(sizeof(RadPlanesHeader), RAD_MEM_HOST_MAPPED);
+        std::fill_n(mapped.expected.begin() + 64, sizeof(RadPlanesHeader), 0); mapped.push(queue.stream);
+        REQUIRE_EQ(rad_stream_sync(queue.stream), RAD_OK);
+        tensors[3] = matrix(mapped.device(), RAD_F16, columns, reduction);
+        for (const char* setting : {"0", "1"}) equal(run(setting, RAD_E_FORMAT), output.expected, "invalid mapped header");
+    });
 }
 TEST(r3d_w2_head_synthetic_aql) {
     if (!device_available()) SKIP("explicit gfx1100 card run required");

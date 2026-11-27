@@ -82,6 +82,7 @@
  */
 
 #include <hip/hip_runtime.h>
+#include <cstdlib>
 
 #include "r3d_common.h"
 #include "r3d_codecs.h"
@@ -103,7 +104,7 @@ constexpr int kMpad         = 16;                      /* the reference's (M+15)
 /* Column c sits at byte step_pos(c): bits 2 and 3 of c swapped, a self-inverse map. On the dword
  * index it is a swap of bits 0 and 1 (the middle two dwords of a 16-byte step exchanged), so
  * dword d starts at byte dword_pos(d). Not 4 * step_pos(d), which swaps the wrong pair of bits. */
-[[maybe_unused]] __device__ __forceinline__ int64_t step_pos(int64_t c)
+__device__ __forceinline__ int64_t step_pos(int64_t c)
 {
     return (c & ~(int64_t)12) | ((c & 4) << 1) | ((c & 8) >> 1);
 }
@@ -394,6 +395,81 @@ __global__ void w2_head_strict(const int8_t* activation, const float* activation
     output[int64_t(row) * output_pitch + column] = f32_to_bf16(accumulated);
 }
 
+#ifdef R3D_BUILD_TARGET
+constexpr int kW2ExactColumns = 124160;
+constexpr int kW2ExactGroups = 20;
+constexpr int kW2ExactWaves = 4;
+constexpr int kW2ExactTile = 4 * kW2ExactWaves;
+static_assert(kWave == 32 && kW2ExactColumns % kW2ExactTile == 0);
+
+__global__ void __launch_bounds__(kWave * kW2ExactWaves)
+w2_head_tp2_exact_wave(const int8_t* activation, const float* activation_scale,
+                       const uint32_t* codes, const RadPlanesHeader* joined, const float* sums,
+                       uint16_t* output, int64_t sums_pitch, int64_t available) {
+    constexpr int packs = kW2ExactGroups * kGroup / 16;
+    __shared__ uint32_t inputs[4][packs];
+    __shared__ int32_t group_sums[kW2ExactGroups];
+    __shared__ int valid;
+    const int thread = int(threadIdx.x), lane = thread % kWave, wave = thread / kWave;
+    if (wave == 0) {
+        bool bad = false;
+        if (lane < kW2ExactGroups) {
+            const float sum = sums[int64_t(lane) * sums_pitch];
+            bad = !isfinite(sum) || sum < -16384.0f || sum > 16384.0f || float(int32_t(sum)) != sum;
+            if (!bad) group_sums[lane] = int32_t(sum);
+        }
+        const auto bad_lanes = __ballot(bad);
+        if (lane == 0) valid = !bad_lanes &&
+            r3d_w2::header(joined, kW2ExactColumns, kW2ExactGroups * kGroup, available) == RAD_OK;
+    }
+    for (int index = thread; index < 4 * packs; index += kWave * kW2ExactWaves) {
+        const int pack = index % packs, field = index / packs;
+        uint32_t word = 0;
+#pragma unroll
+        for (int byte = 0; byte < 4; ++byte)
+            word |= uint32_t(uint8_t(activation[step_pos(16 * pack + 4 * byte + field)])) << (8 * byte);
+        inputs[field][pack] = word;
+    }
+    __syncthreads();
+    if (!valid) return;
+    const auto* entries = reinterpret_cast<const RadPlanesEntry*>(joined + 1);
+    const auto* base = reinterpret_cast<const uint8_t*>(joined);
+    const auto* scales = reinterpret_cast<const uint16_t*>(base + entries[0].offset);
+    const auto* zeros = base + entries[1].offset;
+    const float row_scale = activation_scale[0];
+    for (int offset = wave; offset < kW2ExactTile; offset += kW2ExactWaves) {
+        const int column = int(blockIdx.x) * kW2ExactTile + offset;
+        float accumulated = 0.0f;
+        for (int first = 0; first < kW2ExactGroups; first += 4) {
+            const int pack = first * 8 + lane, group = first + lane / 8;
+            const uint32_t packed = codes[column * packs + pack];
+            int32_t dot = 0;
+#pragma unroll
+            for (int field = 0; field < 4; ++field) {
+                const uint32_t weights = (packed >> (2 * field)) & 0x03030303u;
+                const uint32_t input = inputs[field][pack];
+#if defined(__gfx1100__) && __has_builtin(__builtin_amdgcn_sudot4)
+                dot = __builtin_amdgcn_sudot4(false, int(weights), true, int(input), dot, false);
+#else
+#pragma unroll
+                for (int byte = 0; byte < 4; ++byte)
+                    dot += int32_t(int8_t(input >> (8 * byte))) * int32_t((weights >> (8 * byte)) & 3u);
+#endif
+            }
+#pragma unroll
+            for (int distance = 1; distance < 8; distance *= 2) dot += __shfl_xor(dot, distance, 8);
+            const int plane_index = column * kW2ExactGroups + group;
+            const int32_t corrected = dot - int32_t(zeros[plane_index]) * group_sums[group];
+            const float term = __fmul_rn(__fmul_rn(float(corrected), row_scale), f16_to_f32(scales[plane_index]));
+#pragma unroll
+            for (int slot = 0; slot < 4; ++slot)
+                accumulated = __fadd_rn(accumulated, __shfl(term, 8 * slot, kWave));
+        }
+        if (lane == 0) output[column] = f32_to_bf16(accumulated);
+    }
+}
+#endif
+
 int w2_strict_run(const RadArgs* args, RadStream stream) {
     if (!args || !args->t || args->n_t < 6 || args->n_t > 7) return RAD_E_INVAL;
     if (!r3d_gets(args, "dtype") || std::strcmp(r3d_gets(args, "dtype"), "w2a8")) return RAD_E_DTYPE;
@@ -454,6 +530,19 @@ int w2_strict_run(const RadArgs* args, RadStream stream) {
                                          columns, reduction, available);
         if (status != RAD_OK) return status;
     }
+#ifdef R3D_BUILD_TARGET
+    if (model_head && rows == 1 && args->world_size == 2 && !std::strcmp(R3D_BUILD_TARGET, "gfx1100")) {
+        const char* flag = std::getenv("RAD_MTP_W2_EXACT");
+        if (flag && !std::strcmp(flag, "1")) {
+            R3D_KLAUNCH(R3D_KNAME(w2_head_tp2_exact_wave), dim3(kW2ExactColumns / kW2ExactTile),
+                        dim3(kWave * kW2ExactWaves), reinterpret_cast<hipStream_t>(stream),
+                        static_cast<const int8_t*>(activation.data), static_cast<const float*>(scale.data),
+                        static_cast<const uint32_t*>(codes.data), static_cast<const RadPlanesHeader*>(joined.data),
+                        static_cast<const float*>(sums.data), static_cast<uint16_t*>(output.data), sums_pitch, available);
+            return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+        }
+    }
+#endif
     R3D_KLAUNCH(R3D_KNAME(w2_head_strict), dim3((columns + 127) / 128, rows), dim3(128),
                 reinterpret_cast<hipStream_t>(stream), static_cast<const int8_t*>(activation.data),
                 static_cast<const float*>(scale.data), static_cast<const uint8_t*>(codes.data),

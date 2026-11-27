@@ -277,12 +277,9 @@ void exercise(Api& api, Fixture& fixture, int offset, bool edge, Counts& counts,
         counts.bytes += weight.expected.size();
     }
 }
-}
 
-TEST(r3d_rerank_actual_tp2_aql) {
-    using namespace rerank_aql;
-    if (!device_available()) SKIP("explicit gfx1100 card run required");
-    Api api; Counts counts;
+template<class Visit>
+void actual_tp2_shards(Api& api, Visit visit) {
     Model model("/home/zihaomu/bigssd2/radiance_workspace/models/qwen3.8-next-flash-iqr-v4.rad");
     REQUIRE_EQ(model.header.file_bytes, 121678372864ull);
     bool found = false;
@@ -308,18 +305,167 @@ TEST(r3d_rerank_actual_tp2_aql) {
                 model.read(location.offset + uint64_t(rank) * destination.size(), destination.data(), destination.size());
             }
             fixture.pack(api);
-            exercise(api, fixture, rank * 124160, false, counts);
-            std::printf("RERANK_ACTUAL_SHARD_PASS rank=%d vocab_offset=%d calls=%llu\n", rank, rank * 124160, (unsigned long long)counts.calls);
-            exercise(api, fixture, rank * 124160, false, counts, 32);
-            std::printf("RERANK_CAPACITY rank=%d band=32 live=1,3,8,16,31,32 exhaustive_scores=1 pairs=2D,3D inplace=0,1 memory=DEVICE,VMEM\n", rank);
+            visit(fixture, rank);
         }
     }
     REQUIRE(found);
+}
+}
+
+TEST(r3d_rerank_actual_tp2_aql) {
+    using namespace rerank_aql;
+    if (!device_available()) SKIP("explicit gfx1100 card run required");
+    Api api; Counts counts;
+    actual_tp2_shards(api, [&](Fixture& fixture, int rank) {
+        exercise(api, fixture, rank * 124160, false, counts);
+        std::printf("RERANK_ACTUAL_SHARD_PASS rank=%d vocab_offset=%d calls=%llu\n", rank, rank * 124160, (unsigned long long)counts.calls);
+        exercise(api, fixture, rank * 124160, false, counts, 32);
+        std::printf("RERANK_CAPACITY rank=%d band=32 live=1,3,8,16,31,32 exhaustive_scores=1 pairs=2D,3D inplace=0,1 memory=DEVICE,VMEM\n", rank);
+    });
     std::printf("RERANK_EXTRA_GUARDS device_header_no_write=%llu strict_head_score_witnesses=%llu\n",
         (unsigned long long)counts.no_write, (unsigned long long)counts.head_witnesses);
     std::printf("RERANK_ACTUAL_TP2_PASS calls=%llu libref=%llu candidate_scores=%llu rejects=%llu bytes=%llu scratch=0 queues=2\n",
         (unsigned long long)counts.calls, (unsigned long long)counts.references, (unsigned long long)counts.scored,
         (unsigned long long)counts.rejected, (unsigned long long)counts.bytes);
+}
+
+TEST(r3d_mtp_rerank_exact_tp2_aql) {
+    using namespace rerank_aql;
+    if (!device_available()) SKIP("explicit gfx1100 card run required");
+    struct Switch {
+        const char* key = "RAD_MTP_RERANK_EXACT";
+        bool present = std::getenv(key) != nullptr;
+        std::string saved = present ? std::getenv(key) : "";
+        void set(const char* value) { REQUIRE_EQ(value ? setenv(key, value, 1) : unsetenv(key), 0); }
+        ~Switch() { if (present) setenv(key, saved.c_str(), 1); else unsetenv(key); }
+    } option;
+    enum Sample { dense, ties, mixed_ids, all_invalid, infinities, mixed_nan, bad_header };
+    constexpr int vocab = 124160, width = 2560;
+    Api api; Counts counts; Queue queue(0);
+    const auto* native = api.native.ngram("logit_rerank");
+    REQUIRE_EQ(std::strcmp(native->name, "r3d_logit_rerank_joined_strict"), 0);
+    const auto info = reinterpret_cast<const RadPluginInfo* (*)()>(dlsym(api.native.handle, "rad_plugin_info"));
+    REQUIRE(info && info() && info()->build_target);
+    const bool pure_gfx1100 = !std::strcmp(info()->build_target, "gfx1100");
+    const auto* backend = rad::active_backend();
+    REQUIRE(backend && backend->tape_begin && backend->tape_end && backend->tape_len && backend->tape_diff && backend->tape_destroy);
+    struct Tape {
+        const rad::DeviceBackend* backend;
+        rad::RadTape value = nullptr;
+        ~Tape() { if (value) backend->tape_destroy(value); }
+    };
+    int shards = 0;
+    actual_tp2_shards(api, [&](Fixture& fixture, int rank) {
+        const int offset = rank * vocab;
+        auto params = parameters(offset);
+        Storage weight(fixture.joined.size(), RAD_MEM_DEVICE);
+        std::copy(fixture.joined.begin(), fixture.joined.end(), weight.expected.begin() + 64);
+        weight.push(queue.stream);
+        int sign_rows[2]{-1, -1};
+        for (int local = 0; local < vocab && (sign_rows[0] < 0 || sign_rows[1] < 0); ++local) {
+            const float first = multiply(decode(fixture.codes[size_t(local) * width], RAD_I8), fixture.factor(local, 0));
+            if (std::isfinite(first) && first != 0) sign_rows[first < 0] = local;
+        }
+        REQUIRE(sign_rows[0] >= 0 && sign_rows[1] >= 0);
+        auto compare = [&](Sample sample, int rows, bool inplace, int pair_rank, int world, int launch_rank, const char* flag) {
+            Buffer activation(RAD_BF16, {rows, width}, RAD_MEM_DEVICE, width + 16);
+            Buffer input(RAD_I32, {rows, 8}, RAD_MEM_DEVICE, 12), output(RAD_I32, {rows, 8}, RAD_MEM_DEVICE, 12);
+            Buffer values(RAD_F32, {rows, 8}, RAD_MEM_DEVICE, 16), pairs(RAD_F32, {rows, 16}, RAD_MEM_DEVICE, 20);
+            std::array<Buffer*, 5> buffers{&activation, &input, &output, &values, &pairs};
+            const int local_ids[8]{3, vocab - 1, 0, 17, 3, 73381, 2, 4};
+            const int32_t invalid[4]{INT32_MIN, offset - 1, offset + vocab, INT32_MAX};
+            for (int row = 0; row < rows; ++row) {
+                for (int pos = 0; pos < width; ++pos) {
+                    uint16_t bits = rad_f32_to_bf16(float((pos * 71 + row * 37 + 19) % 521 - 260) / 257.0f);
+                    if (sample == ties) bits = pos & 1 ? 0x8000 : 0;
+                    if (sample == infinities) bits = pos == 0 ? 0x7f80 : 0;
+                    activation.data<uint16_t>()[row * (width + 16) + pos] = bits;
+                }
+                for (int slot = 0; slot < 8; ++slot) {
+                    int32_t id = offset + local_ids[(row + slot) % 8];
+                    if (sample == infinities) id = offset + sign_rows[slot % 2];
+                    if (sample == all_invalid || (sample == mixed_ids && slot % 2)) id = invalid[slot / 2];
+                    input.data<int32_t>()[row * 12 + slot] = id;
+                }
+            }
+            RadTensor host[]{activation.host, matrix(fixture.joined.data(), r3d_head::dtype, vocab, width), input.host,
+                inplace ? input.host : output.host, values.host, pairs.host};
+            RadTensor device[]{activation.device, matrix(weight.device(), r3d_head::dtype, vocab, width), input.device,
+                inplace ? input.device : output.device, values.device, pairs.device};
+            if (!inplace) { device[1].rank = 1; device[1].shape[0] = fixture.joined.size(); device[1].stride[0] = 1; }
+            if (pair_rank <= 0) { host[5].data = nullptr; device[5].data = nullptr; }
+            if (pair_rank == 3) {
+                device[5].rank = 3; device[5].shape[1] = 8; device[5].shape[2] = 2;
+                device[5].stride[1] = 2; device[5].stride[2] = 1;
+            }
+            RadArgs args{}; args.t = device; args.n_t = pair_rank == 0 ? 5 : 6;
+            args.p = params.data(); args.n_p = int(params.size()); args.world_size = world; args.rank = launch_rank;
+            using Outputs = std::array<std::vector<uint8_t>, 5>;
+            auto run = [&](const char* setting, Tape& tape, Outputs& result) {
+                option.set(setting);
+                for (auto* buffer : buffers) buffer->push(queue.stream);
+                REQUIRE_EQ(rad_stream_sync(queue.stream), RAD_OK);
+                REQUIRE_EQ(backend->tape_begin(), RAD_OK);
+                const int status = native->launch(&args, queue.stream);
+                tape.value = backend->tape_end(status == RAD_OK);
+                REQUIRE_EQ(status, RAD_OK); REQUIRE(tape.value); REQUIRE_EQ(backend->tape_len(tape.value), 1);
+                for (size_t index = 0; index < buffers.size(); ++index) result[index] = buffers[index]->read(queue.stream);
+            };
+            Tape strict_tape{backend}, candidate_tape{backend};
+            Outputs strict, candidate;
+            run("0", strict_tape, strict); run(flag, candidate_tape, candidate);
+            REQUIRE(strict_tape.value && candidate_tape.value);
+            const bool routed = pure_gfx1100 && rows == 1 && world == 2 && launch_rank == rank && flag && !std::strcmp(flag, "1");
+            char reason[256]{};
+            REQUIRE_EQ(backend->tape_diff(strict_tape.value, candidate_tape.value, reason, sizeof(reason)), routed ? 0 : -1);
+            if (sample != bad_header) oracle(fixture, host, rows, offset, counts);
+            if (sample == mixed_nan) {
+                REQUIRE(std::isnan(values.data<float>()[0]));
+                REQUIRE_EQ(std::count_if(values.data<float>(), values.data<float>() + 8, [](float value) { return std::isnan(value); }), 2);
+            }
+            if (sample == infinities) {
+                REQUIRE_EQ(std::count(values.data<float>(), values.data<float>() + 8, INFINITY), 4);
+                REQUIRE_EQ(std::count(values.data<float>(), values.data<float>() + 8, -INFINITY), 4);
+            }
+            for (size_t index = 0; index < buffers.size(); ++index) {
+                equal(strict[index], candidate[index], "exact-vs-strict");
+                equal(buffers[index]->expected, candidate[index], "exact-vs-oracle-and-guards");
+            }
+        };
+        compare(dense, 1, false, 2, 2, rank, "1");
+        compare(ties, 1, true, 3, 2, rank, "1");
+        compare(mixed_ids, 1, true, 0, 2, rank, "1");
+        compare(all_invalid, 1, false, -1, 2, rank, "1");
+        compare(infinities, 1, true, 2, 2, rank, "1");
+        compare(dense, 2, true, 3, 2, rank, "1");
+        compare(dense, 1, false, 2, 1, 0, "1");
+        compare(dense, 1, false, 2, 2, 1 - rank, "1");
+        for (int invalid_rank : {-1, 2}) compare(dense, 1, true, 2, 2, invalid_rank, "1");
+        compare(dense, 1, true, 2, 2, rank, nullptr);
+        compare(dense, 1, true, 2, 2, rank, "01");
+
+        auto* header = reinterpret_cast<RadPlanesHeader*>(weight.expected.data() + 64);
+        auto& scale = reinterpret_cast<RadPlanesEntry*>(header + 1)[1];
+        auto upload_header = [&] {
+            REQUIRE_EQ(rad_memcpy_async(weight.device(), header, sizeof(*header) + 2 * sizeof(scale), queue.stream), RAD_OK);
+        };
+        scale.block[1] = fixture.encoding.plane[1].block[1] = 129;
+        upload_header();
+        compare(dense, 1, true, 2, 2, rank, "1");
+        scale.block[1] = fixture.encoding.plane[1].block[1] = 128;
+        upload_header();
+        const size_t scale_byte = (3 * (width / 128) + width / 128 - 1) * sizeof(uint16_t);
+        const uint16_t quiet_nan = 0x7fc5;
+        std::memcpy(fixture.scale.data() + scale_byte, &quiet_nan, sizeof(quiet_nan));
+        REQUIRE_EQ(rad_memcpy_async(static_cast<uint8_t*>(weight.device()) + scale.offset + scale_byte,
+            fixture.scale.data() + scale_byte, sizeof(quiet_nan), queue.stream), RAD_OK);
+        compare(mixed_nan, 1, true, 3, 2, rank, "1");
+        header->magic = 0;
+        upload_header();
+        compare(bad_header, 1, false, 2, 2, rank, "1");
+        ++shards;
+    });
+    REQUIRE_EQ(shards, 2);
 }
 
 TEST(r3d_rerank_nonfinite_aql) {

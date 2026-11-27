@@ -485,6 +485,179 @@ void chain(Model& model, Library& library, int layer, int rank, RadStream stream
 }
 }
 
+TEST(r3d_mtp_moe_four_exact_tp2_aql) {
+    using namespace moe_boundary;
+    RadDeviceProps props{}; REQUIRE_EQ(rad_dev_props(0, &props), RAD_OK);
+    if (props.is_host_backend) {
+        REQUIRE(!std::getenv("RAD_R3D_REQUIRE_DEVICE"));
+        SKIP("explicit gfx1100 card run required");
+    }
+    REQUIRE_EQ(std::strcmp(props.arch, "gfx1100"), 0); REQUIRE_EQ(rad_dev_set(0), RAD_OK);
+    Library library("libr3d"); Queue queue(0);
+    const auto info = reinterpret_cast<const RadPluginInfo* (*)()>(dlsym(library.handle, "rad_plugin_info"));
+    REQUIRE(info && info() && info()->build_target);
+    const bool single_target = !std::strcmp(info()->build_target, "gfx1100");
+    const auto* backend = rad::active_backend();
+    REQUIRE(backend && backend->tape_begin && backend->tape_end && backend->tape_len && backend->tape_diff && backend->tape_destroy);
+    struct Tape {
+        const rad::DeviceBackend* backend;
+        rad::RadTape value = nullptr;
+        ~Tape() { if (value) backend->tape_destroy(value); }
+    };
+    struct SavedFlag {
+        const char* name;
+        bool present = std::getenv(name) != nullptr;
+        std::string saved = present ? std::getenv(name) : "";
+        ~SavedFlag() { if (present) setenv(name, saved.c_str(), 1); else unsetenv(name); }
+    } four{"RAD_MTP_MOE_FOUR"}, dot4{"RAD_IQR_DOT4"}, window{"RAD_IQR_DOT4_WINDOW"},
+        prefetch{"RAD_IQR_PREFETCH"}, split{"RAD_IQR_SPLIT"};
+    for (const char* name : {dot4.name, window.name, split.name}) REQUIRE_EQ(setenv(name, "1", 1), 0);
+    REQUIRE_EQ(setenv(prefetch.name, "0", 1), 0);
+    enum class Routes { spread, hot, dropped };
+    for (int rank : {0, 1}) {
+        const int widths[]{rank ? 512 : 768, rank ? 768 : 512};
+        std::array<std::unique_ptr<Table>, 4> tables;
+        for (int parity : {0, 1}) {
+            const int width = widths[parity];
+            const r3dh_moe_iqr::Header header{r3dh_moe_iqr::magic, 1, uint32_t(width), 2560,
+                0x963a5du + parity * 6u, 0xad7351c3u, 128, 4};
+            std::vector<uint8_t> weight(sizeof(header) + width * 1280);
+            std::memcpy(weight.data(), &header, sizeof(header));
+            uint32_t state = 17u + parity;
+            for (size_t index = sizeof(header); index < weight.size(); ++index) {
+                state = state * 1664525u + 1013904223u; weight[index] = uint8_t(state >> 24);
+            }
+            std::vector<float> factors(2 * (width + 20));
+            for (int index = 0; index < width + 20; ++index) {
+                factors[index] = std::ldexp(1.0f, -(index % 7));
+                factors[width + 20 + index] = index < width ? -factors[index] : factors[index];
+            }
+            std::vector<uint8_t> scales(factors.size() * sizeof(float));
+            std::memcpy(scales.data(), factors.data(), scales.size());
+            tables[2 * parity] = std::make_unique<Table>(weight, 256, queue.stream);
+            auto& table = tables[2 * parity + 1];
+            table = std::make_unique<Table>(scales, 256, queue.stream);
+            REQUIRE_EQ(rad_stream_sync(queue.stream), RAD_OK);
+            for (int entry = 1; entry < 256; entry += 2) table->pointers.data<uint64_t>()[entry] += (width + 20) * sizeof(float);
+            table->pointers.push(queue.stream);
+        }
+        auto trial = [&](int tokens, int experts, int pitch, Routes routes, bool mapped) {
+            const int rows = tokens * 10, out_pitch = 781;
+            const std::string prefix = experts == 512 ? "model_moe_iqr_" : "mixed_iqr_" + std::to_string(experts) + "_";
+            const auto* gate = registered(library, prefix + (rank ? "512_768_strict" : "768_512_strict"));
+            Buffer input(RAD_I8, {tokens + 1, 2560}, RAD_MEM_DEVICE, pitch), scale(RAD_F32, {tokens + 1, 20}, RAD_MEM_DEVICE, 25);
+            Buffer sorted(RAD_I32, {rows}, RAD_MEM_DEVICE), offsets(RAD_I32, {experts + 1}, RAD_MEM_DEVICE);
+            Buffer output(RAD_BF16, {rows + 2, 768}, RAD_MEM_DEVICE, out_pitch);
+            std::vector<std::vector<int>> buckets(experts + 1);
+            for (int token = 0; token < tokens; ++token) {
+                for (int pos = 0; pos < 2560; ++pos) input.data<int8_t>()[token * pitch + pos] = int((pos * (19 + token * 2) + token * 37) % 256) - 128;
+                for (int group = 0; group < 20; ++group) scale.data<float>()[token * 25 + group] = std::ldexp(float(token + 1), -5 - group % 4);
+                for (int choice = 0; choice < 10; ++choice) {
+                    const int slot = token * 10 + choice;
+                    int expert = 32 + slot;
+                    if (choice == 9 || routes == Routes::dropped) expert = experts;
+                    else if (choice == 0 || (routes == Routes::hot && choice < 3)) expert = 4;
+                    else if (choice == 1) expert = 15 + token % 2;
+                    else if (choice == 2 && token < 3) expert = experts - 1;
+                    buckets[expert].push_back(slot == 6 ? -1 : slot == 17 ? rows : slot);
+                }
+            }
+            std::vector<int> owners;
+            for (int expert = 0; expert <= experts; ++expert) {
+                offsets.data<int32_t>()[expert] = int(owners.size());
+                for (int slot : buckets[expert]) { sorted.data<int32_t>()[owners.size()] = slot; owners.push_back(expert); }
+            }
+            REQUIRE_EQ(int(owners.size()), rows);
+            for (Buffer* buffer : {&input, &scale, &sorted, &offsets}) buffer->push(queue.stream);
+            RadParam params[]{RAD_INT("M", 64), RAD_INT("N", widths[0]), RAD_INT("N_odd", widths[1]), RAD_INT("K", 2560),
+                RAD_INT("n_expert", experts), RAD_INT("top_k", 10), RAD_STR("dtype", "i8a8h"), RAD_STR("a_order", "token")};
+            RadTensor tensors[]{live(input, tokens), live(scale, tokens), {}, {}, sorted.device, offsets.device, {}, {}, live(output, rows)};
+            for (int parity : {0, 1}) {
+                tensors[2 + parity * 4] = tables[parity * 2]->view(r3dh_moe_iqr::weight_dtype, widths[parity], 2560);
+                tensors[3 + parity * 4] = tables[parity * 2 + 1]->view(r3dh_moe_iqr::scale_dtype, widths[parity], 20);
+                tensors[2 + parity * 4].shape[0] = tensors[3 + parity * 4].shape[0] = experts / 2;
+            }
+            RadArgs args{}; args.t = tensors; args.n_t = 9; args.p = params; args.n_p = sizeof(params) / sizeof(params[0]);
+            args.rank = rank; args.world_size = 2;
+            REQUIRE(gate->scratch); const int64_t bytes = gate->scratch(&args); REQUIRE(bytes > 0 && bytes % 4 == 0);
+            Buffer scratch(RAD_I32, {bytes / 4}, RAD_MEM_DEVICE); scratch.push(queue.stream);
+            if (mapped) { args.scratch = scratch.device.data; args.scratch_bytes = bytes; }
+            Tape reference{backend}; auto golden = output.expected;
+            const char* settings[]{nullptr, "01", "1"};
+            for (const char* setting : settings) {
+                REQUIRE_EQ(setting ? setenv(four.name, setting, 1) : unsetenv(four.name), 0);
+                output.push(queue.stream); REQUIRE_EQ(rad_stream_sync(queue.stream), RAD_OK);
+                REQUIRE_EQ(backend->tape_begin(), RAD_OK);
+                const int status = gate->launch(&args, queue.stream);
+                Tape actual{backend, backend->tape_end(status == RAD_OK)};
+                REQUIRE_EQ(status, RAD_OK); REQUIRE(actual.value); REQUIRE_EQ(backend->tape_len(actual.value), mapped ? 2 : 1);
+                const auto got = output.read(queue.stream);
+                if (!setting) {
+                    std::swap(reference.value, actual.value);
+                    for (int row = 0; row < rows; ++row) {
+                        const int expert = owners[row], slot = sorted.data<int32_t>()[row], parity = expert & 1, width = widths[parity];
+                        for (int col = 0; col < 768; ++col) {
+                            const size_t offset = 64 + size_t(row * out_pitch + col) * 2;
+                            uint16_t bits = 0;
+                            if (expert < experts && slot >= 0 && slot < rows && col % 384 < width / 2) {
+                                std::memcpy(&bits, got.data() + offset, 2);
+                                if (col % 128 == 0 || col % 128 == 127) {
+                                    const int weight_row = (col / 384) * (width / 2) + col % 384, token = slot / 10;
+                                    auto* blob = tables[2 * parity]->blob.data<uint8_t>(); r3dh_moe_iqr::Header header;
+                                    std::memcpy(&header, blob, sizeof(header));
+                                    auto* factors = tables[2 * parity + 1]->blob.data<float>() + ((expert / 2) & 1) * (width + 20);
+                                    float sum = 0;
+                                    for (int group = 0; group < 20; ++group) {
+                                        int dot = 0;
+                                        for (int pos = group * 128; pos < (group + 1) * 128; ++pos) {
+                                            const auto state = r3dh_moe_iqr::state(blob + sizeof(header), 2560, weight_row, pos);
+                                            dot += int(input.data<int8_t>()[token * pitch + pos]) * r3dh_moe_iqr::mad(state, header.multiplier, header.increment);
+                                        }
+                                        const float scaled = float(dot) * scale.data<float>()[token * 25 + group];
+                                        sum = sum + scaled * factors[width + group];
+                                    }
+                                    REQUIRE_EQ(bits, pack(sum * factors[weight_row]));
+                                }
+                            }
+                            std::memcpy(golden.data() + offset, &bits, 2);
+                            output.expected[offset] = ~golden[offset]; output.expected[offset + 1] = ~golden[offset + 1];
+                        }
+                    }
+                } else {
+                    const bool changed = single_target && mapped && tokens == 4 && pitch % 16 == 0 && !std::strcmp(setting, "1");
+                    char why[1024]{};
+                    const int diff = backend->tape_diff(reference.value, actual.value, why, sizeof(why));
+                    if (changed || diff != -1) std::printf("MOE_FOUR rank=%d experts=%d tokens=%d flag=%s diff=%d %s\n", rank, experts, tokens, setting, diff, why);
+                    REQUIRE_EQ(diff, changed ? 1 : -1);
+                    if (changed) REQUIRE(std::strstr(why, "grid 1536x42x1 against 3072x42x1"));
+                }
+                REQUIRE(got == golden);
+            }
+            if (mapped) {
+                auto* map = scratch.data<int32_t>();
+                int task = 0;
+                for (int expert = 0; expert <= experts; ++expert) if (!buckets[expert].empty()) {
+                    map[2 * task] = expert == experts ? -1 : expert;
+                    map[2 * task + 1] = offsets.data<int32_t>()[expert]; ++task;
+                }
+                for (; task < rows + 2; ++task) { map[2 * task] = -2; map[2 * task + 1] = 0; }
+            }
+            REQUIRE(scratch.read(queue.stream) == scratch.expected);
+            for (Buffer* buffer : {&input, &scale, &sorted, &offsets}) REQUIRE(buffer->read(queue.stream) == buffer->expected);
+        };
+        trial(4, 512, 2560, Routes::spread, true);
+        trial(4, 510, 2576, Routes::hot, true);
+        trial(4, 508, 2560, Routes::dropped, true);
+        for (int tokens : {1, 2, 3, 5}) trial(tokens, 512, 2560, Routes::spread, true);
+        trial(4, 512, 2573, Routes::spread, true);
+        trial(4, 510, 2560, Routes::spread, false);
+        for (auto& table : tables) {
+            REQUIRE(table->blob.read(queue.stream) == table->blob.expected);
+            REQUIRE(table->pointers.read(queue.stream) == table->pointers.expected);
+        }
+    }
+}
+
 TEST(r3d_moe_actual_aql_live_band_chain) {
     CHECK(true);
     RadDeviceProps props{}; moe_boundary::ensure_equal(rad_dev_props(0, &props), RAD_OK);

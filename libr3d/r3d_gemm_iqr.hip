@@ -492,8 +492,29 @@ __global__ __launch_bounds__(Waves * 32) void iqr_wmma_ksplit(const int8_t* acti
     }
 }
 
-template<bool Wave>
-__global__ void iqr_group_bf16(const int8_t* activation, const float* activation_scale,
+static __device__ __forceinline__ int draft_iqr_u4_dot(const int8_t* activation,
+    const uint8_t* codes, unsigned column, unsigned position, const r3d_iqr::Header& header) {
+    uint16_t digits[4];
+#pragma unroll
+    for (unsigned back = 0; back < 4; ++back) {
+        const unsigned previous = (column & ~255u) | ((column - back) & 255u);
+        __builtin_memcpy(&digits[back], codes + previous * (3072 / 2) + position / 2, sizeof(uint16_t));
+    }
+    uint32_t weights = 0, inputs;
+#pragma unroll
+    for (unsigned element = 0; element < 4; ++element) {
+        uint32_t state = 0;
+#pragma unroll
+        for (unsigned back = 0; back < 4; ++back)
+            state |= ((uint32_t(digits[back]) >> (element * 4)) & 15u) << (back * 4);
+        weights |= uint32_t(uint8_t(r3d_iqr::trellis_mad(state, header.multiplier, header.increment))) << (element * 8);
+    }
+    __builtin_memcpy(&inputs, activation + position, sizeof(inputs));
+    return __builtin_amdgcn_sudot4(true, int(weights), true, int(inputs), 0, false);
+}
+
+template<bool Wave, bool Draft>
+static __device__ __forceinline__ void iqr_group_bf16_body(const int8_t* activation, const float* activation_scale,
     const uint8_t* weight, const uint16_t* scales, uint16_t* output,
     int rows, int columns, int reduction, int64_t activation_pitch,
     int64_t activation_scale_pitch, int64_t output_pitch) {
@@ -514,12 +535,16 @@ __global__ void iqr_group_bf16(const int8_t* activation, const float* activation
     float accumulator = 0.0f;
     for (int group = 0; group < groups; ++group) {
         int32_t subtotal = 0;
-        for (int offset = Wave ? int(lane) * 4 : 0; offset < (Wave ? int(lane) * 4 + 4 : 128); ++offset) {
-            const int position = group * 128 + offset;
-            const uint32_t state = r3d_iqr::trellis_state(codes, pitch, column,
-                position, header->bits, 16, header->run_rows);
-            subtotal += int(activation[row * activation_pitch + position])
-                * int(r3d_iqr::trellis_mad(state, header->multiplier, header->increment));
+        if constexpr (Draft) {
+            subtotal = draft_iqr_u4_dot(activation, codes, column, group * 128 + lane * 4, *header);
+        } else {
+            for (int offset = Wave ? int(lane) * 4 : 0; offset < (Wave ? int(lane) * 4 + 4 : 128); ++offset) {
+                const int position = group * 128 + offset;
+                const uint32_t state = r3d_iqr::trellis_state(codes, pitch, column,
+                    position, header->bits, 16, header->run_rows);
+                subtotal += int(activation[row * activation_pitch + position])
+                    * int(r3d_iqr::trellis_mad(state, header->multiplier, header->increment));
+            }
         }
         if constexpr (Wave) {
             for (unsigned distance = 16; distance; distance >>= 1)
@@ -532,6 +557,28 @@ __global__ void iqr_group_bf16(const int8_t* activation, const float* activation
         accumulator = __fadd_rn(accumulator, __fmul_rn(scaled, weight_scale));
     }
     if (!Wave || lane == 0) output[row * output_pitch + column] = narrow_bf16(accumulator);
+}
+
+template<bool Wave>
+__global__ void iqr_group_bf16(const int8_t* activation, const float* activation_scale,
+    const uint8_t* weight, const uint16_t* scales, uint16_t* output,
+    int rows, int columns, int reduction, int64_t activation_pitch,
+    int64_t activation_scale_pitch, int64_t output_pitch) {
+    iqr_group_bf16_body<Wave, false>(activation, activation_scale, weight, scales, output,
+        rows, columns, reduction, activation_pitch, activation_scale_pitch, output_pitch);
+}
+
+static __global__ void iqr_mtp_draft_group_bf16(const int8_t* activation, const float* activation_scale,
+    const uint8_t* weight, const uint16_t* scales, uint16_t* output) {
+    const auto* header = reinterpret_cast<const r3d_iqr::Header*>(weight);
+    if (header->bits != 4 || header->run_rows != 256) {
+        if (blockIdx.x < 2560 / 128)
+            iqr_group_bf16_body<false, false>(activation, activation_scale, weight, scales, output,
+                1, 2560, 3072, 3072, 24, 2560);
+        return;
+    }
+    iqr_group_bf16_body<true, true>(activation, activation_scale, weight, scales, output,
+        1, 2560, 3072, 3072, 24, 2560);
 }
 
 extern "C" int r3d_rad_gemm_iqr_scalar(const RadArgs* arguments, RadStream stream) {
@@ -591,6 +638,19 @@ extern "C" int r3d_rad_gemm_iqr_scalar(const RadArgs* arguments, RadStream strea
         || tensor[0].stride[0] < reduction || tensor[1].stride[0] < reduction / 128
         || tensor[4].stride[0] < columns) return RAD_E_SHAPE;
     if (group_scale) {
+#ifdef R3D_BUILD_TARGET
+        if (rows == 1 && columns == 2560 && reduction == 3072 && arguments->world_size == 2
+            && (arguments->rank == 0 || arguments->rank == 1) && !std::strcmp(R3D_BUILD_TARGET, "gfx1100")) {
+            const char* draft = std::getenv("RAD_MTP_DRAFT_IQR");
+            if (draft && !std::strcmp(draft, "1")) {
+                iqr_mtp_draft_group_bf16<<<dim3(2560 / 4), dim3(128), 0, reinterpret_cast<hipStream_t>(stream)>>>(
+                    static_cast<const int8_t*>(tensor[0].data), static_cast<const float*>(tensor[1].data),
+                    static_cast<const uint8_t*>(tensor[2].data), static_cast<const uint16_t*>(tensor[3].data),
+                    static_cast<uint16_t*>(tensor[4].data));
+                return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+            }
+        }
+#endif
         const char* wave = std::getenv("RAD_IQR_DENSE_WAVE");
         if (rows <= 16 && wave && std::strcmp(wave, "0") != 0) {
             iqr_group_bf16<true><<<dim3((columns + 3) / 4, rows), dim3(128), 0,

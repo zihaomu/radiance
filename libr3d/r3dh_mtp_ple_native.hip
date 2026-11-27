@@ -95,6 +95,41 @@ __global__ void project(const uint16_t* normalized, RadTensor matrix, RadTensor 
         narrow(accumulator + embedding_product[row * width + column]);
     else embedding_product[row * width + column] = accumulator;
 }
+template<bool Hidden>
+__global__ __launch_bounds__(256) void project_fc_exact(const uint16_t* normalized,
+        const uint8_t* matrix, uint16_t* output, float* embedding_product, Index op) {
+    constexpr int width = 2560, streams = 4, columns = 8, tile = 128;
+    constexpr int weight_pitch = width + sizeof(float) * (width / tile);
+    __shared__ float terms[columns][tile + 1];
+    const int tid = threadIdx.x, producer = tid / 32, lane = tid % 32;
+    const int first = blockIdx.x * columns, row = blockIdx.y, group = blockIdx.z;
+    const auto* weights = matrix + (first + producer) * weight_pitch;
+    const auto* scales = reinterpret_cast<const float*>(weights + width);
+    const auto* input = normalized + (row * (streams + 1) + (Hidden ? group : streams)) * width;
+    float accumulator = 0;
+    for (int base = 0; base < width; base += tile) {
+        const int inner = lane * 4;
+        uint32_t codes;
+        __builtin_memcpy(&codes, weights + base + inner, sizeof(codes));
+        const float scale = scales[base / tile];
+        #pragma unroll
+        for (int part = 0; part < 4; ++part) {
+            const float decoded = fp8(uint8_t(codes >> (8 * part))) * scale;
+            terms[producer][inner + part] = bf(input[base + inner + part]) * decoded;
+        }
+        __syncthreads();
+        if (tid < columns) {
+            #pragma unroll 8
+            for (int inner = 0; inner < tile; ++inner) accumulator += terms[tid][inner];
+        }
+        __syncthreads();
+    }
+    if (tid < columns) {
+        const int column = first + tid, product_index = row * width + column;
+        if (Hidden) output[row * op + group * width + column] = narrow(accumulator + embedding_product[product_index]);
+        else embedding_product[product_index] = accumulator;
+    }
+}
 __global__ void gate(DataView key, DataView query, DataView value, DataView wk,
                      DataView wq, DataView wc, DataView gv, DataView gvn,
                      Index width, Index streams, Index kp, Index qp, Index vp,
@@ -337,6 +372,22 @@ extern "C" int r3dh_mtp_ple_mtp_enter(const RadArgs* args, RadStream stream) {
     norm<<<dim3(count, streams + 1), 1, 0, queue>>>(*hidden, *embedding, *wh, *we, normalized, width,
         streams, pitch(hidden, wide), pitch(embedding, width), groups, real(args, "eps", 1e-6f), real(args, "wadd", 0));
     if (launched() != RAD_OK) return RAD_E_DEVICE;
+    const bool draft_fc = args->world_size == 2 && (count == 1 || count == 4) &&
+        width == 2560 && streams == 4 && groups == streams &&
+        fc_hidden.dtype == r3dh_mtp_fc_e4m3_dtype && fc_embedding.dtype == r3dh_mtp_fc_e4m3_dtype &&
+        hidden->rank == 2 && hidden->shape[1] == wide && embedding->rank == 2 && embedding->shape[1] == width &&
+        output->rank == 2 && output->shape[1] == wide;
+    const char* exact = draft_fc ? std::getenv("RAD_MTP_FC_EXACT") : nullptr;
+    if (exact && !std::strcmp(exact, "1")) {
+        auto* result = static_cast<uint16_t*>(output->data);
+        const Index op = pitch(output, wide);
+        project_fc_exact<false><<<dim3(width / 8, count), 256, 0, queue>>>(normalized,
+            static_cast<const uint8_t*>(fc_embedding.data), result, product, op);
+        if (launched() != RAD_OK) return RAD_E_DEVICE;
+        project_fc_exact<true><<<dim3(width / 8, count, streams), 256, 0, queue>>>(normalized,
+            static_cast<const uint8_t*>(fc_hidden.data), result, product, op);
+        return launched();
+    }
     project<<<dim3((width + 127) / 128, count), 128, 0, queue>>>(normalized, fc_embedding, *output, product, width, streams, pitch(output, wide), false);
     if (launched() != RAD_OK) return RAD_E_DEVICE;
     project<<<dim3((width + 127) / 128, count, streams), 128, 0, queue>>>(normalized, fc_hidden, *output, product, width, streams, pitch(output, wide), true);

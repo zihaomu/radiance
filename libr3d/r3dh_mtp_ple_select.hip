@@ -4,6 +4,8 @@
 #include <hip/hip_fp16.h>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 namespace r3dh_mtp_ple_select {
 struct StrictRerank {
@@ -18,14 +20,14 @@ struct StrictRerank {
     int offset;
 };
 static_assert(sizeof(StrictRerank) + 256 <= 768);
-__global__ void joined_rerank(StrictRerank call) {
-    __shared__ int32_t ids[32];
-    __shared__ float scores[32];
-    if (r3d_head::header(call.weight, 124160, 2560, call.available) != RAD_OK) return;
+__device__ inline void write_rerank(const StrictRerank& call, int row, const int32_t* ids, const float* scores);
+__device__ inline bool valid_rerank_header(const StrictRerank& call) {
+    return r3d_head::header(call.weight, 124160, 2560, call.available) == RAD_OK &&
+        uint64_t(call.weight->bytes) <= UINTPTR_MAX - reinterpret_cast<uintptr_t>(call.weight);
+}
+__device__ inline void scalar_rerank_row(const StrictRerank& call, int row, int32_t* ids, float* scores) {
     const auto* base = reinterpret_cast<const uint8_t*>(call.weight);
-    if (uint64_t(call.weight->bytes) > UINTPTR_MAX - reinterpret_cast<uintptr_t>(base)) return;
     const int candidate = threadIdx.x;
-    const int row = blockIdx.x;
     if (candidate < 8) ids[candidate] = call.candidates[int64_t(row) * call.pitch[1] + candidate];
     __syncthreads();
     if (candidate < 8) {
@@ -60,7 +62,9 @@ __global__ void joined_rerank(StrictRerank call) {
         if (!owned) ids[candidate] = -1;
     }
     __syncthreads();
-    if (candidate) return;
+    if (!candidate) write_rerank(call, row, ids, scores);
+}
+__device__ inline void write_rerank(const StrictRerank& call, int row, const int32_t* ids, const float* scores) {
     unsigned used = 0;
     for (int output = 0; output < 8; ++output) {
         int best = -1;
@@ -79,6 +83,60 @@ __global__ void joined_rerank(StrictRerank call) {
             call.pairs[int64_t(row) * call.pitch[4] + output * 2 + 1] = score;
         }
     }
+}
+__global__ void joined_rerank(StrictRerank call) {
+    __shared__ int32_t ids[8];
+    __shared__ float scores[8];
+    if (valid_rerank_header(call)) scalar_rerank_row(call, blockIdx.x, ids, scores);
+}
+__global__ void joined_rerank_exact(StrictRerank call) {
+    constexpr int tile = 256;
+    __shared__ float terms[8][tile + 1];
+    __shared__ int32_t ids[8];
+    __shared__ float scores[8];
+    if (!valid_rerank_header(call)) return;
+    const auto* plane = reinterpret_cast<const RadPlanesEntry*>(call.weight + 1);
+    if (plane[0].dtype != RAD_I8 || plane[1].dtype != RAD_BF16 ||
+        plane[1].block[0] != 1 || plane[1].block[1] != 128) {
+        scalar_rerank_row(call, 0, ids, scores);
+        return;
+    }
+    const int thread = threadIdx.x, candidate = thread / 32, lane = thread % 32;
+    if (thread < 8) {
+        const int32_t global = call.candidates[thread];
+        ids[thread] = global >= call.offset && global < call.offset + 124160 ? global : -1;
+    }
+    __syncthreads();
+    const auto* base = reinterpret_cast<const uint8_t*>(call.weight);
+    const auto* codes = reinterpret_cast<const int8_t*>(base + plane[0].offset);
+    const auto* scales = reinterpret_cast<const uint16_t*>(base + plane[1].offset);
+    const int local = ids[candidate] - call.offset;
+    const bool fold = thread < 8 && ids[thread] >= 0;
+    float score = 0.0f;
+    for (int start = 0; start < 2560; start += tile) {
+        if (local >= 0) {
+            #pragma unroll
+            for (int group = 0; group < tile / 128; ++group) {
+                const float scale = __uint_as_float(uint32_t(scales[local * 20 + start / 128 + group]) << 16);
+                #pragma unroll
+                for (int column = 0; column < 128; column += 32) {
+                    const int slot = group * 128 + column + lane;
+                    const float weight = __fmul_rn(float(codes[local * 2560 + start + slot]), scale);
+                    const float activation = __uint_as_float(uint32_t(call.input[start + slot]) << 16);
+                    terms[candidate][slot] = __fmul_rn(activation, weight);
+                }
+            }
+        }
+        __syncthreads();
+        if (fold) {
+            #pragma unroll 16
+            for (int slot = 0; slot < tile; ++slot) score = __fadd_rn(score, terms[thread][slot]);
+        }
+        __syncthreads();
+    }
+    if (thread < 8) scores[thread] = fold ? score : -INFINITY;
+    __syncthreads();
+    if (!thread) write_rerank(call, 0, ids, scores);
 }
 using Index = int64_t;
 const RadTensor* at(const RadArgs* args, int index) {
@@ -254,6 +312,16 @@ extern "C" int r3d_rad_logit_rerank_strict(const RadArgs* args, RadStream stream
         static_cast<const int32_t*>(candidates->data), static_cast<int32_t*>(indices->data),
         static_cast<float*>(values->data), pairs ? static_cast<float*>(pairs->data) : nullptr,
         {input->stride[0], candidates->stride[0], indices->stride[0], values->stride[0], pairs ? pairs->stride[0] : 0}, available, int(offset)};
+#ifdef R3D_BUILD_TARGET
+    if (rows == 1 && args->world_size == 2 && (args->rank == 0 || args->rank == 1) &&
+        offset == args->rank * 124160 && !std::strcmp(R3D_BUILD_TARGET, "gfx1100")) {
+        const char* exact = std::getenv("RAD_MTP_RERANK_EXACT");
+        if (exact && !std::strcmp(exact, "1")) {
+            joined_rerank_exact<<<1, 256, 0, reinterpret_cast<hipStream_t>(stream)>>>(call);
+            return status();
+        }
+    }
+#endif
     joined_rerank<<<rows, 32, 0, reinterpret_cast<hipStream_t>(stream)>>>(call);
     return status();
 }

@@ -232,3 +232,137 @@ TEST(r3d_mtp_fc_actual_aql_private_views) {
         (unsigned long long)fixtures, (unsigned long long)launches, (unsigned long long)rejects,
         (unsigned long long)outputs, (unsigned long long)compared, (unsigned long long)guards);
 }
+
+TEST(r3d_mtp_fc_exact_tp2_draft_aql) {
+    using namespace mtp_fc_test;
+    using rad::RadTape;
+    if (!joined_head_test::device_available()) SKIP("explicit gfx1100 card run required");
+    struct Flag {
+        const char* name;
+        bool present = std::getenv(name) != nullptr;
+        std::string saved = present ? std::getenv(name) : "";
+        void set(const char* value) { REQUIRE_EQ(value ? setenv(name, value, 1) : unsetenv(name), 0); }
+        ~Flag() { if (present) setenv(name, saved.c_str(), 1); else unsetenv(name); }
+    } flag{"RAD_MTP_FC_EXACT"}, precision{"RAD_PRECISION"};
+    Api api;
+    const auto* backend = rad::active_backend();
+    REQUIRE(backend->tape_begin && backend->tape_end && backend->tape_diff && backend->tape_len && backend->tape_destroy);
+    mtp_fc_test::Model model("/home/zihaomu/bigssd2/radiance_workspace/models/qwen3.8-next-flash-iqr-v4.rad");
+    constexpr int width = 2560, streams = 4, wide = width * streams, physical = 2640;
+    auto params = parameters();
+    Queue queue(0);
+    Blob codes(width * width, RAD_F8E4M3), scales(width * (width / 128), RAD_F32);
+    Blob gain_h(wide, RAD_F32), gain_e(width, RAD_F32);
+    model.gain("mtp.pre_fc_norm_hidden.weight", gain_h);
+    model.gain("mtp.pre_fc_norm_embedding.weight", gain_e);
+    Buffer wh(RAD_F32, {wide}, RAD_MEM_DEVICE), we(RAD_F32, {width}, RAD_MEM_DEVICE);
+    std::memcpy(wh.host.data, gain_h.data<void>(), gain_h.bytes.size());
+    std::memcpy(we.host.data, gain_e.data<void>(), gain_e.bytes.size());
+    wh.push(queue.stream); we.push(queue.stream);
+    Storage fc_h(width * physical, -1), fc_e(width * physical, -1);
+    const RadEncoding encoding = rad_enc_affine(RAD_F8E4M3, RAD_F32, 1, 128);
+    const int selection[]{0, 1};
+    for (int half : {0, 1}) {
+        auto& fc = half ? fc_e : fc_h;
+        model.matrix(half ? "mtp.fc_embedding.weight" : "mtp.fc_hidden.weight", codes, scales, width);
+        RadTensor planes[]{matrix(codes.data<void>(), RAD_F8E4M3, width, width),
+            matrix(scales.data<void>(), RAD_F32, width, width / 128)};
+        RadLayout layout{};
+        REQUIRE_EQ(api.row->layout(params.data(), int(params.size()), half + 4, &encoding, selection, planes, 2, &layout), RAD_OK);
+        REQUIRE_EQ(layout.dtype, r3dh_mtp_fc_e4m3_dtype); REQUIRE_EQ(layout.bytes, int64_t(width) * physical);
+        REQUIRE_EQ(api.row->relayout(params.data(), int(params.size()), half + 4, &encoding, selection, planes, 2,
+            fc.expected.data() + 64, layout.bytes), RAD_OK);
+        fc.push(queue.stream);
+    }
+    uint64_t compared = 0;
+    bool special = false;
+    auto trial = [&](int count, int padding, int world, int rank, int groups, bool legacy_hidden,
+                     const char* setting, bool candidate) {
+        const int hp = wide + padding, ep = width + 2 * padding, op = wide + 3 * padding;
+        Buffer hidden(RAD_BF16, {count + 1, wide}, RAD_MEM_DEVICE, hp);
+        Buffer embedding(RAD_BF16, {count + 1, width}, RAD_MEM_DEVICE, ep);
+        Buffer output(RAD_BF16, {count + 1, wide}, RAD_MEM_DEVICE, op);
+        for (Buffer* input : {&hidden, &embedding}) {
+            for (int row = 0; row < count; ++row) {
+                auto* values = input->data<uint16_t>() + row * input->host.stride[0];
+                for (int col = 0; col < input->host.shape[1]; ++col) {
+                    uint32_t bits = uint32_t(col * 97 + row * 65537 + rank * 7919 + (input == &hidden ? 19 : 23));
+                    bits = (bits ^ (bits >> 16)) * 0x7feb352du; bits ^= bits >> 15;
+                    values[col] = rad_f32_to_bf16(float(int(bits % 2049) - 1024) / 512);
+                }
+                values[0] = 0x8000; values[127] = 0x0001; values[128] = 0;
+                if (special && input == &hidden) values[(row % streams) * width + 129] = row & 1 ? 0xffc5 : 0x7f80;
+            }
+            input->push(queue.stream);
+        }
+        RadTensor tensors[]{hidden.device, embedding.device, wh.device, we.device,
+            matrix(fc_h.device(), r3dh_mtp_fc_e4m3_dtype, width, width),
+            matrix(fc_e.device(), r3dh_mtp_fc_e4m3_dtype, width, width), output.device};
+        for (int slot : {0, 1, 6}) tensors[slot].shape[0] = count;
+        if (legacy_hidden) tensors[4] = matrix(fc_h.device(), RAD_F8E4M3, width, physical);
+        params[3] = RAD_INT("ngroup", groups);
+        RadArgs args{}; args.p = params.data(); args.n_p = int(params.size()); args.t = tensors; args.n_t = 7;
+        args.world_size = world; args.rank = rank;
+        args.scratch_bytes = api.row->scratch(&args);
+        REQUIRE_EQ(args.scratch_bytes, 2293760);
+        Storage scratch(size_t(args.scratch_bytes), RAD_MEM_DEVICE); args.scratch = scratch.device();
+        auto record = [&](const char* value) {
+            flag.set(value); output.push(queue.stream); scratch.push(queue.stream);
+            if (rad_stream_sync(queue.stream) != RAD_OK || backend->tape_begin() != RAD_OK)
+                throw std::runtime_error("MTP FC tape begin");
+            const int status = api.row->launch(&args, queue.stream);
+            RadTape tape = backend->tape_end(status == RAD_OK);
+            if (status != RAD_OK || !tape || backend->tape_len(tape) != 3)
+                throw std::runtime_error("MTP FC tape did not capture three launches");
+            return tape;
+        };
+        const RadTape strict = record("0");
+        const auto strict_out = output.read(queue.stream), strict_work = scratch.read(queue.stream);
+        auto golden_out = output.expected, golden_work = scratch.expected;
+        auto arm = [](auto& poison, auto& golden, const auto& actual, size_t begin, size_t bytes) {
+            std::copy_n(actual.begin() + begin, bytes, golden.begin() + begin);
+            for (size_t index = begin; index < begin + bytes; ++index) poison[index] = uint8_t(~actual[index]);
+        };
+        for (int row = 0; row < count; ++row)
+            arm(output.expected, golden_out, strict_out, 64 + size_t(row) * op * 2, wide * 2);
+        arm(scratch.expected, golden_work, strict_work, 64, size_t(count) * width * ((streams + 1) * 2 + 4));
+        equal_bytes(strict_out, golden_out, "strict_output_guards", compared);
+        equal_bytes(strict_work, golden_work, "strict_scratch_guards", compared);
+        const RadTape experiment = record(setting);
+        char why[512]{};
+        const int difference = backend->tape_diff(strict, experiment, why, sizeof(why));
+        backend->tape_destroy(experiment); backend->tape_destroy(strict);
+        if (difference != (candidate ? 1 : -1)) std::printf("MTP_FC_ROUTE M=%d setting=%s diff=%d %s\n",
+            count, setting ? setting : "unset", difference, why);
+        REQUIRE_EQ(difference, candidate ? 1 : -1);
+        if (candidate) { REQUIRE(std::strstr(why, "grid 2560x")); REQUIRE(std::strstr(why, "against 81920x")); }
+        equal_bytes(output.read(queue.stream), golden_out, "draft_all_output_rows_and_guards", compared);
+        equal_bytes(scratch.read(queue.stream), golden_work, "draft_norm_fp32_product_and_guards", compared);
+        equal_bytes(hidden.read(queue.stream), hidden.expected, "draft_hidden_immutable", compared);
+        equal_bytes(embedding.read(queue.stream), embedding.expected, "draft_embedding_immutable", compared);
+    };
+    precision.set("exact");
+    for (int rank : {0, 1}) for (int count : {1, 4}) for (int padding : {0, 17})
+        trial(count, padding, 2, rank, streams, false, "1", true);
+    for (const char* disabled : {static_cast<const char*>(nullptr), "", "0", "01"})
+        trial(4, 0, 2, 0, streams, false, disabled, false);
+    for (int count : {2, 3, 5}) trial(count, 17, 2, 0, streams, false, "1", false);
+    trial(4, 0, 1, 0, streams, false, "1", false);
+    trial(4, 0, 2, 0, 1, false, "1", false);
+    trial(4, 0, 2, 0, streams, true, "1", false);
+    precision.set("tolerance"); trial(4, 0, 2, 1, streams, false, "1", true);
+    equal_bytes(fc_h.read(queue.stream), fc_h.expected, "model_fc_h_immutable", compared);
+    equal_bytes(fc_e.read(queue.stream), fc_e.expected, "model_fc_e_immutable", compared);
+    special = true; precision.set("exact");
+    fc_e.expected[64 + 127] = 0x7f; fc_e.expected[64 + physical + 128] = 0xff;
+    const uint32_t scale_bits[]{0x80000000u, 0x7f800000u, 0xff800000u, 0xffc51234u};
+    for (int col = 0; col < 4; ++col)
+        std::memcpy(fc_h.expected.data() + 64 + col * physical + width + 19 * sizeof(float), &scale_bits[col], sizeof(float));
+    fc_h.push(queue.stream); fc_e.push(queue.stream);
+    trial(4, 17, 2, 1, streams, false, "1", true);
+    equal_bytes(fc_h.read(queue.stream), fc_h.expected, "special_fc_h_immutable", compared);
+    equal_bytes(fc_e.read(queue.stream), fc_e.expected, "special_fc_e_immutable", compared);
+    equal_bytes(wh.read(queue.stream), wh.expected, "draft_hidden_gain_immutable", compared);
+    equal_bytes(we.read(queue.stream), we.expected, "draft_embedding_gain_immutable", compared);
+    std::printf("PASS MTP_FC_EXACT_TP2_DRAFT_AQL exact_bytes=%llu\n", (unsigned long long)compared);
+}

@@ -644,7 +644,18 @@ extern "C" int r3dh_moe_iqr_launch(const RadArgs* arguments, RadStream stream) {
         const bool even = geometry.width[0] <= geometry.output_width && geometry.width[1] <= geometry.output_width
             && (geometry.output_width / 2) % split_columns == 0 && (geometry.width[0] / 2) % split_columns == 0
             && (geometry.width[1] / 2) % split_columns == 0;
-        if (geometry.tokens == 1 && even && r3d_exact_path("RAD_IQR_SPLIT")) {
+        bool split = geometry.tokens == 1 && even && r3d_exact_path("RAD_IQR_SPLIT");
+#ifdef R3D_BUILD_TARGET
+        if (geometry.tokens == 4 && arguments->world_size == 2 && !std::strcmp(R3D_BUILD_TARGET, "gfx1100")
+            && reinterpret_cast<uintptr_t>(call.activation) % alignof(uint4) == 0
+            && call.activation_pitch % alignof(uint4) == 0
+            && ((arguments->rank == 0 && geometry.width[0] == 768 && geometry.width[1] == 512)
+                || (arguments->rank == 1 && geometry.width[0] == 512 && geometry.width[1] == 768))) {
+            const char* four = std::getenv("RAD_MTP_MOE_FOUR");
+            split = four && !std::strcmp(four, "1");
+        }
+#endif
+        if (split) {
             gate_up_split<<<dim3(geometry.output_width / split_columns, capacity), 256, 0, native_stream>>>(call, map);
             return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
         }

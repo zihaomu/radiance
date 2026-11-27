@@ -1,0 +1,50 @@
+# W7900D MTP3 recovery plan
+
+2026-11-24. Implementation worktree: `rdna3-dev`, branch `rdna3_w7900_qwen3.8_flash_dev`, frozen reference `0405f3578d16af56cef642df5119434f4a271f9a`. This is a plan, not a claim that any candidate has passed. Work on dev; do not change fork `main`, PR #563, or its review children during exploration.
+
+## Definition of success
+
+For Qwen3.8 Flash Next IQR-V4, make **fixed-depth MTP3 faster than MTP0 on both short TP2 workloads**, without slowing ordinary decode or weakening exact mode. Proposed release gate: at least **1.10x MTP0** on each workload, not the average across essay and code. Report a partial win as partial. R9700 results are useful context, not an acceptance threshold for different hardware. TP1 MTP3 startup is a separate functional deliverable.
+
+| Frozen dev, TP2 | MTP0 tok/s | MTP3 tok/s | Accepted/proposed per request | Approx. MTP3 cycle now / break-even |
+|---|---:|---:|---:|---:|
+| Water-cycle essay, 55 input tokens | 61.54 | 31.89 | 164/279 | 86 / 44.6 ms |
+| `merge_intervals` code, 71 input tokens | 61.52 | 40.96 | 183/216 | 86 / 57.6 ms |
+
+Each cell above is the median of eight measured requests on the frozen **dev** binary, 256 generated tokens per request. Cycle budgets use 255 post-first-token outputs and the observed number of fixed-depth rounds; recompute them when acceptance changes. At baseline acceptance, essay needs roughly 42 ms and code 29 ms removed per cycle just to tie. A faster LM head alone cannot close either gap.
+
+The **integration build**, not dev, supplied the existing rank-0 essay timestamps: single-row trunk 18.24 ms; four-row verification trunk 59.37 ms; history/first draft 10.69 ms, second draft 8.45 ms, third draft 8.43 ms. These are instrumented pass spans, not end-to-end latency or sums across GPUs. Reconfirm them on dev before attributing gains. Workspace evidence, relative to the parent of this checkout: `doc/W7900_TP2_MTP3_Diagnosis.md`, `results/diag-frozen0405f35-w7900tp2-{0,3}-{essay,code}/summary.json`, and `results/w7900-mtp-diagnosis-20261124/trace-{0,3}/stamps.csv`.
+
+## Execution order
+
+| Stage | Experiment | Decision gate (proposed, not measured) |
+|---|---|---|
+| P0. Pin the control | Preserve the frozen binaries; build candidates in a separate build directory. Record commit, plugin/server/model hashes, request JSON, config and GPU IDs. Re-run MTP0/3 on both prompts and take a separate dev essay trace. | Confirm actual depth, four live verify rows, three draft passes, baseline rates within 5%, and stable outputs within each mode. Explain any discrepancy before tuning. |
+| P1. Four-row target LM head | In [joined head dispatch](../libr3d/r3d_vocab_bf16.hip), test one tolerance-wave grid with four independent rows. The existing kernel indexes both input and output by `blockIdx.y` and pitch. Compare against one-row wave calls, not just the staged kernel. | First screen: from 19.59 ms to **at most 5 ms** for the verify head on the real shard; then require faster whole-cycle serving. Keep exact on the ordered implementation. |
+| P2. Serial draft head | Optimize [packed W2 vocabulary projection](../libr3d/r3d_gemm_nt_q_w2a8.hip) first (about 3.2 ms on **each** of three passes). Separately test the two [MTP projections](../libr3d/r3dh_mtp_ple_native.hip); the history pass has different input geometry than rounds 2 and 3. Preserve the shortlist, tie order, rerank and cross-rank result. | Require unchanged draft IDs on exact replay; screen for at least 25% less aggregate draft-pass time versus the post-P1 baseline. Record all three spans, not just the fastest pass. |
+| P3. Remaining four-row trunk | Reprofile after P1/P2. Start with whichever still dominates: [affine GEMM](../libr3d/r3dh_i8_gemm.hip) (170 calls, 10.21 ms on the original verify trace), [expert gate/up](../libr3d/r3dh_moe_iqr.hip) (5.68 ms), or [HC](../libr3d/r3dh_hc_strict.hip) (the one-row fusion does not run at four rows). Compare four separate rows with a small tile that shares weight reads. Change one operator at a time. | Rank by saved **ms per complete cycle**. Recheck both ranks, nonuniform expert routes and partial live rows. Do not widen the persistent HC kernel to four rows without validating scratch, occupancy and synchronization. |
+| P4. Serving qualification | Retest the best combination against the frozen MTP3 binary and against MTP0 on the **same candidate binary**. Separate client/server timing and verify actual proposals/accepts. | Apply the release gates below. If still slower, publish the remaining cycle deficit locally and the next measured hotspot; do not relabel MTP1, adaptive depth, or drafting-off as an MTP3 fix. |
+
+### First reversible edit
+
+1. Add a four-row test beside [the TP2 joined-weight fixture](../tests/r3d_joined_head_aql.h). Use both real 124160-column vocabulary shards at K=2560, four **different** activation rows, padded row strides, and output guard bytes. A repeated row would hide an addressing bug.
+2. Put the P1 candidate behind a new default-off switch, subordinate to `r3d_tolerance_path("RAD_LOGITS_WAVE")` in [the precision policy](../libr3d/r3d_flags.h). Limit the first probe to gfx1100 TP2, the tested joined head shape, and exactly four **live** rows, not a declared `M` band. Keep header validation on the device for device-only weights. Do not change the one-row path or widen `logits_joined_stream`: that exact kernel currently has no row offset.
+3. Compare every F32 logit bitwise against four separate M=1 calls using the same tolerance-wave arithmetic. Then compare against ordered strict using the existing head-wave tolerance/error and top-k checks. Exercise 1/2/3/4/5 live rows, tails, noncanonical encodings, special values, both ranks and buffers with padding. Rows outside the new guard retain the old dispatch. If the launch API cannot distinguish a four-row prefill call, test it too; do not assume every M=4 call is verification.
+4. Under `RAD_PRECISION=exact`, force both wave switches on and require the four-row ordered result byte-for-byte, including guards. Only then time the real four-row GPU entry and compare with a stamped dev serving pass. If parity or routing/shape guards fail, keep the switch off and stop this candidate.
+
+## Measurement and promotion
+
+- Reserve GPU4/5 with both render locks; run sequentially, with fresh output directories and no inherited `RAD_`/`REC_` overrides. Keep the 113 GiB checkpoint, ROCm image, TP wire `exact`, 4096 context, batch 64, i8 KV, single sequence, prefix cache off, seed, temperature 0 and thinking off fixed. Do not rebuild a live plugin. Reuse the workspace launch and streaming drivers (`scripts/pr-tp1.sh`, `scripts/mtp3-warm-case.sh`, `scripts/mtp3-warm-sse.pl`).
+- Each fresh server: warm on its own prompt at least four times, until the last three rates span at most 5%; then measure eight 256-token requests. In final qualification run six order-balanced fresh-server pairs **per workload and comparison**. Report session medians, median paired change and pair wins. Server/client aggregate rates must agree within 1%; retain all samples. Use uninstrumented results for speed claims. Take traces separately for attribution.
+- **Keep a candidate** only after numerical tests and a repeatable net serving gain; suggested gate: at least 1% median paired improvement over the preceding MTP3 baseline and at least 5/6 wins on the targeted prompt, no more than 1% regression on the other. Check MTP0 separately (at most 1% regression on either prompt). **Promote the final combination** only when it also passes the 1.10x-over-MTP0 target on both prompts, six serving tasks and the complete gfx1100 device suite.
+- Log proposed/accepted drafts, actual verify steps, generated token IDs or visible text hashes, and time per cycle. Default tolerance MTP0 and MTP3 already yield different text on these prompts: report fixed-input/fixed-length timing separately from equal-output comparisons. Require deterministic same-mode replay; flag every changed trajectory against the frozen oracle. For tolerance changes, require strict-reference numerical bounds and a held-out task/replay gate before changing defaults; do not count a speed gain caused only by easier-to-draft text. Test exact MTP0 vs exact MTP3 on both prompts and retain a first-divergent-token trace on failure. The prior exact parity observation covered essay only.
+- After each stage, append the SHA, switch, fixture results, raw run paths, four-row head/trunk and draft-pass times, warm essay/code rates, acceptance and keep/drop decision to this plan. No default change or public README update based on a microbenchmark, a single smoke run, or a profiled run.
+
+## TP1 functional track
+
+Do not infer TP1 speed from TP2. First reproduce the declaration failure on frozen dev with GPU4 only; the previous detailed startup log is from the integration build. Add failing TP1 declaration and device/reference fixtures **per operator**: W4NL `moe_gemm_q` gate/up at even/odd N=1280, `gemm_nt_q_gated` at N=1280/K=2560, and `logit_rerank` at R=8/full vocabulary 248320, offset 0. Compare with the [W4NL fixture](../tests/r3d_w4nl_gate_aql.h) and [TP2 rerank fixture](../tests/r3d_rerank_aql.h). Implement and verify one row at a time; preserve existing TP2 rows and refusals. The first three missing forms are not proof that no further form is missing. Require full graph startup, a real MTP3 request with accepted drafts and strict parity checks before benchmarking the same warm TP1 essay/code pair. Keep TP1 MTP3 result cells blank until then.
+
+## Status
+
+- Planning complete on dev `0405f35`; frozen dev serving controls and integration traces reviewed.
+- Next: P0 dev trace and artifact lock, then P1 four-row differential test. No optimization from this plan has been enabled, benchmarked or published.

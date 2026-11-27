@@ -94,12 +94,13 @@ __global__ __launch_bounds__(128) void dot4_gemv(const int8_t* activation, const
 }
 // wave_gemm's arithmetic: a group's int32 sum is exact in any order and each column's fold stays ascending.
 // Waves split the groups and read every 16-column x 128-K tile as coalesced 16-byte loads.
-template<int Rows>
+template<int Rows, int MaxK = 16384>
 __global__ __launch_bounds__(256) void split_gemv(const int8_t* activation, const float* activation_scale,
     const int8_t* weight, const float* scale, uint16_t* output, int rows, int reduction,
     int64_t activation_pitch, int64_t scale_pitch, int64_t output_pitch) {
-    __shared__ __align__(16) int8_t cached[Rows][16384];
-    __shared__ int subtotals[Rows][128][16];
+    __shared__ __align__(16) int8_t cached[Rows][MaxK];
+    __shared__ int subtotals[Rows][MaxK / 128][16];
+    static_assert(MaxK % 128 == 0 && sizeof(cached) + sizeof(subtotals) < 64 * 1024);
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
     const int tile = blockIdx.x, groups = reduction / 128;
     for (int row = 0; row < rows; ++row)
@@ -247,6 +248,23 @@ extern "C" int r3dh_i8_rad_gemm_nt_q(const RadArgs* arguments, RadStream stream)
             tensor[0].stride[0], tensor[1].stride[0], tensor[4].stride[0]);
         return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
     }
+#ifdef R3D_BUILD_TARGET
+    if (rows == 4 && arguments->world_size == 2 && (arguments->rank == 0 || arguments->rank == 1)
+        && !std::strcmp(R3D_BUILD_TARGET, "gfx1100") && !std::strcmp(dtype, "i8a8h")
+        && ((reduction == 2560 && (columns == 256 || columns == 512 || columns == 768))
+            || (columns == 2560 && (reduction == 256 || reduction == 384 || reduction == 3072)))
+        && reinterpret_cast<uintptr_t>(tensor[2].data) % alignof(uint4) == 0) {
+        const char* four = std::getenv("RAD_MTP_I8_FOUR");
+        if (four && !std::strcmp(four, "1")) {
+            split_gemv<4, 3072><<<dim3(columns / 16), dim3(256), 0, native_stream>>>(
+                static_cast<const int8_t*>(tensor[0].data), static_cast<const float*>(tensor[1].data),
+                static_cast<const int8_t*>(tensor[2].data), static_cast<const float*>(tensor[3].data),
+                static_cast<uint16_t*>(tensor[4].data), 4, int(reduction),
+                tensor[0].stride[0], tensor[1].stride[0], tensor[4].stride[0]);
+            return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+        }
+    }
+#endif
     if (rows <= 2)
         wave_gemm<<<grid, dim3(128), 0, native_stream>>>(
             static_cast<const int8_t*>(tensor[0].data), static_cast<const float*>(tensor[1].data),

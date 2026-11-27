@@ -787,6 +787,50 @@ __global__ __launch_bounds__(256) void up_split(const uint16_t* intermediate, co
     if (trace_logits) trace_logits[index] = sum;
     if (trace_gates) trace_gates[index] = gated;
 }
+
+__global__ __launch_bounds__(128) void up_split_four(const uint16_t* intermediate, const uint8_t* up,
+    uint16_t* gates, uint16_t* trace_gates, float* trace_logits) {
+    __shared__ float4 activation[4][81];
+    const int tid = threadIdx.x, part = tid & 3, output_row = blockIdx.x * 32 + (tid >> 2);
+    for (int pos = tid; pos < rank; pos += 128)
+        activation[pos / 80][pos % 80] = make_float4(widen_bf16(intermediate[pos]), widen_bf16(intermediate[rank + pos]),
+            widen_bf16(intermediate[2 * rank + pos]), widen_bf16(intermediate[3 * rank + pos]));
+    const uint8_t* line = up + size_t(output_row) * up_pitch;
+    const float factor = reinterpret_cast<const float*>(line + rank)[part];
+    __syncthreads();
+    float sums[4]{};
+#pragma unroll 1
+    for (int chunk = 0; chunk < 5; ++chunk) {
+        const uint4 codes = reinterpret_cast<const uint4*>(line + part * 80)[chunk];
+        const uint32_t words[4]{codes.x, codes.y, codes.z, codes.w};
+#pragma unroll
+        for (int byte = 0; byte < 16; ++byte) {
+            const int shift = 8 * (byte & 3);
+            const uint32_t word = words[byte >> 2];
+            const uint32_t magnitude = (shift < 24 ? word << (20 - shift) : word >> 4) & 0x07f00000U;
+            const uint32_t sign = (word << (24 - shift)) & 0x80000000U;
+            const float weight = __uint_as_float(magnitude | sign) * 0x1p120f * factor;
+            const float4 inputs = activation[part][chunk * 16 + byte];
+            sums[0] += inputs.x * weight;
+            sums[1] += inputs.y * weight;
+            sums[2] += inputs.z * weight;
+            sums[3] += inputs.w * weight;
+        }
+    }
+#pragma unroll
+    for (int row = 0; row < 4; ++row) {
+        float sum = sums[row];
+        sum += __shfl_xor(sum, 1, 4);
+        sum += __shfl_xor(sum, 2, 4);
+        if (!part) {
+            const size_t index = size_t(row) * wide + output_row;
+            const uint16_t gated = narrow_bf16(sigmoid_exact(sum));
+            gates[index] = gated;
+            if (trace_logits) trace_logits[index] = sum;
+            if (trace_gates) trace_gates[index] = gated;
+        }
+    }
+}
 // RAD_HC_FUSED (tolerance, one row): the read as two kernels plus mix_quant_exact. The down runs
 // split-K over (16-row group, half-stream slice) blocks on h * (gain + wadd), before any norm, and
 // each slice's sum of squares; the up blocks fold the slices with each stream's 1/rms (the norm
@@ -1457,7 +1501,14 @@ int strict_launch(const RadArgs* args, RadStream stream, const R3dhHcTrace* trac
         const char* fused_flag = (r3d_tolerance_path("RAD_HC_UPMIX_FUSED") ? "1" : nullptr);
         const char* split_up = (r3d_tolerance_path("RAD_HC_UP_SPLIT") ? "1" : nullptr);
         if (split_up && std::strcmp(split_up, "0") != 0) {
-            up_split<<<dim3(wide / 64, rows), 256, 0, device_stream>>>(intermediate, up_data, gates, up_gates, up_logits);
+#ifdef R3D_BUILD_TARGET
+            const char* four = rows == 4 && args->world_size == 2 && !std::strcmp(R3D_BUILD_TARGET, "gfx1100")
+                ? std::getenv("RAD_MTP_HC_FOUR") : nullptr;
+            if (four && !std::strcmp(four, "1"))
+                up_split_four<<<wide / 32, 128, 0, device_stream>>>(intermediate, up_data, gates, up_gates, up_logits);
+            else
+#endif
+                up_split<<<dim3(wide / 64, rows), 256, 0, device_stream>>>(intermediate, up_data, gates, up_gates, up_logits);
             mix_quant_exact<<<dim3(width / 128, rows), 128, 0, device_stream>>>(normalized, gates,
                 static_cast<uint16_t*>(output->data), codes(0), scales(0), int8(0), codes(1), scales(1), int8(1));
         } else if (fused_flag && std::strcmp(fused_flag, "0") != 0) {

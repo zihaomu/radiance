@@ -1473,6 +1473,7 @@ TEST(r3d_i8_actual_aql_quant_boundary) {
 #include "r3d_iqr_output_aql.h"
 #include "r3d_attn_fused_actual_aql.h"
 #include "r3d_joined_head_aql.h"
+#include "r3d_mtp_verify_head_aql.h"
 #include "r3d_rerank_aql.h"
 #include "r3d_sample_pair_aql.h"
 #include "r3d_sample_merge32_aql.h"

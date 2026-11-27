@@ -1780,3 +1780,143 @@ TEST(r3d_tp1_i8_split_ab) {
     setenv("RAD_I8_SPLIT", "0", 1);
     rad_event_destroy(start); rad_event_destroy(finish);
 }
+
+TEST(r3d_mtp_i8_four_exact_tp2_aql) {
+    using joined_head_test::Storage;
+    using joined_head_test::matrix;
+    if (!joined_head_test::device_available()) SKIP("explicit gfx1100 card run required");
+    struct SavedFlag {
+        const char* name;
+        bool present = std::getenv(name) != nullptr;
+        std::string saved = present ? std::getenv(name) : "";
+        ~SavedFlag() { if (present) setenv(name, saved.c_str(), 1); else unsetenv(name); }
+    } four{"RAD_MTP_I8_FOUR"}, precision{"RAD_PRECISION"};
+    REQUIRE_EQ(setenv(precision.name, "exact", 1), 0);
+    Library native("libr3d");
+    const auto gemm = reinterpret_cast<RadLaunchFn>(dlsym(native.handle, "r3dh_i8_rad_gemm_nt_q"));
+    const auto info = reinterpret_cast<const RadPluginInfo* (*)()>(dlsym(native.handle, "rad_plugin_info"));
+    REQUIRE(info && info() && info()->build_target);
+    const bool single_target = !std::strcmp(info()->build_target, "gfx1100");
+    const auto* backend = rad::active_backend();
+    REQUIRE(gemm && backend && backend->tape_begin && backend->tape_end && backend->tape_len
+        && backend->tape_diff && backend->tape_destroy);
+    struct Tape {
+        const rad::DeviceBackend* backend;
+        rad::RadTape value = nullptr;
+        ~Tape() { if (value) backend->tape_destroy(value); }
+    };
+    Queue compute(0);
+    auto trial = [&](int columns, int reduction, int rows, int world, int rank, const char* dtype,
+                     int weight_offset, bool edge, bool eligible) {
+        const int groups = reduction / 128, pad = rank == 1 || edge || weight_offset ? 1 : 0;
+        const int input_offset = 4 * pad, input_pitch = reduction + 4 * pad;
+        const int scale_pitch = groups + 3 * pad, output_pitch = columns + 7 * pad;
+        Storage input(input_offset + rows * input_pitch, RAD_MEM_DEVICE);
+        Storage weight(weight_offset + size_t(columns) * reduction, RAD_MEM_DEVICE);
+        Buffer input_scale(RAD_F32, {rows, groups}, RAD_MEM_DEVICE, scale_pitch);
+        Buffer weight_scale(r3dh_i8::scale_dtype, {columns, groups}, RAD_MEM_DEVICE);
+        Buffer output(RAD_BF16, {rows + 1, columns}, RAD_MEM_DEVICE, output_pitch);
+        auto* codes = reinterpret_cast<int8_t*>(input.expected.data() + 64 + input_offset);
+        auto* weights = reinterpret_cast<int8_t*>(weight.expected.data() + 64 + weight_offset);
+        uint32_t state = 19u + rank;
+        auto next = [&] { state = state * 1664525u + 1013904223u; return state; };
+        auto factor = [&] { return std::ldexp(float(0x800000u | (next() >> 9)), -30); };
+        for (int row = 0; row < rows; ++row) for (int group = 0; group < groups; ++group) {
+            auto* chunk = codes + row * input_pitch + group * 128;
+            for (int pos = 0; pos < 128; ++pos) chunk[pos] = int(next() >> 24) - 128;
+            chunk[0] = 1; chunk[1] = row & 1 ? -128 : 127; chunk[127] = row + group;
+            input_scale.data<float>()[row * scale_pitch + group] = edge && row == 0
+                ? (group == 1 ? 0x1.000002p0f : 1.0f) : factor();
+        }
+        for (size_t index = 0; index < size_t(columns) * reduction; ++index)
+            weights[index] = int(next() >> 24) - 128;
+        for (int col = 0; col < columns; ++col) for (int group = 0; group < groups; ++group) {
+            float value = ((col + group) & 1 ? -1.0f : 1.0f) * factor();
+            if (edge && col < 9) {
+                for (int pos = 0; pos < 128; ++pos)
+                    weights[r3dh_i8::packed_index(col, group * 128 + pos, reduction)] = pos == 0;
+                const float first[]{-0.0f, INFINITY, -INFINITY, std::numeric_limits<float>::quiet_NaN(),
+                    0x1.01p0f, 0x1.03p0f, 0x1p24f, 0x1p-40f, -1.0f};
+                value = group == 0 ? first[col] : 0.0f;
+                if (col == 6 && group == 2) value = 1.0f;
+                if (col == 6 && group == 3) value = -0x1p24f;
+                if (col == 8 && group == 1) value = 0x1.fffffcp-1f;
+            }
+            weight_scale.data<float>()[col * groups + group] = value;
+        }
+        input.push(compute.stream); weight.push(compute.stream);
+        input_scale.push(compute.stream); weight_scale.push(compute.stream);
+        auto* activation = static_cast<uint8_t*>(input.device()) + input_offset;
+        auto* packed = static_cast<uint8_t*>(weight.device()) + weight_offset;
+        REQUIRE_EQ(reinterpret_cast<uintptr_t>(activation) % 16, uintptr_t(input_offset));
+        REQUIRE_EQ(reinterpret_cast<uintptr_t>(packed) % 16, uintptr_t(weight_offset));
+        RadTensor tensors[]{matrix(activation, RAD_I8, rows, reduction, input_pitch), input_scale.device,
+            matrix(packed, r3dh_i8::weight_dtype, columns, reduction), weight_scale.device, output.device};
+        tensors[4].shape[0] = rows;
+        RadParam params[]{RAD_INT("M", 64), RAD_INT("N", columns), RAD_INT("K", reduction),
+            RAD_INT("group", 128), RAD_STR("dtype", dtype)};
+        RadArgs args{}; args.t = tensors; args.n_t = 5; args.p = params; args.n_p = 5;
+        args.world_size = world; args.rank = rank;
+        Tape reference{backend};
+        auto golden = output.expected;
+        const char* settings[]{nullptr, "0", "01", "1"};
+        for (const char* setting : settings) {
+            REQUIRE_EQ(setting ? setenv(four.name, setting, 1) : unsetenv(four.name), 0);
+            output.push(compute.stream);
+            REQUIRE_EQ(rad_stream_sync(compute.stream), RAD_OK);
+            REQUIRE_EQ(backend->tape_begin(), RAD_OK);
+            const int status = gemm(&args, compute.stream);
+            Tape actual{backend, backend->tape_end(status == RAD_OK)};
+            REQUIRE_EQ(status, RAD_OK); REQUIRE(actual.value); REQUIRE_EQ(backend->tape_len(actual.value), 1);
+            const auto got = output.read(compute.stream);
+            if (!setting) {
+                std::swap(reference.value, actual.value);
+                for (int row = 0; row < rows; ++row) {
+                    const size_t begin = 64 + size_t(row) * output_pitch * 2;
+                    std::copy_n(got.data() + begin, columns * 2, golden.data() + begin);
+                    for (int byte = 0; byte < columns * 2; ++byte) output.expected[begin + byte] = ~got[begin + byte];
+                    for (int col : {0, 1, 2, 3, 4, 5, 6, 7, 8, 15, 16, columns / 2, columns - 1}) {
+                        float sum = 0.0f;
+                        for (int group = 0; group < groups; ++group) {
+                            int dot = 0;
+                            for (int pos = group * 128; pos < (group + 1) * 128; ++pos)
+                                dot += int(codes[row * input_pitch + pos]) * weights[r3dh_i8::packed_index(col, pos, reduction)];
+                            const float scaled = joined_head_test::multiply(float(dot), input_scale.data<float>()[row * scale_pitch + group]);
+                            sum = joined_head_test::add(sum, joined_head_test::multiply(scaled, weight_scale.data<float>()[col * groups + group]));
+                        }
+                        uint16_t bits;
+                        std::memcpy(&bits, got.data() + begin + col * 2, sizeof(bits));
+                        if (std::isnan(sum)) REQUIRE((bits & 0x7fffu) > 0x7f80u);
+                        else REQUIRE_EQ(bits, rad_f32_to_bf16(sum));
+                    }
+                }
+            } else {
+                char why[512]{};
+                const bool changed = single_target && eligible && !std::strcmp(setting, "1");
+                const int difference = backend->tape_diff(reference.value, actual.value, why, sizeof(why));
+                if (difference != (changed ? 0 : -1))
+                    std::printf("I8_FOUR M=%d N=%d K=%d world=%d rank=%d flag=%s diff=%d %s\n",
+                        rows, columns, reduction, world, rank, setting, difference, why);
+                REQUIRE_EQ(difference, changed ? 0 : -1);
+                if (changed) {
+                    const auto grids = "grid " + std::to_string(columns * 2) + "x1x1 against "
+                        + std::to_string(columns * 16) + "x1x1";
+                    REQUIRE(std::strstr(why, grids.c_str()));
+                }
+            }
+            REQUIRE(got == golden);
+        }
+    };
+    const std::pair<int, int> shapes[]{{256, 2560}, {512, 2560}, {768, 2560},
+        {2560, 256}, {2560, 384}, {2560, 3072}};
+    for (int rank : {0, 1}) for (auto [columns, reduction] : shapes)
+        trial(columns, reduction, 4, 2, rank, "i8a8h", 0, false, true);
+    trial(2560, 3072, 4, 2, 1, "i8a8h", 0, true, true);
+    for (int rows : {1, 2, 3, 5}) trial(256, 2560, rows, 2, 0, "i8a8h", 0, false, false);
+    trial(256, 2560, 4, 1, 0, "i8a8h", 0, false, false);
+    trial(256, 2560, 4, 2, 1, "i8a8", 0, false, false);
+    trial(256, 2560, 4, 2, 1, "i8a8h", 4, false, false);
+    trial(128, 2560, 4, 2, 0, "i8a8h", 0, false, false);
+    trial(2560, 512, 4, 2, 0, "i8a8h", 0, false, false);
+    trial(2560, 3200, 4, 2, 1, "i8a8h", 0, false, false);
+}

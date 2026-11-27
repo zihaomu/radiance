@@ -890,7 +890,12 @@ int joined_strict_run(const RadArgs* args, RadStream stream) {
         if (status != RAD_OK) return status;
     }
     const dim3 grid((columns + 127) / 128, activation.shape[0]);
-    if (reduction == 2560 && activation.shape[0] == 1 && r3d_tolerance_path("RAD_LOGITS_WAVE")) {
+    bool verify_wave = false;
+#ifdef R3D_BUILD_TARGET
+    verify_wave = activation.shape[0] == 4 && columns == 124160 && args->world_size == 2 &&
+        !std::strcmp(R3D_BUILD_TARGET, "gfx1100") && r3d_tolerance_path("RAD_MTP_VERIFY_HEAD4");
+#endif
+    if (reduction == 2560 && (activation.shape[0] == 1 || verify_wave) && r3d_tolerance_path("RAD_LOGITS_WAVE")) {
         R3D_KLAUNCH(R3D_KNAME(logits_joined_wave), dim3((columns + 3) / 4, activation.shape[0]), dim3(128),
             reinterpret_cast<hipStream_t>(stream), static_cast<const uint16_t*>(activation.data),
             static_cast<const RadPlanesHeader*>(weight.data), static_cast<float*>(output.data),
