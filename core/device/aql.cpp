@@ -2080,7 +2080,16 @@ struct Sig {
      * poll is no queue packet, so `waiters` cannot hold it. */
     std::atomic<int32_t>  xp_dev{-1};
     std::atomic<uint32_t> xp_list{0};
+#ifdef RAD_AQL_RETIRE_DIAGNOSTICS
+    uint64_t retire_window = 0;
+#endif
 };
+
+#ifdef RAD_AQL_RETIRE_DIAGNOSTICS
+std::atomic<uint64_t> next_retire_window{1};
+thread_local uint64_t retire_window = 0;
+thread_local aql::RetireCounts retire_counts;
+#endif
 
 struct SigPool {
     std::mutex        mu;
@@ -2100,9 +2109,25 @@ bool xp_list_finished(int ord, uint32_t k);
  * prefetch DMA list that has not yet read it (`xp_dev`). Reused then, its next user's 1 would be
  * what that wait sees, and the wait would hang behind work that waits for it. */
 bool reusable(const Sig* g) {
-    if (g->stamped || hsa_signal_load_relaxed(g->h) != 0) return false;
+    if (g->stamped) return false;
+    const auto value = hsa_signal_load_relaxed(g->h);
+#ifdef RAD_AQL_RETIRE_DIAGNOSTICS
+    const bool fresh = retire_window && g->retire_window == retire_window;
+    if (retire_window) {
+        ++retire_counts.value_reads;
+        retire_counts.fresh_reads += fresh;
+        retire_counts.fresh_nonzero += fresh && value != 0;
+    }
+#endif
+    if (value != 0) return false;
     for (const auto& w : g->waiters) {
         hsa_queue_t* q = queue_of(w.first);
+#ifdef RAD_AQL_RETIRE_DIAGNOSTICS
+        if (retire_window && q) {
+            ++retire_counts.queue_reads;
+            retire_counts.fresh_queue_reads += fresh;
+        }
+#endif
         if (q && hsa_queue_load_read_index_relaxed(q) <= w.second) return false;
     }
     const int32_t xd = g->xp_dev.load(std::memory_order_acquire);
@@ -2124,6 +2149,9 @@ void sig_free(SigPool& p, Sig* g) {
 Sig* sig_get(bool irq) {
     SigPool& p = pool();
     std::lock_guard<std::mutex> lk(p.mu);
+#ifdef RAD_AQL_RETIRE_DIAGNOSTICS
+    if (retire_window) ++retire_counts.gets;
+#endif
     /* Oldest first. Signals retire in record order, so the front is most likely done; popping
      * from the front costs a look or two, where a full walk reads every signal and waiter queue
      * from device-written memory. The walk is the fallback for when the front is not done (the
@@ -2156,6 +2184,9 @@ Sig* sig_get(bool irq) {
     const hsa_status_t st = irq ? hsa_signal_create(0, 0, nullptr, &g->h)
                                 : hsa_amd_signal_create(0, 0, nullptr, HSA_AMD_SIGNAL_AMD_GPU_ONLY, &g->h);
     if (st != HSA_STATUS_SUCCESS || (irq && !interrupts(g->h))) return nullptr;
+#ifdef RAD_AQL_RETIRE_DIAGNOSTICS
+    if (retire_window) ++retire_counts.creates;
+#endif
     p.by_handle[g->h.handle] = g.get();
     return g.release();
 }
@@ -2173,6 +2204,13 @@ void sig_retire(Sig* g) {
     SigPool& p = pool();
     std::lock_guard<std::mutex> lk(p.mu);
     p.retiring.push_back(g);
+#ifdef RAD_AQL_RETIRE_DIAGNOSTICS
+    g->retire_window = retire_window;
+    if (retire_window) {
+        ++retire_counts.retirements;
+        retire_counts.retiring_peak = std::max<uint64_t>(retire_counts.retiring_peak, p.retiring.size());
+    }
+#endif
 }
 
 struct Event {
@@ -3355,13 +3393,21 @@ int a_ride(RadStream rs, void** token) {
     return RAD_OK;
 }
 
+int ride_wait_submit(Stream* s, Sig* g) {
+    uint64_t idx = 0;
+    const int rc = barrier(s, g->h, hsa_signal_t{0}, HSA_FENCE_SCOPE_AGENT, HSA_FENCE_SCOPE_NONE, &idx);
+    if (rc == RAD_OK) g->waiters.emplace_back(s->id, idx);
+#ifdef RAD_AQL_RETIRE_DIAGNOSTICS
+    if (retire_window && rc == RAD_OK) ++retire_counts.waits;
+#endif
+    return rc;
+}
+
 int a_ride_wait(RadStream rs, void* token) {
     Stream* s = ours(rs);
     Sig* g = (Sig*)token;
     if (!s || !g) return RAD_E_INVAL;
-    uint64_t idx = 0;
-    const int rc = barrier(s, g->h, hsa_signal_t{0}, HSA_FENCE_SCOPE_AGENT, HSA_FENCE_SCOPE_NONE, &idx);
-    if (rc == RAD_OK) g->waiters.emplace_back(s->id, idx);
+    const int rc = ride_wait_submit(s, g);
     sig_retire(g);
     return rc;
 }
@@ -4779,6 +4825,22 @@ DeviceBackend g_aql;
 }  // namespace
 
 namespace aql {
+int ride_wait_keep(void* stream, void* token) {
+    Stream* s = ours(stream);
+    return s && token ? ride_wait_submit(s, static_cast<Sig*>(token)) : RAD_E_INVAL;
+}
+
+#ifdef RAD_AQL_RETIRE_DIAGNOSTICS
+void retire_count_begin() {
+    retire_counts = {};
+    retire_window = next_retire_window.fetch_add(1, std::memory_order_relaxed);
+}
+RetireCounts retire_count_end() {
+    retire_window = 0;
+    return retire_counts;
+}
+#endif
+
 bool ride_reusable(void* token) {
     Sig* g = static_cast<Sig*>(token);
     if (!g) return false;
@@ -5122,6 +5184,11 @@ hipError_t hipPeekAtLastError(void) {
 namespace rad {
 namespace aql {
 /* A build without the AQL backend hands out no ride and launches no chain. */
+int ride_wait_keep(void*, void*) { return RAD_E_UNSUPPORTED; }
+#ifdef RAD_AQL_RETIRE_DIAGNOSTICS
+void retire_count_begin() {}
+RetireCounts retire_count_end() { return {}; }
+#endif
 bool ride_reusable(void*) { return false; }
 int chain_probe(void*, unsigned*, unsigned*, unsigned, unsigned) { return RAD_E_UNSUPPORTED; }
 int chain_marks(void*, unsigned*, unsigned) { return RAD_E_UNSUPPORTED; }

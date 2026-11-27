@@ -72,6 +72,19 @@ void set_next_fence(uint8_t f);
 /* Whether the signal behind a rad_ride token could be handed out again now (tests/device_test.cpp). */
 bool ride_reusable(void* token);
 
+/* Enqueue the same wait as rad_ride_wait; ownership stays with the caller, including on error. */
+int ride_wait_keep(void* stream, void* token);
+
+#ifdef RAD_AQL_RETIRE_DIAGNOSTICS
+struct RetireCounts {
+    uint64_t gets = 0, creates = 0, retirements = 0, value_reads = 0;
+    uint64_t fresh_reads = 0, fresh_nonzero = 0, queue_reads = 0, fresh_queue_reads = 0;
+    uint64_t waits = 0, retiring_peak = 0;
+};
+void retire_count_begin();
+RetireCounts retire_count_end();
+#endif
+
 /* `pairs` launches of two chained kernels onto `stream`, one behind the other: the first stores
  * i + 1 over the 64 words at `x`; the second loads x[0] the way a kernel loads a value all its
  * lanes share (a scalar load) and each of its `blocks` blocks stores what it saw, at

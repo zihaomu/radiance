@@ -2,10 +2,12 @@
 #include "ctx.h"
 #include "xp_state.h"
 #include "rad_internal.h"
+#include "../device/aql.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cpuid.h>
+#include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
 #include <pthread.h>
@@ -103,10 +105,16 @@ bool xp_wait(const volatile void* line, Done done, std::chrono::steady_clock::du
     }
 }
 
+void release_held_waits(XpState& state) {
+    for (void* token : state.held_waits) rad_ride_release(token, nullptr, 0);
+    state.held_waits.clear();
+}
+
 }  // namespace
 
 void Ctx::xp_free(XpState& x) {
     if (x.stream) rad_stream_sync(x.stream);
+    release_held_waits(x);
     if (x.ring) rad_dev_free_uncached(x.ring);
     for (void* p : {(void*)x.rec, (void*)x.nrec, (void*)x.stats, (void*)x.logits, (void*)x.maps,
                     (void*)x.places})
@@ -161,6 +169,12 @@ void Ctx::xp_open(const uint64_t* lo, const uint64_t* hi, const uint64_t* stride
         RAD_WARN("rank %d: expert prefetch off: %s", rank_, why && *why ? why : "no memory for it");
         xp_free(*x);
         return;
+    }
+    const char* deferred = std::getenv("RADIANCE_XP_DEFER_RIDE_RETIRE");
+    x->defer_ride_retire = deferred && !std::strcmp(deferred, "1");
+    if (x->defer_ride_retire) {
+        x->held_waits.reserve(size_t(nl));
+        RAD_INFO("rank %d: expert prefetch ride waits submit immediately; retirement deferred to pass boundary", rank_);
     }
     std::memset((void*)x->box, 0, sizeof(XpBox) * kXpGroups);
     std::memset(x->done, 0, 4 * kXpGroups);
@@ -382,6 +396,7 @@ int Ctx::xp_predict_run(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_
             RAD_TRY(rad_event_wait(cs, x.tail));
             x.tail_live = false;
         }
+        if (x.defer_ride_retire) release_held_waits(x);
         ++x.passes;
     }
     x.last_layer = layer;
@@ -390,7 +405,16 @@ int Ctx::xp_predict_run(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_
      * reads it) rather than via a barrier packet between two kernels. */
     void* rt = nullptr;
     if (rad_ride(cs, &rt) == RAD_OK) {
-        RAD_TRY(rad_ride_wait(x.stream, rt));
+        if (x.defer_ride_retire) {
+            const int rc = aql::ride_wait_keep(x.stream, rt);
+            if (rc != RAD_OK) {
+                rad_ride_release(rt, nullptr, 0);
+                return rc;
+            }
+            x.held_waits.push_back(rt);
+        } else {
+            RAD_TRY(rad_ride_wait(x.stream, rt));
+        }
     } else {
         RAD_TRY(rad_event_record(x.sync, cs));
         RAD_TRY(rad_event_wait(x.stream, x.sync));

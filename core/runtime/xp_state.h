@@ -44,6 +44,8 @@ struct XpState {
     RadEvent     tail   = nullptr;     /* the pass start waits for the stream's work of the last */
     RadEvent     sync   = nullptr;     /* the router input's readiness, where a ride is refused */
     bool         tail_live = false;
+    bool         defer_ride_retire = false;
+    std::vector<void*> held_waits;
     char*        ring   = nullptr;     /* uncached: kXpGroups x kXpSlots slots of `slot` bytes */
     uint64_t     slot   = 0;
     XpPools      pools{};

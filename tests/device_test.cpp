@@ -26,6 +26,10 @@
 #include <vector>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 using rad::DirectFile;
 using rad::RAD_DIO_READ;
@@ -1474,6 +1478,8 @@ TEST(a_dma_lists_mark_stays_out_of_the_pool_until_the_engine_has_read_it) {
     CHECK(back);
     rad_ride_release(first, nullptr, 0);
 }
+
+#include "aql_ride_retire_control.h"
 
 /* A host wait on a stream at a closed gate could only end when the waiting thread opened it, so it
  * is refused with RAD_E_STATE instead of hanging, and works again once the gate is open. */
